@@ -1,5 +1,7 @@
 # fw-helper
 
+[![ci](https://github.com/Wooloomooloo2/fw-helper/actions/workflows/ci.yml/badge.svg)](https://github.com/Wooloomooloo2/fw-helper/actions/workflows/ci.yml)
+
 Firmware control for the **Framework Laptop 13** on Ubuntu — fan curves, power limits,
 battery charge limit, and performance profiles in one tray application.
 
@@ -7,8 +9,10 @@ Inspired by [G-Helper](https://github.com/seerge/g-helper), which does this for 
 on Windows. This shares no code with it — see
 [ADR 0001](docs/adr/0001-separate-repository.md).
 
-> **Status: planning.** No code yet. The architecture is decided and recorded; the hardware
-> is surveyed. See [docs/plan.md](docs/plan.md).
+> **Status: early.** The read-only hardware layer works — capability detection and live
+> telemetry, verified on real hardware. **Nothing writes to hardware yet.** Fan, power, and
+> charge control are designed and their mechanisms proven, but not implemented.
+> See [docs/plan.md](docs/plan.md).
 
 ## Why
 
@@ -21,11 +25,12 @@ once, switchable from a tray icon or a hotkey.
 
 | Feature | Status |
 |---|---|
-| Fan curves | Planned — verified working (0 → 4681 rpm, EC reclaims cleanly) |
+| Live telemetry | **Working** — temps, fan RPM, package power, battery |
+| Capability detection | **Working** — every knob reports available, or why not |
+| Fan curves | Planned — mechanism verified (0 → 4681 rpm, EC reclaims cleanly) |
 | Performance profiles | Planned — layered over power-profiles-daemon |
-| Power limits (PL1/PL2) | Planned — verified regulating to ±2% of setpoint |
+| Power limits (PL1/PL2) | Planned — mechanism verified, regulates to ±2% of setpoint |
 | Battery charge limit | Planned — needs a module parameter ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)) |
-| Live telemetry | Planned |
 
 Every mechanism above has been exercised on real hardware before any application code was
 written — see [docs/hardware-baseline.md](docs/hardware-baseline.md).
@@ -71,6 +76,22 @@ load. [ADR 0006](docs/adr/0006-fail-safe-fan-control.md) specifies the mitigatio
 and a critical-temperature override that hands control back unconditionally).
 
 `kill -9` recovery is a release gate, not a nice-to-have.
+
+## Try it
+
+```bash
+cargo run -p fw-helperctl -- status     # capabilities + one telemetry sample
+sudo ./target/release/fw-helperctl watch 10   # live power, fan, CPU temp at 1 Hz
+```
+
+Package power needs root — `energy_uj` is `0400`, the PLATYPUS mitigation. Everything else
+works unprivileged. Nothing in `fw-helperctl` writes to hardware.
+
+Tests need neither hardware nor root; they run against synthetic sysfs fixtures:
+
+```bash
+cargo test --all
+```
 
 ## Poking at your own machine
 
