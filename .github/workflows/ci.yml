@@ -16,6 +16,11 @@ jobs:
 
       # ADR 0010: the hardware layer takes no external dependencies. Enforce it,
       # because this is the code that will drive fans and power limits as root.
+      # A malformed policy makes dbus-daemon skip the file silently, which surfaces
+      # much later as AccessDenied when the daemon tries to own its name.
+      - name: D-Bus policy is well-formed
+        run: python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('data/org.fwhelper.Daemon1.conf')"
+
       - name: fw-helper-core has no dependencies
         run: |
           deps=$(cargo tree -p fw-helper-core --prefix none \

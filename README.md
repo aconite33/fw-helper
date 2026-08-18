@@ -80,12 +80,24 @@ and a critical-temperature override that hands control back unconditionally).
 ## Try it
 
 ```bash
-cargo run -p fw-helperctl -- status     # capabilities + one telemetry sample
-sudo ./target/release/fw-helperctl watch 10   # live power, fan, CPU temp at 1 Hz
+cargo build --all
+cargo run -p fw-helperctl -- status      # reads sysfs directly; no daemon needed
 ```
 
-Package power needs root — `energy_uj` is `0400`, the PLATYPUS mitigation. Everything else
-works unprivileged. Nothing in `fw-helperctl` writes to hardware.
+For the full picture, run the daemon. It needs the D-Bus policy installed first:
+
+```bash
+sudo ./scripts/install-dev.sh            # D-Bus policy + fw-helperctl on PATH
+sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
+fw-helperctl status                      # unprivileged, via D-Bus
+fw-helperctl watch 10                    # live power, fan, CPU temp at 1 Hz
+sudo pkill -x fw-helperd                 # stop it
+```
+
+Package power needs a **root daemon** — `energy_uj` is `0400`, the PLATYPUS mitigation. The
+client stays unprivileged and holds no hardware access. Without the daemon, `fw-helperctl`
+falls back to reading sysfs directly and everything except package power still works.
+Nothing in `fw-helperctl` writes to hardware.
 
 Tests need neither hardware nor root; they run against synthetic sysfs fixtures:
 

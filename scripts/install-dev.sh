@@ -17,19 +17,47 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 POLICY=/etc/dbus-1/system.d/org.fwhelper.Daemon1.conf
 UNIT=/etc/systemd/system/fw-helperd.service
 BIN=/usr/libexec/fw-helperd
+CTL=/usr/local/bin/fw-helperctl
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl disable --now fw-helperd.service 2>/dev/null || true
-    rm -fv "$POLICY" "$UNIT" "$BIN"
+    rm -fv "$POLICY" "$UNIT" "$BIN" "$CTL"
     systemctl daemon-reload
     systemctl reload dbus 2>/dev/null || true
     echo "removed."
     exit 0
 fi
 
+# Validate before installing. dbus-daemon skips an unparseable file and reports it
+# only to the journal; the daemon then fails with a misleading AccessDenied.
+if ! python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse(sys.argv[1])" \
+        "$REPO/data/org.fwhelper.Daemon1.conf" 2>/tmp/fw-policy-parse.err; then
+    echo "ERROR: D-Bus policy is not well-formed XML, refusing to install:" >&2
+    cat /tmp/fw-policy-parse.err >&2
+    exit 1
+fi
+
 install -m 644 -v "$REPO/data/org.fwhelper.Daemon1.conf" "$POLICY"
 # The bus only reads system.d at startup or on reload.
 systemctl reload dbus 2>/dev/null || echo "note: could not reload dbus; a reboot will pick it up"
+
+# The reload succeeds even when the bus rejected our file, so check the journal.
+if journalctl -u dbus.service --since "10 seconds ago" --no-pager 2>/dev/null \
+        | grep -q "org.fwhelper.Daemon1.conf"; then
+    echo "WARNING: dbus reported a problem with the policy file:" >&2
+    journalctl -u dbus.service --since "10 seconds ago" --no-pager \
+        | grep -A2 "org.fwhelper.Daemon1.conf" >&2
+fi
+
+# Symlink the CLI onto PATH so `fw-helperctl` works from any directory. It is
+# unprivileged and holds no hardware access -- everything goes over D-Bus.
+for build in release debug; do
+    if [[ -x "$REPO/target/$build/fw-helperctl" ]]; then
+        ln -sfnv "$REPO/target/$build/fw-helperctl" "$CTL"
+        break
+    fi
+done
+[[ -e "$CTL" ]] || echo "note: no fw-helperctl binary found; run 'cargo build' then re-run this"
 
 if [[ "${1:-}" == "--systemd" ]]; then
     [[ -x "$REPO/target/release/fw-helperd" ]] || {
@@ -41,8 +69,9 @@ if [[ "${1:-}" == "--systemd" ]]; then
     systemctl --no-pager status fw-helperd.service | head -12
 else
     echo
-    echo "Policy installed. Run the daemon by hand:"
-    echo "    sudo $REPO/target/debug/fw-helperd"
-    echo "Then, in another shell:"
+    echo "Policy installed. Start the daemon and query it in one go:"
+    echo "    sudo sh -c '$REPO/target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'"
     echo "    fw-helperctl status"
+    echo
+    echo "Stop it with:  sudo pkill -x fw-helperd"
 fi
