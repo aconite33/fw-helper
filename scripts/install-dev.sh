@@ -72,32 +72,28 @@ if journalctl -u dbus.service --since "10 seconds ago" --no-pager 2>/dev/null \
         | grep -A2 "org.fwhelper.Daemon1.conf" >&2
 fi
 
-# Symlink the CLI onto PATH so `fw-helperctl` works from any directory. It is
-# unprivileged and holds no hardware access; everything goes over D-Bus.
+# Put the CLI on PATH via a shim that resolves the newest build at RUN time.
 #
-# Pick whichever build is NEWEST, not release-by-preference: a stale release binary
-# left over from an earlier milestone will silently shadow a fresh debug build and
-# behave like an old version of the program.
-newest=""
-for build in release debug; do
-    candidate="$REPO/target/$build/fw-helperctl"
-    [[ -x "$candidate" ]] || continue
-    if [[ -z "$newest" || "$candidate" -nt "$newest" ]]; then
-        newest="$candidate"
-    fi
-done
-
-if [[ -n "$newest" ]]; then
-    ln -sfnv "$newest" "$CTL"
-    other=$([[ "$newest" == *release* ]] && echo "$REPO/target/debug/fw-helperctl" \
-                                         || echo "$REPO/target/release/fw-helperctl")
-    if [[ -x "$other" ]]; then
-        echo "note: both debug and release builds exist; linked the newer one."
-        echo "      run 'cargo build --release --all' to keep them in step."
-    fi
-else
-    echo "note: no fw-helperctl binary found; run 'cargo build --all' then re-run this"
+# A plain symlink to target/release goes stale the moment you rebuild only debug,
+# and then behaves like an older version of the program, which looks exactly like a
+# bug in the daemon rather than a stale binary. Resolving per-invocation removes the
+# failure mode instead of narrowing it. Packaging (M7) installs a real binary.
+cat > "$CTL" <<SHIM
+#!/bin/sh
+# fw-helper development shim, installed by scripts/install-dev.sh
+R="$REPO/target/release/fw-helperctl"
+D="$REPO/target/debug/fw-helperctl"
+if [ -x "\$R" ] && { [ ! -x "\$D" ] || [ "\$R" -nt "\$D" ]; }; then
+    exec "\$R" "\$@"
 fi
+if [ -x "\$D" ]; then
+    exec "\$D" "\$@"
+fi
+echo "fw-helperctl: no build found; run 'cargo build --all' in $REPO" >&2
+exit 1
+SHIM
+chmod 755 "$CTL"
+echo "installed shim: $CTL (resolves newest build at run time)"
 
 install -m 644 -v "$REPO/data/org.fwhelper.policy" "$POLKIT"
 
