@@ -1,0 +1,47 @@
+[Unit]
+Description=fw-helper firmware control daemon
+Documentation=https://github.com/Wooloomooloo2/fw-helper
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.fwhelper.Daemon1
+ExecStart=/usr/libexec/fw-helperd
+Restart=on-failure
+RestartSec=5
+
+# Root is required for energy_uj (0400, PLATYPUS mitigation) and, from M2, for
+# writing pwm1 and the powercap constraints. Everything not needed is dropped.
+User=root
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# sysfs must stay writable from M2 (pwm1, powercap), so ProtectSystem=strict is not
+# usable here. ReadWritePaths is deliberately narrow.
+ProtectSystem=full
+PrivateTmp=yes
+PrivateNetwork=yes
+ReadWritePaths=/sys/class/hwmon /sys/class/powercap /sys/class/power_supply /sys/firmware/acpi
+
+# From M3 this is the crash-path fan restore (ADR 0006). Harmless until then.
+# ExecStopPost=/usr/libexec/fw-helper-restore-fan
+
+[Install]
+WantedBy=multi-user.target

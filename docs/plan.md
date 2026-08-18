@@ -110,15 +110,24 @@ with no network, and there is no dependency-resolution risk to debug alongside l
 
 **Exit: reached.**
 
-#### M1b — daemon and D-Bus
+#### M1b — daemon and D-Bus  ✅ implemented, pending root verification
 
-- `fw-helperd` as a systemd service, system-bus name `org.fwhelper.Daemon1` (zbus)
-- Publish `Capabilities` and `Telemetry`; enforce the 1 Hz / 0.1 W limits from
-  [0009](adr/0009-power-telemetry-rate-limited-and-quantized.md) at the interface boundary
-- logind `PrepareForSleep` → `Monitor::on_resume()` to invalidate the energy reference
-- Repoint `fw-helperctl` at D-Bus so it stops needing root
+- [x] `fw-helperd` on the system bus as `org.fwhelper.Daemon1` (zbus 5.19)
+- [x] `Capabilities`, `Telemetry`, `CriticalTemperatures`, `Version` properties, with
+      PropertiesChanged emitted only when the published view actually changes
+- [x] 1 Hz poll cap and 0.1 W quantization enforced; no on-demand sampling method
+      ([0009](adr/0009-power-telemetry-rate-limited-and-quantized.md))
+- [x] logind `PrepareForSleep` → `Monitor::on_resume()`; degrades to the sampler's
+      max-gap check if logind is unreachable
+- [x] `fw-helperctl` prefers D-Bus, falls back to direct sysfs when the daemon is absent
+- [x] D-Bus policy, hardened systemd unit, `scripts/install-dev.sh`
+- [x] CI: `cargo deny`, and a gate failing the build if `fw-helper-core` gains a dependency
+      ([0010](adr/0010-dependency-boundary.md))
+- [ ] **Verify as root on the system bus** — package power is the one property an
+      unprivileged daemon cannot produce
 
-**Exit:** `fw-helperctl status` works unprivileged, against the daemon.
+**Exit:** `fw-helperctl status` shows package power while running unprivileged, against a
+root daemon on the system bus.
 
 ---
 

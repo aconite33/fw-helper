@@ -13,3 +13,25 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # Tests run against synthetic sysfs fixtures, so no hardware is needed (ADR 0004).
       - run: cargo test --all
+
+      # ADR 0010: the hardware layer takes no external dependencies. Enforce it,
+      # because this is the code that will drive fans and power limits as root.
+      - name: fw-helper-core has no dependencies
+        run: |
+          deps=$(cargo tree -p fw-helper-core --prefix none \
+                 | sed 's/ v[0-9].*//' | sort -u | grep -v '^fw-helper-core$' || true)
+          if [ -n "$deps" ]; then
+            echo "::error::fw-helper-core gained dependencies (see ADR 0010):"
+            echo "$deps"
+            exit 1
+          fi
+          echo "fw-helper-core: clean"
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources

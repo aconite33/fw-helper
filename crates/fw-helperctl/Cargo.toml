@@ -8,3 +8,4 @@ rust-version.workspace = true
 
 [dependencies]
 fw-helper-core = { path = "../fw-helper-core" }
+zbus = "5.13.2"

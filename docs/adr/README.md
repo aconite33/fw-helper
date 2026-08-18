@@ -15,3 +15,4 @@ and setting the old one's status to `Superseded by NNNN`.
 | [0007](0007-no-undervolting.md) | No undervolting; RAPL power limits only | Accepted |
 | [0008](0008-charge-limit-via-module-parameter.md) | Charge limit via `probe_with_fwk_charge_control` | Accepted |
 | [0009](0009-power-telemetry-rate-limited-and-quantized.md) | Power telemetry rate-limited and quantized | Accepted |
+| [0010](0010-dependency-boundary.md) | `fw-helper-core` stays dependency-free | Accepted |
