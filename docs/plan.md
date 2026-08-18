@@ -86,7 +86,7 @@ a line of application code exists.
 No hardware writes at all. Prove the plumbing. Split in two so the hardware layer lands
 dependency-free and stays that way.
 
-#### M1a — hardware layer, zero dependencies  ✅ scaffolded (unbuilt)
+#### M1a — hardware layer, zero dependencies  ✅ complete
 
 Deliberately std-only: no external crates, so it builds and tests anywhere, including CI
 with no network, and there is no dependency-resolution risk to debug alongside logic bugs.
@@ -104,10 +104,11 @@ with no network, and there is no dependency-resolution risk to debug alongside l
       `-D warnings`, rustfmt clean
 - [x] Cross-checked against `scripts/fw-probe.sh` on real hardware: capabilities, sensor
       labels, critical thresholds and control-sensor selection all agree
-- [ ] Verify package power under root (the one path unprivileged runs cannot exercise)
+- [x] Verified package power under root: `EnergySampler` reads 1.6–1.7 W idle against the
+      1.77 W measured independently by `scripts/q6-pl1-load-test.sh`. Two implementations,
+      same counter, agreeing
 
-**Exit:** `cargo test --all` green, `cargo clippy -- -D warnings` clean, and
-`sudo fw-helperctl status` matching `scripts/fw-probe.sh` on real hardware.
+**Exit: reached.**
 
 #### M1b — daemon and D-Bus
 
@@ -145,9 +146,10 @@ The highest-value and highest-risk feature. Do not shortcut
 
 - Curve engine: interpolated temp→duty points, configurable sensor, hysteresis to stop
   oscillation, ramp limiting so the fan does not step audibly
-- **Where the benefit actually is** (from Q6): the stock EC curve sits at 0 rpm at 43.9 °C but
-  ~2900 rpm at 64.8 °C, and only reaches ~3100 rpm at 76.8 °C. It ramps hard between roughly
-  45 °C and 65 °C, then flattens. The audible win is a gentler curve through the 55–70 °C
+- **Where the benefit actually is** (from Q6): the stock EC curve sits at 0 rpm at 43.9 °C and
+  still 0 rpm at 44.9 °C, but ~2900 rpm at 64.8 °C, and only reaches ~3100 rpm at 76.8 °C.
+  So the fan-start knee is above 45 °C and the ramp to ~2900 rpm is compressed into a narrow
+  band, then flattens. The audible win is a gentler curve through the 55–70 °C
   band — which is exactly where a 15 W profile parks the machine. Fan and power profiles
   compose; design them together, not separately
 - Safety, in this order — **build these before the curve is user-editable**:
