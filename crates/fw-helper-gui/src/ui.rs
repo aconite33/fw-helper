@@ -2,8 +2,8 @@
 
 use crate::worker::{self, Update};
 use adw::prelude::*;
-use gtk::glib;
 use fw_helper_client::Snapshot;
+use gtk::glib;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -60,7 +60,9 @@ pub fn build(app: &adw::Application) {
     stats.append(&stat_card(&fan, "fan"));
 
     let profile = gtk::Label::builder().xalign(0.0).label("—").build();
-    let profile_row = adw::ActionRow::builder().title("Performance profile").build();
+    let profile_row = adw::ActionRow::builder()
+        .title("Performance profile")
+        .build();
     profile_row.add_suffix(&profile);
 
     let battery = adw::ActionRow::builder().title("Battery").build();
@@ -69,7 +71,9 @@ pub fn build(app: &adw::Application) {
     system_group.add(&profile_row);
     system_group.add(&battery);
 
-    let sensors_group = adw::PreferencesGroup::builder().title("Temperatures").build();
+    let sensors_group = adw::PreferencesGroup::builder()
+        .title("Temperatures")
+        .build();
     let caps_group = adw::PreferencesGroup::builder()
         .title("Capabilities")
         .description("What this machine exposes. Unavailable items say why.")
@@ -161,7 +165,8 @@ fn stat_card(value: &gtk::Label, caption: &str) -> gtk::Widget {
 
 fn disconnected(w: &mut Widgets, why: &str) {
     w.title.set_subtitle("daemon not running");
-    w.banner.set_title(&format!("fw-helperd is not available — {why}"));
+    w.banner
+        .set_title(&format!("fw-helperd is not available — {why}"));
     w.banner.set_revealed(true);
     w.power.set_label("—");
     w.fan.set_label("—");
@@ -216,7 +221,11 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
         };
 
         let is_control = s.control_sensor.as_deref() == Some(sensor.label.as_str());
-        let suffix = if is_control { "  · fan curve input" } else { "" };
+        let suffix = if is_control {
+            "  · fan curve input"
+        } else {
+            ""
+        };
         let crit = sensor
             .critical
             .map(|c| format!(" of {c:.0} °C"))

@@ -5,11 +5,13 @@
 //! stack runs with no hardware attached. See `docs/adr/0004-sysfs-first-hardware-access.md`.
 
 pub mod caps;
+pub mod charge;
 pub mod energy;
 pub mod sysfs;
 pub mod telemetry;
 
 pub use caps::{Cap, Capabilities};
+pub use charge::{ChargeControl, ChargeError};
 pub use energy::EnergySampler;
 pub use sysfs::Sysfs;
 pub use telemetry::{Monitor, Telemetry};

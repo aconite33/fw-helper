@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>fw-helper</vendor>
+  <vendor_url>https://github.com/Wooloomooloo2/fw-helper</vendor_url>
+
+  <action id="org.fwhelper.set-charge-limit">
+    <description>Set the battery charge limit</description>
+    <message>Authentication is required to change the battery charge limit</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!--
+        auth_admin_keep: authenticate once, then the session may adjust freely.
+        Prompting on every slider movement would train users to click through.
+      -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

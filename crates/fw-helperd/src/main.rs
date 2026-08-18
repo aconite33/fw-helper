@@ -6,6 +6,8 @@
 
 mod iface;
 mod logind;
+mod polkit;
+mod state;
 mod wire;
 
 use fw_helper_core::{Capabilities, Monitor, Sysfs};
@@ -33,7 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("note: package power needs root; running unprivileged?");
     }
 
-    let daemon = iface::Daemon::new(caps);
+    let state = state::State::load();
+    if let Some(limit) = state.charge_limit {
+        eprintln!("persisted charge limit: {limit}%");
+    }
+    let daemon = iface::Daemon::new(fs.clone(), caps, state);
+    daemon.reapply_charge_limit();
 
     // The session bus is a development affordance: claiming a name on the system bus
     // needs both root and an installed policy file, which makes iterating painful.
@@ -90,6 +97,14 @@ async fn poll_loop(conn: zbus::Connection, mut mon: Monitor, resumed: Arc<Atomic
         if resumed.swap(false, Ordering::SeqCst) {
             mon.on_resume();
             eprintln!("resumed from sleep; energy reference invalidated");
+            // Firmware commonly resets the charge threshold across suspend.
+            if let Ok(guard) = conn
+                .object_server()
+                .interface::<_, iface::Daemon>(OBJECT_PATH)
+                .await
+            {
+                guard.get().await.reapply_charge_limit();
+            }
         }
 
         let sample = mon.sample();

@@ -6,6 +6,7 @@
 #
 #   sudo ./scripts/install-dev.sh            # policy only, run the daemon by hand
 #   sudo ./scripts/install-dev.sh --systemd  # also install + start the unit
+#   sudo ./scripts/install-dev.sh --enable-charge-control
 #   sudo ./scripts/install-dev.sh --uninstall
 #
 # Installs nothing that writes to hardware: M1b is read-only.
@@ -18,10 +19,32 @@ POLICY=/etc/dbus-1/system.d/org.fwhelper.Daemon1.conf
 UNIT=/etc/systemd/system/fw-helperd.service
 BIN=/usr/libexec/fw-helperd
 CTL=/usr/local/bin/fw-helperctl
+POLKIT=/usr/share/polkit-1/actions/org.fwhelper.policy
+MODPROBE=/etc/modprobe.d/fw-helper.conf
+
+# Opt-in, never a side effect of installing: this changes which mechanism governs
+# battery charging on the machine (ADR 0008).
+if [[ "${1:-}" == "--enable-charge-control" ]]; then
+    echo "This makes fw-helper the battery charge-limit authority."
+    echo "Leave the battery limit in UEFI setup at its default, or the two will fight."
+    echo
+    install -m 644 -v "$REPO/data/fw-helper.modprobe.conf" "$MODPROBE"
+    echo "Reloading cros_charge_control..."
+    modprobe -r cros_charge_control 2>/dev/null || true
+    modprobe cros_charge_control 2>/dev/null || true
+    sleep 1
+    if [[ -e /sys/class/power_supply/BAT1/charge_control_end_threshold ]]; then
+        echo "OK: charge_control_end_threshold now present"
+        echo "    current limit: $(cat /sys/class/power_supply/BAT1/charge_control_end_threshold)%"
+    else
+        echo "Not yet present. A reboot may be needed; check: dmesg | grep -i charge" >&2
+    fi
+    exit 0
+fi
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl disable --now fw-helperd.service 2>/dev/null || true
-    rm -fv "$POLICY" "$UNIT" "$BIN" "$CTL"
+    rm -fv "$POLICY" "$UNIT" "$BIN" "$CTL" "$POLKIT" "$MODPROBE"
     systemctl daemon-reload
     systemctl reload dbus 2>/dev/null || true
     echo "removed."
@@ -76,6 +99,8 @@ else
     echo "note: no fw-helperctl binary found; run 'cargo build --all' then re-run this"
 fi
 
+install -m 644 -v "$REPO/data/org.fwhelper.policy" "$POLKIT"
+
 if [[ "${1:-}" == "--systemd" ]]; then
     [[ -x "$REPO/target/release/fw-helperd" ]] || {
         echo "ERROR: build first: cargo build --release -p fw-helperd" >&2; exit 1; }
@@ -91,4 +116,7 @@ else
     echo "    fw-helperctl status"
     echo
     echo "Stop it with:  sudo pkill -x fw-helperd"
+    echo
+    echo "Charge limiting needs one more opt-in step (see ADR 0008):"
+    echo "    sudo $0 --enable-charge-control"
 fi

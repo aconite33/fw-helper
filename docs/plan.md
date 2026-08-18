@@ -131,7 +131,7 @@ cannot, and the client renders it with no privileges of its own.
 
 ---
 
-### M2 — Battery charge limit
+### M2 — Battery charge limit  ✅ implemented, pending hardware verification
 
 Smallest real feature, lowest risk, immediately useful.
 
@@ -143,8 +143,19 @@ Smallest real feature, lowest risk, immediately useful.
 - polkit action `org.fwhelper.set-charge-limit`
 - Persist across reboot; re-apply on resume
 
+- [x] `ChargeControl` in core: range check (20–100), read-back verification, errors
+      that name the fix rather than describing the symptom
+- [x] `SetChargeLimit` D-Bus method behind polkit action `org.fwhelper.set-charge-limit`
+      (`auth_admin_keep`, so a slider does not prompt on every movement)
+- [x] polkit fails **closed** — an unreachable polkit denies rather than allows
+- [x] State persisted to `/var/lib/fw-helper/state`, re-applied at startup and on resume,
+      because the threshold survives neither
+- [x] `fw-helperctl charge-limit N`, and `ChargeLimit` on the interface
+- [x] `--enable-charge-control` as an explicit opt-in, never a side effect of installing
+- [ ] **Verify on hardware**: enable the module parameter, set a limit, confirm it holds
+      across suspend and reboot
+
 **Exit:** `fw-helperctl charge-limit 80` holds across a reboot and a suspend/resume cycle.
-**Gated on Q3.**
 
 ---
 

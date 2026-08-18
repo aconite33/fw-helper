@@ -3,21 +3,39 @@
 //! M1b is read-only: properties only, no methods that touch hardware. Writes arrive
 //! with M2 onward, each behind its own polkit action (ADR 0003).
 
-use crate::wire;
-use fw_helper_core::{Capabilities, Telemetry};
+use crate::state::State;
+use crate::{polkit, wire};
+use fw_helper_core::{Capabilities, ChargeControl, Sysfs, Telemetry};
 use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
 pub struct Daemon {
+    fs: Sysfs,
     caps: Capabilities,
     latest: Telemetry,
+    state: State,
 }
 
 impl Daemon {
-    pub fn new(caps: Capabilities) -> Self {
+    pub fn new(fs: Sysfs, caps: Capabilities, state: State) -> Self {
         Self {
+            fs,
             caps,
             latest: Telemetry::default(),
+            state,
+        }
+    }
+
+    /// Re-apply the persisted charge limit. Called at startup, because
+    /// `charge_control_end_threshold` does not survive a reboot, and on resume,
+    /// because firmware may reset it.
+    pub fn reapply_charge_limit(&self) {
+        let Some(limit) = self.state.charge_limit else {
+            return;
+        };
+        match ChargeControl::new(&self.fs).set(limit) {
+            Ok(()) => eprintln!("re-applied charge limit {limit}%"),
+            Err(e) => eprintln!("could not re-apply charge limit {limit}%: {e}"),
         }
     }
 
@@ -59,5 +77,42 @@ impl Daemon {
     #[zbus(property)]
     async fn version(&self) -> u32 {
         1
+    }
+
+    /// Current charge limit as the EC reports it, or 0 when unsupported.
+    #[zbus(property)]
+    async fn charge_limit(&self) -> u8 {
+        ChargeControl::new(&self.fs).read().unwrap_or(0)
+    }
+
+    /// Set the battery charge limit.
+    ///
+    /// The first method in this interface that writes to hardware. Two things are
+    /// non-negotiable and set the pattern for every write that follows: polkit is
+    /// checked before touching anything, and the value is read back afterwards so a
+    /// silent override surfaces as an error rather than as success (ADR 0008).
+    async fn set_charge_limit(
+        &mut self,
+        percent: u8,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        let sender = header
+            .sender()
+            .map(|s| s.to_string())
+            .ok_or_else(|| zbus::fdo::Error::AuthFailed("no caller identity".into()))?;
+
+        polkit::check(conn, &sender, polkit::actions::SET_CHARGE_LIMIT)
+            .await
+            .map_err(zbus::fdo::Error::AuthFailed)?;
+
+        ChargeControl::new(&self.fs)
+            .set(percent)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        self.state.charge_limit = Some(percent);
+        self.state.save();
+        eprintln!("charge limit set to {percent}% by {sender}");
+        Ok(())
     }
 }

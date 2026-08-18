@@ -23,6 +23,13 @@ pub trait Daemon {
     fn critical_temperatures(&self) -> zbus::Result<HashMap<String, f64>>;
     #[zbus(property)]
     fn version(&self) -> zbus::Result<u32>;
+
+    /// Current charge limit, or 0 when unsupported.
+    #[zbus(property)]
+    fn charge_limit(&self) -> zbus::Result<u8>;
+
+    /// Set the battery charge limit. May prompt via polkit.
+    fn set_charge_limit(&self, percent: u8) -> zbus::Result<()>;
 }
 
 /// Highest interface version this client understands.
@@ -65,6 +72,8 @@ pub struct Snapshot {
     pub platform_profile: Option<String>,
     pub control_sensor: Option<String>,
     pub temps: Vec<Sensor>,
+    /// `None` when charge control is unsupported on this machine.
+    pub charge_limit: Option<u8>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -98,6 +107,9 @@ impl Snapshot {
         temps.sort_by(|a, b| b.celsius.total_cmp(&a.celsius));
 
         Ok(Self {
+            // The daemon reports 0 for "unsupported"; keep that distinction here
+            // rather than leaking a sentinel value to consumers.
+            charge_limit: d.charge_limit().ok().filter(|v| *v > 0),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

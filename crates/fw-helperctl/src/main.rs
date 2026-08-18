@@ -16,6 +16,7 @@ fw-helperctl — Framework laptop firmware control
 USAGE:
     fw-helperctl status          capabilities and one telemetry sample
     fw-helperctl watch [secs]    live telemetry, 1 Hz (default 10s)
+    fw-helperctl charge-limit N  set the battery charge limit (20-100)
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -26,6 +27,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("status") | None => status(),
         Some("watch") => watch(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10)),
+        Some("charge-limit") => charge_limit(args.get(1).map(String::as_str)),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -85,6 +87,9 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
     if let Some(pct) = s.battery_percent {
         let st = s.battery_status.clone().unwrap_or_default();
         println!("  battery            {pct}% ({st})");
+    }
+    if let Some(limit) = s.charge_limit {
+        println!("  charge limit       {limit}%");
     }
 
     if !s.temps.is_empty() {
@@ -147,6 +152,34 @@ fn status_direct() {
             println!("  {mark} {:<22} {:>6.1} C   ({crit})", t.label, t.celsius);
         }
         println!("\n  * = sensor a fan curve would follow");
+    }
+}
+
+/// Setting a limit requires the daemon: this is a hardware write, and it goes
+/// through polkit inside the daemon rather than being attempted directly.
+fn charge_limit(arg: Option<&str>) {
+    let Some(arg) = arg else {
+        eprintln!("usage: fw-helperctl charge-limit <20-100>");
+        std::process::exit(2);
+    };
+    let Ok(percent) = arg.parse::<u8>() else {
+        eprintln!("not a number: {arg}");
+        std::process::exit(2);
+    };
+
+    let (d, _) = match connect() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fw-helperd unavailable ({e}); setting a charge limit requires it");
+            std::process::exit(1);
+        }
+    };
+    match d.set_charge_limit(percent) {
+        Ok(()) => println!("charge limit set to {percent}%"),
+        Err(e) => {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

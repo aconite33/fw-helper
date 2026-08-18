@@ -27,7 +27,10 @@ pub fn spawn() -> async_channel::Receiver<Update> {
         let (proxy, _version) = match connect() {
             Ok(pair) => pair,
             Err(e) => {
-                if tx.send_blocking(Update::Disconnected(e.to_string())).is_err() {
+                if tx
+                    .send_blocking(Update::Disconnected(e.to_string()))
+                    .is_err()
+                {
                     return; // UI gone
                 }
                 thread::sleep(RECONNECT_DELAY);
