@@ -1,7 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/fw-helper-core", "crates/fw-helperctl", "crates/fw-helperd"]
-# fw-helper-gui / fw-helper-restore-fan join at M6 and M3.
+members = [
+    "crates/fw-helper-core",
+    "crates/fw-helper-client",
+    "crates/fw-helperctl",
+    "crates/fw-helperd",
+    "crates/fw-helper-gui",
+]
+# fw-helper-restore-fan joins at M3.
 
 [workspace.package]
 version = "0.0.1"

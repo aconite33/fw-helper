@@ -1,0 +1,18 @@
+[package]
+name = "fw-helper-gui"
+description = "Desktop UI for fw-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The user-facing binary is just `fw-helper`.
+[[bin]]
+name = "fw-helper"
+path = "src/main.rs"
+
+[dependencies]
+fw-helper-client = { path = "../fw-helper-client" }
+async-channel = "2"
+gtk = { version = "0.10.3", package = "gtk4", features = ["v4_14"] }
+adw = { version = "0.8", package = "libadwaita", features = ["v1_5"] }

@@ -218,7 +218,17 @@ Ties M2–M4 together into the actual product.
 
 ---
 
-### M6 — GUI
+### M6 — GUI  🟡 read-only view landed early (during M1b)
+
+The telemetry view was pulled forward to have something visible. What exists:
+`crates/fw-helper-gui` (binary `fw-helper`), a libadwaita window showing live stats,
+per-sensor temperature bars scaled to each sensor's own critical threshold, and
+capabilities greyed out with their reason. Worker thread owns D-Bus so the main loop
+never blocks; reconnects on its own if the daemon restarts.
+
+Still to do below. Controls arrive as M2–M5 land.
+
+### M6 (remainder) — GUI controls
 
 - GTK4 + libadwaita main window: status, profile picker, curve editor, charge slider
 - Tray icon via StatusNotifierItem. **Note:** stock Ubuntu GNOME needs the AppIndicator

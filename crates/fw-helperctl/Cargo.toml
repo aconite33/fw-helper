@@ -7,5 +7,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fw-helper-client = { version = "0.0.1", path = "../fw-helper-client" }
 fw-helper-core = { path = "../fw-helper-core" }
-zbus = "5.13.2"

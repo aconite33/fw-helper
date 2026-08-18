@@ -1,0 +1,11 @@
+[package]
+name = "fw-helper-client"
+description = "D-Bus client for fw-helperd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# zbus lives here, not in fw-helper-core (ADR 0010).
+[dependencies]
+zbus = "5"
