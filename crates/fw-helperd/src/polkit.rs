@@ -7,10 +7,21 @@
 use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
+use std::time::Duration;
+
 /// Subject type understood by polkit for a D-Bus caller.
 const SUBJECT_KIND: &str = "system-bus-name";
+const FLAG_NONE: u32 = 0;
 /// `AllowUserInteraction` — lets polkit prompt rather than refusing outright.
 const FLAG_ALLOW_INTERACTION: u32 = 1;
+
+/// Upper bound on how long we will wait for a human to answer a polkit prompt.
+///
+/// This is not tuning. **polkit blocks indefinitely when no authentication agent
+/// can service the request** — which happens for any caller not attached to a login
+/// session, such as a shell with no `XDG_SESSION_ID`. Without a bound, one such call
+/// wedges the method handler forever.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[zbus::proxy(
     interface = "org.freedesktop.PolicyKit1.Authority",
@@ -45,15 +56,29 @@ pub async fn check(conn: &zbus::Connection, sender: &str, action: &str) -> Resul
     details.insert("name", name);
     let subject = (SUBJECT_KIND, details);
 
-    let (authorized, _challenge, _info) = authority
-        .check_authorization(&subject, action, HashMap::new(), FLAG_ALLOW_INTERACTION, "")
+    // Ask without interaction first. This always returns promptly, and covers the
+    // already-authorized cases: root, an admin whose auth_admin_keep is still
+    // valid, or a permissive local rule. Only if that fails do we risk a prompt.
+    let (authorized, _challenge, _) = authority
+        .check_authorization(&subject, action, HashMap::new(), FLAG_NONE, "")
         .await
         .map_err(|e| format!("polkit check failed: {e}"))?;
-
     if authorized {
-        Ok(())
-    } else {
-        Err(format!("not authorized for {action}"))
+        return Ok(());
+    }
+
+    // Authentication is genuinely required. Now allow a prompt, bounded.
+    let prompt =
+        authority.check_authorization(&subject, action, HashMap::new(), FLAG_ALLOW_INTERACTION, "");
+    match tokio::time::timeout(PROMPT_TIMEOUT, prompt).await {
+        Ok(Ok((true, _, _))) => Ok(()),
+        Ok(Ok((false, _, _))) => Err(format!("not authorized for {action}")),
+        Ok(Err(e)) => Err(format!("polkit check failed: {e}")),
+        Err(_) => Err(format!(
+            "no answer from polkit within {}s for {action}. No authentication agent \
+             is available for this caller — run from a desktop session, or as root",
+            PROMPT_TIMEOUT.as_secs()
+        )),
     }
 }
 

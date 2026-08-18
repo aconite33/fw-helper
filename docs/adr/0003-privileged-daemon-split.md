@@ -74,6 +74,14 @@ offering controls that silently do nothing.**
 **Negative**
 
 - Two processes, an IPC boundary, and a schema to version.
+- **polkit can block indefinitely.** `CheckAuthorization` with `AllowUserInteraction`
+  never returns when no authentication agent can service the caller — which is the
+  case for any process not attached to a login session (no `XDG_SESSION_ID`), such as
+  a shell spawned outside the desktop session. Two rules follow, and both are load
+  bearing: check without interaction first so already-authorized callers answer
+  immediately, and put a hard timeout on the interactive call. A write method must
+  also take `&self`, never `&mut self` — the latter makes zbus hold the interface
+  write lock for the duration, so one pending prompt stalls telemetry for every client.
 - polkit prompts are intrusive if configured naively. Mitigate with `auth_admin_keep`
   (session-scoped) and by treating `ResetToFirmwareDefaults` as always-allowed — returning
   hardware to a safe state should never require a password.

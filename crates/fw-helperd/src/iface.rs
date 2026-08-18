@@ -7,13 +7,18 @@ use crate::state::State;
 use crate::{polkit, wire};
 use fw_helper_core::{Capabilities, ChargeControl, Sysfs, Telemetry};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use zbus::zvariant::OwnedValue;
 
 pub struct Daemon {
     fs: Sysfs,
     caps: Capabilities,
     latest: Telemetry,
-    state: State,
+    /// Behind a mutex so write methods can take `&self`. A `&mut self` method makes
+    /// zbus hold the interface **write** lock for the whole call, and a polkit prompt
+    /// can legitimately take tens of seconds — which would stall telemetry for every
+    /// client while a password dialog sits on screen.
+    state: Mutex<State>,
 }
 
 impl Daemon {
@@ -22,7 +27,7 @@ impl Daemon {
             fs,
             caps,
             latest: Telemetry::default(),
-            state,
+            state: Mutex::new(state),
         }
     }
 
@@ -30,7 +35,7 @@ impl Daemon {
     /// `charge_control_end_threshold` does not survive a reboot, and on resume,
     /// because firmware may reset it.
     pub fn reapply_charge_limit(&self) {
-        let Some(limit) = self.state.charge_limit else {
+        let Some(limit) = self.state.lock().ok().and_then(|s| s.charge_limit) else {
             return;
         };
         match ChargeControl::new(&self.fs).set(limit) {
@@ -92,7 +97,7 @@ impl Daemon {
     /// checked before touching anything, and the value is read back afterwards so a
     /// silent override surfaces as an error rather than as success (ADR 0008).
     async fn set_charge_limit(
-        &mut self,
+        &self,
         percent: u8,
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
@@ -110,8 +115,11 @@ impl Daemon {
             .set(percent)
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        self.state.charge_limit = Some(percent);
-        self.state.save();
+        // Lock only to record the result. Never held across an await.
+        if let Ok(mut state) = self.state.lock() {
+            state.charge_limit = Some(percent);
+            state.save();
+        }
         eprintln!("charge limit set to {percent}% by {sender}");
         Ok(())
     }
