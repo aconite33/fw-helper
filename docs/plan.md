@@ -81,20 +81,40 @@ a line of application code exists.
 
 ---
 
-### M1 — Daemon skeleton, read-only
+### M1 — Read-only foundation
 
-No hardware writes at all. Prove the plumbing.
+No hardware writes at all. Prove the plumbing. Split in two so the hardware layer lands
+dependency-free and stays that way.
 
-- Cargo workspace, `rust-toolchain.toml`, CI (fmt, clippy, test)
-- `fw-helperd` as a systemd service, D-Bus system-bus name `org.fwhelper.Daemon1`
-- **Capability probing at startup** — detect each knob, expose via `Capabilities` property
-  ([0003](adr/0003-privileged-daemon-split.md)). This is what stops the GUI offering dead controls
-- `Telemetry` property: temps, fan RPM, package power (from `energy_uj` deltas), battery
-- Sysfs access layer behind a trait, with a fake root for tests ([0004](adr/0004-sysfs-first-hardware-access.md))
-- `fw-helperctl status` renders it
+#### M1a — hardware layer, zero dependencies  ✅ scaffolded (unbuilt)
 
-**Exit:** `fw-helperctl status` prints live telemetry on the real machine, and the sysfs layer
-has unit tests running against a fixture directory with no hardware.
+Deliberately std-only: no external crates, so it builds and tests anywhere, including CI
+with no network, and there is no dependency-resolution risk to debug alongside logic bugs.
+
+- [x] Cargo workspace, `rust-toolchain.toml`, GitHub Actions (fmt, clippy, test)
+- [x] `Sysfs` — every path rooted, so fixtures replace hardware
+      ([0004](adr/0004-sysfs-first-hardware-access.md))
+- [x] `EnergySampler` — wrap correction, multi-wrap and suspend detection, 0.1 W
+      quantization ([0009](adr/0009-power-telemetry-rate-limited-and-quantized.md))
+- [x] `Capabilities::probe` — every knob resolves to available, or a reason with a fix
+- [x] `Monitor` — temps, fan RPM, package power, battery, platform profile
+- [x] `fw-helperctl status` / `watch`
+- [x] Fixture tests: a synthetic Framework 13 tree, plus a bare-root degradation case
+- [ ] **Build and test it.** No Rust toolchain on the dev machine yet — this code has
+      never been compiled
+
+**Exit:** `cargo test --all` green, `cargo clippy -- -D warnings` clean, and
+`sudo fw-helperctl status` matching `scripts/fw-probe.sh` on real hardware.
+
+#### M1b — daemon and D-Bus
+
+- `fw-helperd` as a systemd service, system-bus name `org.fwhelper.Daemon1` (zbus)
+- Publish `Capabilities` and `Telemetry`; enforce the 1 Hz / 0.1 W limits from
+  [0009](adr/0009-power-telemetry-rate-limited-and-quantized.md) at the interface boundary
+- logind `PrepareForSleep` → `Monitor::on_resume()` to invalidate the energy reference
+- Repoint `fw-helperctl` at D-Bus so it stops needing root
+
+**Exit:** `fw-helperctl status` works unprivileged, against the daemon.
 
 ---
 

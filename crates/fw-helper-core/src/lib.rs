@@ -1,0 +1,29 @@
+//! Hardware access layer for Framework laptops.
+//!
+//! Every path goes through [`Sysfs`], which carries a filesystem root. Production
+//! uses `/`; tests point it at a fixture tree so the whole capability and telemetry
+//! stack runs with no hardware attached. See `docs/adr/0004-sysfs-first-hardware-access.md`.
+
+pub mod caps;
+pub mod energy;
+pub mod sysfs;
+pub mod telemetry;
+
+pub use caps::{Cap, Capabilities};
+pub use energy::EnergySampler;
+pub use sysfs::Sysfs;
+pub use telemetry::{Monitor, Telemetry};
+
+/// Sysfs paths this crate knows about, relative to the [`Sysfs`] root.
+pub mod paths {
+    /// Authoritative RAPL zone on Framework 13 Intel — see baseline Q2.
+    /// The MSR zone (`intel-rapl:0`) reports a meaningless 200 W PL1.
+    pub const RAPL_MMIO: &str = "sys/class/powercap/intel-rapl-mmio:0";
+    pub const PLATFORM_PROFILE: &str = "sys/firmware/acpi/platform_profile";
+    pub const PLATFORM_PROFILE_CHOICES: &str = "sys/firmware/acpi/platform_profile_choices";
+    pub const BATTERY: &str = "sys/class/power_supply/BAT1";
+    pub const CHARGE_LIMIT_PARAM: &str =
+        "sys/module/cros_charge_control/parameters/probe_with_fwk_charge_control";
+    /// hwmon node *name* — indices are not stable across boots, always resolve by name.
+    pub const EC_HWMON_NAME: &str = "cros_ec";
+}

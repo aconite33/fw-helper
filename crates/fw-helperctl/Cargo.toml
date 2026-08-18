@@ -1,0 +1,10 @@
+[package]
+name = "fw-helperctl"
+description = "Command-line control for fw-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fw-helper-core = { path = "../fw-helper-core" }

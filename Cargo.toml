@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/fw-helper-core", "crates/fw-helperctl"]
+# fw-helperd / fw-helper-gui / fw-helper-restore-fan join at M1b, M6, M3.
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/Wooloomooloo2/fw-helper"
+rust-version = "1.74"

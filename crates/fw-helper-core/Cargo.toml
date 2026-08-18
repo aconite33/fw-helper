@@ -1,0 +1,11 @@
+[package]
+name = "fw-helper-core"
+description = "Hardware access and telemetry for Framework laptops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Intentionally dependency-free. Everything here is std-only so the hardware
+# layer can be built and tested anywhere, including in CI with no network.
+[dependencies]
