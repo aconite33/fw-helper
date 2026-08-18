@@ -106,7 +106,9 @@ mod tests {
         let mut s = EnergySampler::new(RANGE);
         s.sample(0, t0);
         // 25 J over 1 s == 25 W
-        let w = s.sample(25_000_000, at(t0, 1)).expect("should yield a value");
+        let w = s
+            .sample(25_000_000, at(t0, 1))
+            .expect("should yield a value");
         assert!((w - 25.0).abs() < 0.001, "got {w}");
     }
 
@@ -115,8 +117,10 @@ mod tests {
         let t0 = Instant::now();
         let mut s = EnergySampler::new(RANGE);
         s.sample(RANGE - 10_000_000, t0); // 10 J short of the top
-        // wraps and lands 15 J past zero => 25 J total over 1 s
-        let w = s.sample(15_000_000, at(t0, 1)).expect("should yield a value");
+                                          // wraps and lands 15 J past zero => 25 J total over 1 s
+        let w = s
+            .sample(15_000_000, at(t0, 1))
+            .expect("should yield a value");
         assert!((w - 25.0).abs() < 0.001, "got {w}");
     }
 

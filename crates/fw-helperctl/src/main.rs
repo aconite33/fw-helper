@@ -80,7 +80,10 @@ fn status(mon: &mut Monitor) {
             } else {
                 " "
             };
-            println!("  {marker} {:<22} {:>6.1} C   ({crit})", temp.label, temp.celsius);
+            println!(
+                "  {marker} {:<22} {:>6.1} C   ({crit})",
+                temp.label, temp.celsius
+            );
         }
         println!("\n  * = sensor a fan curve would follow");
     }

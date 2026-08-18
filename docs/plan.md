@@ -100,8 +100,11 @@ with no network, and there is no dependency-resolution risk to debug alongside l
 - [x] `Monitor` — temps, fan RPM, package power, battery, platform profile
 - [x] `fw-helperctl status` / `watch`
 - [x] Fixture tests: a synthetic Framework 13 tree, plus a bare-root degradation case
-- [ ] **Build and test it.** No Rust toolchain on the dev machine yet — this code has
-      never been compiled
+- [x] **Built and tested** on rustc 1.97.1 — 15 tests green, clippy clean under
+      `-D warnings`, rustfmt clean
+- [x] Cross-checked against `scripts/fw-probe.sh` on real hardware: capabilities, sensor
+      labels, critical thresholds and control-sensor selection all agree
+- [ ] Verify package power under root (the one path unprivileged runs cannot exercise)
 
 **Exit:** `cargo test --all` green, `cargo clippy -- -D warnings` clean, and
 `sudo fw-helperctl status` matching `scripts/fw-probe.sh` on real hardware.

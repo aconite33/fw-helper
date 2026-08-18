@@ -112,7 +112,10 @@ fn finds_hwmon_by_name_not_index() {
 #[test]
 fn charge_limit_available_when_threshold_exists() {
     let f = Fixture::framework_13("charge-ok");
-    f.write("sys/class/power_supply/BAT1/charge_control_end_threshold", "80\n");
+    f.write(
+        "sys/class/power_supply/BAT1/charge_control_end_threshold",
+        "80\n",
+    );
     assert!(Capabilities::probe(&f.sysfs()).charge_limit.is_available());
 }
 
@@ -125,10 +128,7 @@ fn degrades_gracefully_with_no_hardware() {
     // Nothing panics, and every knob explains itself.
     for (name, cap) in caps.summary() {
         assert!(!cap.is_available(), "{name} should be unavailable");
-        assert!(
-            !format!("{cap}").is_empty(),
-            "{name} must carry a reason"
-        );
+        assert!(!format!("{cap}").is_empty(), "{name} must carry a reason");
     }
 }
 

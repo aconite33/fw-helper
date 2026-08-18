@@ -156,8 +156,16 @@ mod tests {
     fn control_temp_prefers_peci() {
         let t = Telemetry {
             temps: vec![
-                TempReading { label: "ddr_f75303@4d".into(), celsius: 90.0, critical: None },
-                TempReading { label: "peci-temp".into(), celsius: 46.8, critical: None },
+                TempReading {
+                    label: "ddr_f75303@4d".into(),
+                    celsius: 90.0,
+                    critical: None,
+                },
+                TempReading {
+                    label: "peci-temp".into(),
+                    celsius: 46.8,
+                    critical: None,
+                },
             ],
             ..Default::default()
         };
@@ -168,8 +176,16 @@ mod tests {
     fn control_temp_falls_back_to_hottest() {
         let t = Telemetry {
             temps: vec![
-                TempReading { label: "battery_temp@b".into(), celsius: 30.0, critical: None },
-                TempReading { label: "local_f75397@4c".into(), celsius: 55.0, critical: None },
+                TempReading {
+                    label: "battery_temp@b".into(),
+                    celsius: 30.0,
+                    critical: None,
+                },
+                TempReading {
+                    label: "local_f75397@4c".into(),
+                    celsius: 55.0,
+                    critical: None,
+                },
             ],
             ..Default::default()
         };
