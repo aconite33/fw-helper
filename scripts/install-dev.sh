@@ -50,14 +50,31 @@ if journalctl -u dbus.service --since "10 seconds ago" --no-pager 2>/dev/null \
 fi
 
 # Symlink the CLI onto PATH so `fw-helperctl` works from any directory. It is
-# unprivileged and holds no hardware access -- everything goes over D-Bus.
+# unprivileged and holds no hardware access; everything goes over D-Bus.
+#
+# Pick whichever build is NEWEST, not release-by-preference: a stale release binary
+# left over from an earlier milestone will silently shadow a fresh debug build and
+# behave like an old version of the program.
+newest=""
 for build in release debug; do
-    if [[ -x "$REPO/target/$build/fw-helperctl" ]]; then
-        ln -sfnv "$REPO/target/$build/fw-helperctl" "$CTL"
-        break
+    candidate="$REPO/target/$build/fw-helperctl"
+    [[ -x "$candidate" ]] || continue
+    if [[ -z "$newest" || "$candidate" -nt "$newest" ]]; then
+        newest="$candidate"
     fi
 done
-[[ -e "$CTL" ]] || echo "note: no fw-helperctl binary found; run 'cargo build' then re-run this"
+
+if [[ -n "$newest" ]]; then
+    ln -sfnv "$newest" "$CTL"
+    other=$([[ "$newest" == *release* ]] && echo "$REPO/target/debug/fw-helperctl" \
+                                         || echo "$REPO/target/release/fw-helperctl")
+    if [[ -x "$other" ]]; then
+        echo "note: both debug and release builds exist; linked the newer one."
+        echo "      run 'cargo build --release --all' to keep them in step."
+    fi
+else
+    echo "note: no fw-helperctl binary found; run 'cargo build --all' then re-run this"
+fi
 
 if [[ "${1:-}" == "--systemd" ]]; then
     [[ -x "$REPO/target/release/fw-helperd" ]] || {

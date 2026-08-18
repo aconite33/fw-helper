@@ -194,7 +194,9 @@ delivers the thermal and acoustic outcome people actually want from undervolting
 
 **The stock EC fan curve has real headroom.** Dropping 12 °C moved the fan only ~7%
 (3100 → 2925 rpm), and the machine was already at 2900 rpm at 64.8 °C while sitting at
-0 rpm at 43.9 °C. So the EC curve ramps steeply somewhere between ~45 °C and ~65 °C and then
+0 rpm at 43.9 °C. Later observation during M1b narrows the knee further: **0 rpm at 44.9 °C
+but ~2020 rpm at 53.9 °C**, so the fan starts somewhere in 45–54 °C and is already at two
+thirds of its loaded speed by 54 °C. So the EC curve ramps steeply somewhere between ~45 °C and ~65 °C and then
 flattens. A custom curve that is less aggressive in the 55–70 °C band is where M3's audible
 benefit lives — see M3 notes.
 

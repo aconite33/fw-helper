@@ -110,7 +110,7 @@ with no network, and there is no dependency-resolution risk to debug alongside l
 
 **Exit: reached.**
 
-#### M1b — daemon and D-Bus  ✅ implemented, pending root verification
+#### M1b — daemon and D-Bus  ✅ complete
 
 - [x] `fw-helperd` on the system bus as `org.fwhelper.Daemon1` (zbus 5.19)
 - [x] `Capabilities`, `Telemetry`, `CriticalTemperatures`, `Version` properties, with
@@ -123,11 +123,11 @@ with no network, and there is no dependency-resolution risk to debug alongside l
 - [x] D-Bus policy, hardened systemd unit, `scripts/install-dev.sh`
 - [x] CI: `cargo deny`, and a gate failing the build if `fw-helper-core` gains a dependency
       ([0010](adr/0010-dependency-boundary.md))
-- [ ] **Verify as root on the system bus** — package power is the one property an
-      unprivileged daemon cannot produce
+- [x] **Verified as root on the system bus**: `fw-helperctl` running as uid 1000 reads
+      package power (3.2 W idle, tracking load live) from a root daemon over D-Bus
 
-**Exit:** `fw-helperctl status` shows package power while running unprivileged, against a
-root daemon on the system bus.
+**Exit: reached.** The privilege split is real: the daemon opens a counter the client
+cannot, and the client renders it with no privileges of its own.
 
 ---
 
