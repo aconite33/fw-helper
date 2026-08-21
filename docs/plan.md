@@ -205,6 +205,19 @@ out, without needing any intervention in the second.
 The highest-value and highest-risk feature. Do not shortcut
 [ADR 0006](adr/0006-fail-safe-fan-control.md).
 
+- [x] **The learned firmware floor persists across restarts** (2026-08-21). Written to
+  `/var/lib/fw-helper/state` as `fan_floor=54:0,56:0,...`, periodically (60 s) *and* on
+  clean shutdown — periodically because `SIGKILL` is a supported way for this daemon to
+  end, and everything learned since the last write would go with it. The write goes
+  through the `Daemon` rather than the poll loop, because the state file also holds the
+  charge limit and two writers would silently drop one. Malformed entries are skipped
+  rather than failing the load, since a damaged floor costs some quiet while refusing the
+  file would also lose the charge limit.
+  **Verified**: 11 observations saved after a heating cycle (firmware silent through
+  44–62 °C), `restored 11 firmware fan floor observations` on restart, floor preserved.
+  The run's final check landed at 31.9 °C rather than the intended 55 °C, so the
+  behavioural payoff at mid temperatures rests on the restored entries plus the earlier
+  51.9 °C verification, not on this run
 - [x] **Curve engine** (`fw-helper-core/src/curve.rs`, 2026-08-21): validated
   interpolated temp→duty points, asymmetric hysteresis, ramp limiting. Reached over D-Bus
   as `SetFanCurve` and from `fw-helperctl fan curve [T:D,...]`. The curve produces a
@@ -218,10 +231,9 @@ The highest-value and highest-risk feature. Do not shortcut
   92–112, with **2 duty direction reversals across 45 settled samples** (no hunting) and
   no step beyond the ramp limit. Coming down it beat firmware at every point measured —
   duty 77 vs ~90 at 60 °C, 61 vs ~82 at 55 °C, 38 vs ~74 at 50 °C.
-  **Known limitation**: the run also showed the curve asking for 0 at 55 °C and getting
-  61, because the daemon had just restarted and the observed floor was empty, so the
-  cold-start model applied. Persisting observations across restarts is the obvious fix
-  and is not done
+  A run also showed the curve asking for 0 at 55 °C and getting 61, because the daemon
+  had just restarted and the observed floor was empty, so the cold-start model applied.
+  Fixed below.
 - **Where the benefit actually is — revised 2026-08-21.** The paragraph below was written
   from Q6 data that turned out to be firmware's *descending* branch. Measured while
   heating, firmware is silent right through the 55–70 °C band and does not start the fan

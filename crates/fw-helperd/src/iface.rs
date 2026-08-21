@@ -143,6 +143,20 @@ impl Daemon {
         }
     }
 
+    /// Record the learned firmware floor alongside the rest of the persisted state.
+    ///
+    /// Lives here because the state file is one file with one owner: writing it from
+    /// the poll loop directly would race the charge-limit write and silently drop one.
+    pub fn save_floor(&self, observations: Vec<(f64, u8)>) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.floor == observations {
+                return;
+            }
+            state.floor = observations;
+            state.save();
+        }
+    }
+
     /// Called by the poll task. Returns true when the published view actually changed,
     /// so we only emit a PropertiesChanged signal when there is something to say.
     pub fn update(&mut self, t: Telemetry) -> bool {
@@ -427,6 +441,7 @@ mod tests {
         let caps = Capabilities::probe(&fs_);
         let state = State {
             charge_limit: persisted,
+            floor: Vec::new(),
         };
         let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));
         let wd = crate::watchdog::Watchdog::new(Arc::clone(&lease));

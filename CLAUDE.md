@@ -171,9 +171,10 @@ Climbing, firmware is silent through 55–70 °C, so there is little to win goin
 is coming *down*, where firmware holds duty 50–90 to 44.9 °C. Measured, the curve beats it
 by 13–36 counts through that range, with no hunting.
 
-**Open limitation:** the observed floor is lost on daemon restart, and the cold-start model
-is the loud one — measured, a curve asking for silence at 55 °C got duty 61 right after a
-restart. Persisting observations to `/var/lib/fw-helper/state` is the obvious fix.
+**The observed floor now persists** to `/var/lib/fw-helper/state` as
+`fan_floor=54:0,56:0,...`, saved every 60 s and on clean shutdown — periodically because
+`SIGKILL` is a supported ending and everything since the last write would go with it.
+Verified: 11 observations saved and restored across a restart.
 
 Next: M3 is feature-complete; remaining is M4's power limits, which the plan says to design
 alongside the curve — 10 W of power limit buys ~12 °C, so the two compose.

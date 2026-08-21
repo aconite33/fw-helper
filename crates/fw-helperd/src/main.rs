@@ -56,6 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(limit) = state.charge_limit {
         eprintln!("persisted charge limit: {limit}%");
     }
+    if !state.floor.is_empty() {
+        let n = lease.restore_floor(state.floor.clone());
+        eprintln!("restored {n} firmware fan floor observations");
+    }
     // Started before the bus name is claimed: from the moment a client can ask for
     // manual fan control, the thing that takes it back must already be running.
     let watchdog = watchdog::Watchdog::new(Arc::clone(&lease));
@@ -109,6 +113,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => eprintln!("SIGINT, shutting down"),
         _ = sigterm.recv()          => eprintln!("SIGTERM, shutting down"),
     }
+    // Write out anything learned since the last periodic save. SIGKILL bypasses this,
+    // which is why the periodic save exists as well.
+    if let Some((_, observations)) = lease.floor_snapshot() {
+        if !observations.is_empty() {
+            if let Ok(guard) = conn
+                .object_server()
+                .interface::<_, iface::Daemon>(OBJECT_PATH)
+                .await
+            {
+                guard.get().await.save_floor(observations);
+            }
+        }
+    }
     shut_down_fan(&lease, &watchdog);
     poll.abort();
     Ok(())
@@ -136,6 +153,13 @@ fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
         Some(Err(e)) => eprintln!("fan: not restoring manual control after resume: {e}"),
     }
 }
+
+/// How often the learned fan floor is written out.
+///
+/// Not every tick: most ticks learn nothing, and the file also holds the charge limit.
+/// Not only at shutdown either, because `SIGKILL` is a supported way for this daemon to
+/// end and everything learned since the last write would go with it.
+const FLOOR_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Is the machine heating? Carries the previous answer through unchanged readings.
 ///
@@ -383,6 +407,8 @@ async fn poll_loop(
     let started = std::time::Instant::now();
     let mut restore_fan_after_resume = false;
     let mut govern = Govern::default();
+    let mut last_floor_save = std::time::Instant::now();
+    let mut saved_floor_revision = 0u64;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
@@ -413,6 +439,25 @@ async fn poll_loop(
         }
 
         let sample = mon.sample();
+
+        // Persist anything newly learned about the firmware floor, at most once a
+        // minute and only when the revision has actually moved.
+        if last_floor_save.elapsed() >= FLOOR_SAVE_INTERVAL {
+            last_floor_save = std::time::Instant::now();
+            if let Some((revision, observations)) = lease.floor_snapshot() {
+                if revision != saved_floor_revision && !observations.is_empty() {
+                    saved_floor_revision = revision;
+                    if let Ok(guard) = conn
+                        .object_server()
+                        .interface::<_, iface::Daemon>(OBJECT_PATH)
+                        .await
+                    {
+                        guard.get().await.save_floor(observations);
+                    }
+                }
+            }
+        }
+
         if std::mem::take(&mut restore_fan_after_resume) {
             restore_fan(&lease, &sample);
         }

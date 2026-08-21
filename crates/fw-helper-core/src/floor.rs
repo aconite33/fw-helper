@@ -120,6 +120,9 @@ pub struct FirmwareFloor {
     /// duty 0 here" — a real observation, and what firmware does below ~65 °C — from
     /// "nothing seen yet", which must fall back to the model.
     seen: [bool; BUCKETS],
+    /// Bumped whenever an observation changes anything, so a caller can tell whether
+    /// there is something new worth persisting without diffing the whole table.
+    revision: u64,
 }
 
 impl Default for FirmwareFloor {
@@ -133,6 +136,7 @@ impl FirmwareFloor {
         Self {
             observed: [0; BUCKETS],
             seen: [false; BUCKETS],
+            revision: 0,
         }
     }
 
@@ -196,6 +200,39 @@ impl FirmwareFloor {
         if !self.seen[i] || ec_duty > self.observed[i] {
             self.observed[i] = ec_duty;
             self.seen[i] = true;
+            self.revision += 1;
+        }
+    }
+
+    /// Changes so far. Compare against a previously held value to know whether there
+    /// is anything new to persist.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Every observation, as (temperature, duty) pairs at the low edge of each bucket.
+    ///
+    /// Exported by temperature rather than by bucket index so the file stays readable
+    /// and survives a change to the bucket width: [`Self::restore`] re-buckets whatever
+    /// it is given.
+    pub fn observations(&self) -> Vec<(f64, u8)> {
+        (0..BUCKETS)
+            .filter(|&i| self.seen[i])
+            .map(|i| (BUCKET_BASE_C + (i as f64) * BUCKET_C, self.observed[i]))
+            .collect()
+    }
+
+    /// Reload observations recorded earlier.
+    ///
+    /// These have already passed the ascending-branch filter, so they are recorded
+    /// directly. Anything outside the tracked range is dropped rather than clamped —
+    /// silently folding a 200 °C entry into the top bucket would turn a corrupt file
+    /// into a fan at full duty.
+    pub fn restore(&mut self, observations: impl IntoIterator<Item = (f64, u8)>) {
+        for (celsius, duty) in observations {
+            if let Some(i) = Self::bucket(celsius) {
+                self.record(i, duty);
+            }
         }
     }
 
@@ -489,6 +526,48 @@ mod tests {
         f.observe_span(42.0, 60.0, 0, true);
         assert_eq!(f.observed_duty(50.0), Some(120), "quiet must not undo loud");
         assert_eq!(f.observed_duty(58.0), Some(0));
+    }
+
+    #[test]
+    fn observations_survive_a_round_trip() {
+        let mut a = FirmwareFloor::new();
+        a.observe_span(42.0, 64.0, 0, true);
+        a.observe(70.0, 90, true);
+        let saved = a.observations();
+        assert!(!saved.is_empty());
+
+        let mut b = FirmwareFloor::new();
+        b.restore(saved);
+        for c in [44.0, 52.0, 60.0, 64.0, 70.0] {
+            assert_eq!(b.floor_duty(c), a.floor_duty(c), "differs at {c} C");
+        }
+    }
+
+    #[test]
+    fn restoring_nonsense_does_not_produce_a_screaming_fan() {
+        // A corrupt or hand-edited file must not fold out-of-range entries into the
+        // hottest bucket, which would pin the floor at full duty.
+        let mut f = FirmwareFloor::new();
+        f.restore([(500.0, 255), (-40.0, 255), (f64::NAN, 255)]);
+        assert!(f.observed_duty(108.0).is_none());
+        assert_eq!(f.floor_duty(40.0), 0);
+    }
+
+    #[test]
+    fn the_revision_only_moves_when_something_changes() {
+        let mut f = FirmwareFloor::new();
+        assert_eq!(f.revision(), 0);
+        f.observe(60.0, 90, true);
+        let after = f.revision();
+        assert!(after > 0);
+
+        // A quieter sample in the same bucket changes nothing, so there is nothing new
+        // to write.
+        f.observe(60.0, 10, true);
+        assert_eq!(f.revision(), after);
+        // And a cooling sample is discarded entirely.
+        f.observe(60.0, 200, false);
+        assert_eq!(f.revision(), after);
     }
 
     #[test]

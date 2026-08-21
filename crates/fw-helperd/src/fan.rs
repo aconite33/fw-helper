@@ -249,6 +249,29 @@ impl FanLease {
         }
     }
 
+    /// Reload observations recorded by a previous run.
+    ///
+    /// Worth persisting because the cold-start model is built from descending-branch
+    /// measurements and is the loud one: a fresh daemon overrides a quiet curve until it
+    /// has watched a heating cycle. Measured, a curve asking for silence at 55 °C got
+    /// duty 61 straight after a restart.
+    pub fn restore_floor(&self, observations: Vec<(f64, u8)>) -> usize {
+        let n = observations.len();
+        if let Ok(mut floor) = self.floor.lock() {
+            floor.restore(observations);
+        }
+        n
+    }
+
+    /// Observations worth writing out, with the revision they correspond to.
+    ///
+    /// The revision lets the caller skip writing when nothing has been learned, which
+    /// is most ticks.
+    pub fn floor_snapshot(&self) -> Option<(u64, Vec<(f64, u8)>)> {
+        let floor = self.floor.lock().ok()?;
+        Some((floor.revision(), floor.observations()))
+    }
+
     /// The lowest duty permitted at this temperature.
     pub fn floor_duty(&self, celsius: f64) -> u8 {
         self.floor
