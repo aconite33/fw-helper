@@ -10,6 +10,23 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use zbus::zvariant::OwnedValue;
 
+/// Outcome of [`Daemon::reapply_charge_limit`].
+///
+/// `AlreadyCorrect` versus `Corrected` is the distinction worth having: it says whether
+/// firmware actually reset the threshold, which no amount of unconditional writing can
+/// reveal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reapply {
+    /// No limit persisted; nothing to do.
+    NothingPersisted,
+    /// Hardware already held the persisted value. Firmware left it alone.
+    AlreadyCorrect,
+    /// Hardware disagreed and has been corrected. Firmware reset it, or something else did.
+    Corrected,
+    /// The re-apply was attempted and failed. Reason already logged.
+    Failed,
+}
+
 pub struct Daemon {
     fs: Sysfs,
     caps: Capabilities,
@@ -34,13 +51,47 @@ impl Daemon {
     /// Re-apply the persisted charge limit. Called at startup, because
     /// `charge_control_end_threshold` does not survive a reboot, and on resume,
     /// because firmware may reset it.
-    pub fn reapply_charge_limit(&self) {
+    ///
+    /// Reads before writing, and this is not an optimisation — the write is cheap and
+    /// idempotent. It is about what the log can tell us afterwards. Writing
+    /// unconditionally emits the same line whether or not firmware disturbed anything,
+    /// which is precisely the question the resume hook exists to answer. Separating the
+    /// two cases makes every resume a free measurement of whether this hook is
+    /// load-bearing on this hardware, rather than an assumption we keep re-asserting.
+    ///
+    /// Returns what happened, so callers and tests can distinguish the cases without
+    /// scraping stderr.
+    pub fn reapply_charge_limit(&self) -> Reapply {
         let Some(limit) = self.state.lock().ok().and_then(|s| s.charge_limit) else {
-            return;
+            return Reapply::NothingPersisted;
         };
-        match ChargeControl::new(&self.fs).set(limit) {
-            Ok(()) => eprintln!("re-applied charge limit {limit}%"),
-            Err(e) => eprintln!("could not re-apply charge limit {limit}%: {e}"),
+        let cc = ChargeControl::new(&self.fs);
+
+        match cc.read() {
+            Ok(observed) if observed == limit => {
+                eprintln!("charge limit still {limit}%; nothing to re-apply");
+                return Reapply::AlreadyCorrect;
+            }
+            Ok(observed) => {
+                eprintln!("charge limit is {observed}%, expected {limit}%; re-applying");
+            }
+            // Fall through to the write deliberately. The usual cause is the attribute
+            // being absent, and `set` reports that with the actionable message (ADR 0008)
+            // rather than the bare io error we would have to invent here.
+            Err(e) => {
+                eprintln!("cannot read charge limit ({e}); re-applying {limit}% anyway");
+            }
+        }
+
+        match cc.set(limit) {
+            Ok(()) => {
+                eprintln!("re-applied charge limit {limit}%");
+                Reapply::Corrected
+            }
+            Err(e) => {
+                eprintln!("could not re-apply charge limit {limit}%: {e}");
+                Reapply::Failed
+            }
         }
     }
 
@@ -122,5 +173,91 @@ impl Daemon {
         }
         eprintln!("charge limit set to {percent}% by {sender}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const ATTR: &str = "sys/class/power_supply/BAT1/charge_control_end_threshold";
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Same rooted-sysfs trick as the core fixtures (ADR 0004): no hardware, no root.
+    fn fixture(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "fw-helperd-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            n
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn daemon_with(root: &Path, persisted: Option<u8>) -> Daemon {
+        let fs_ = Sysfs::new(root);
+        let caps = Capabilities::probe(&fs_);
+        let state = State {
+            charge_limit: persisted,
+        };
+        Daemon::new(fs_, caps, state)
+    }
+
+    fn write_attr(root: &Path, value: &str) {
+        let p = root.join(ATTR);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, value).unwrap();
+    }
+
+    fn read_attr(root: &Path) -> String {
+        fs::read_to_string(root.join(ATTR)).unwrap().trim().into()
+    }
+
+    #[test]
+    fn reapply_reports_when_firmware_left_the_limit_alone() {
+        let root = fixture("already");
+        write_attr(&root, "80\n");
+        let d = daemon_with(&root, Some(80));
+
+        assert_eq!(d.reapply_charge_limit(), Reapply::AlreadyCorrect);
+        assert_eq!(read_attr(&root), "80");
+    }
+
+    #[test]
+    fn reapply_corrects_when_firmware_reset_the_limit() {
+        let root = fixture("reset");
+        // What a firmware reset across suspend would look like.
+        write_attr(&root, "100\n");
+        let d = daemon_with(&root, Some(80));
+
+        assert_eq!(d.reapply_charge_limit(), Reapply::Corrected);
+        assert_eq!(read_attr(&root), "80");
+    }
+
+    #[test]
+    fn reapply_does_nothing_without_a_persisted_limit() {
+        let root = fixture("none");
+        write_attr(&root, "100\n");
+        let d = daemon_with(&root, None);
+
+        assert_eq!(d.reapply_charge_limit(), Reapply::NothingPersisted);
+        // Untouched — an absent limit is not a request to set 100%.
+        assert_eq!(read_attr(&root), "100");
+    }
+
+    #[test]
+    fn reapply_fails_loudly_when_charge_control_is_unavailable() {
+        // No attribute at all: the module parameter is unset (ADR 0008).
+        let root = fixture("unsupported");
+        fs::create_dir_all(&root).unwrap();
+        let d = daemon_with(&root, Some(80));
+
+        assert_eq!(d.reapply_charge_limit(), Reapply::Failed);
     }
 }

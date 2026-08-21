@@ -45,12 +45,21 @@ sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 and the daemon logged both `resumed from sleep` and `re-applied charge limit 80%`. The
 logind hook (`main.rs:106`) works and the post-resume write succeeds.
 
-Note what this did *not* settle: `reapply_charge_limit` (`iface.rs:37`) writes
-unconditionally rather than comparing first, so that log line appears whether or not
-firmware cleared anything. **Whether firmware resets the threshold across suspend is still
-unknown.** Settle it cheaply — stop the daemon, suspend, and read sysfs on wake with nobody
-to correct it. The answer matters past M2: it decides whether the resume hook every future
-write path inherits is load-bearing or belt-and-braces.
+Note what this did *not* settle: at the time, `reapply_charge_limit` wrote unconditionally,
+so that log line appeared whether or not firmware cleared anything. **Whether firmware
+resets the threshold across suspend is still unknown.**
+
+That is now fixed — `reapply_charge_limit` reads before writing and returns a `Reapply`
+outcome, so the log distinguishes the cases:
+
+```
+charge limit still 80%; nothing to re-apply          → firmware left it alone
+charge limit is 100%, expected 80%; re-applying      → firmware reset it
+```
+
+So the next suspend answers the question for free, with the daemon running as normal. Just
+restart it on the new build first. The answer matters past M2: it decides whether the resume
+hook every future write path inherits is load-bearing or belt-and-braces.
 
 **Reboot.** The sysfs value is expected to be lost; what is under test is the daemon
 re-applying it from persisted state at startup. After rebooting, start the daemon and expect

@@ -165,12 +165,14 @@ Smallest real feature, lowest risk, immediately useful.
       `charge_control_end_threshold` reads `80`. The daemon logged both
       `resumed from sleep` and `re-applied charge limit 80%`, so the logind signal is
       received, consumed once, and the post-resume write succeeds
-- [ ] **Open question this test could not answer**: does firmware actually clear the
-      threshold on resume? `reapply_charge_limit` writes unconditionally, so the log line
-      fires either way and hides the answer. Settle it by stopping the daemon, suspending,
-      and reading sysfs on wake with nobody to correct it. Matters beyond M2 — if firmware
-      does not reset, the resume hook is insurance rather than a requirement, and M3–M5
-      inherit the same pattern
+- [x] Made that question answerable. `reapply_charge_limit` now reads before writing and
+      returns a `Reapply` outcome, so `still 80%; nothing to re-apply` and
+      `is 100%, expected 80%; re-applying` are distinct log lines. Covered by the first
+      four unit tests in the daemon crate, against a rooted fixture
+- [ ] **Open question**: does firmware actually clear the threshold on resume? The old
+      unconditional write hid the answer. The next suspend on the new build reports it
+      directly. Matters beyond M2 — if firmware does not reset, the resume hook is
+      insurance rather than a requirement, and M3–M5 inherit the same pattern
 - [ ] Confirm it is **re-applied after a reboot**. The sysfs value is expected to be lost;
       what is under test is the daemon re-applying `80` from persisted state at startup
 
