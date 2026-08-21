@@ -19,177 +19,73 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M1a — hardware layer | complete, verified on hardware |
 | M1b — daemon + D-Bus | complete, verified unprivileged against a root daemon |
 | M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
-| M3 — fan control | in progress: lease mechanism + restore binary land and are hardware-verified; daemon side not started |
-| M4 — power limits | PL1 control complete and verified (15 W → 15.02 W); profiles pending M5 |
+| M3 — fan control | **complete**: all six ADR 0006 safety points and the curve engine verified on hardware |
+| M4 — power limits | PL1 control complete and verified (15 W setpoint → 15.02 W sustained) |
 | M5, M7 | planned; every mechanism pre-verified |
 | M6 — GUI | read-only telemetry view landed early; controls pending M2–M5 |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
-### Resume here — M3
+### Resume here — M5, profiles
 
-**M2 is complete**, all three criteria measured on hardware on 2026-08-21.
+Last session ended 2026-08-21 with M2, M3 and M4's PL1 control all complete and verified
+on hardware. The systemd unit is **installed and enabled**, so `fw-helperd` starts at boot
+(`sudo ./scripts/install-dev.sh --uninstall` reverses that).
 
-The write path: `sudo fw-helperctl charge-limit 80` returned promptly (the polkit hang is
-fixed), the daemon's read-back confirmed it, sysfs read `80`, D-Bus reported `80%`, and
-`/var/lib/fw-helper/state` holds `charge_limit=80`. No UEFI override — `NotApplied` never
-fired, so that path stays implemented but unexercised. The modprobe drop-in also survives a
-cold boot, which had only ever been proven after a live `modprobe -r`/`modprobe`.
+**What exists now.** Battery charge limit (M2). Fan control (M3): manual duty, a curve
+engine, and every safety layer in ADR 0006 — lease with restore on exit/signal/panic, the
+`ExecStopPost` crash binary, an independent watchdog, the firmware floor, the `temp*_crit`
+ceiling, and refusal without a sensor. Plus a battery guard and floor persistence. Power
+limits (M4): PL1 only. Read `docs/plan.md` for the per-item detail and evidence; every
+claim there names the measurement behind it.
 
-**Reboot re-apply: passed.** Across a journal-verified reboot the daemon was left down for
-27 minutes with sysfs reading `100` — the value really is lost at boot. Starting it logged,
-before any client command was issued:
+**Next: M5 — profiles.** Bundling PL1 with a fan curve into Quiet / Balanced /
+Performance, which is where the two compose: 10 W of power limit is worth ~12 °C, so the
+profile picks a power budget and the curve only has to cover what is left. Two constraints
+that are not negotiable:
 
-```
-persisted charge limit: 80%
-charge limit is 100%, expected 80%; re-applying
-re-applied charge limit 80%
-```
+- **ADR 0005**: `platform_profile` and EPP belong to power-profiles-daemon. Delegate over
+  D-Bus, never write those paths. Last-writer-wins against the GNOME power slider is the
+  worst bug class here.
+- Profiles must compose the existing controls, not bypass them. The firmware floor, the
+  ceiling and the battery guard apply to a profile's curve exactly as they do to a
+  hand-set duty.
 
-**Suspend/resume: passed, and firmware does *not* reset the threshold.** The instrumented
-build's first suspend logged `charge limit still 80%; nothing to re-apply`. So the resume
-hook (`main.rs:106`) is **insurance rather than a requirement** for the charge limit. Two
-caveats: that is one ~28 s s2idle cycle on battery, and it says nothing about the other
-knobs — the EC has far more reason to reset a fan or power limit than a charge threshold.
-**Each of M3–M5 earns this verdict separately.** Every resume adds a data point for free, so
-a contradicting line in the log would be conspicuous.
+**How this project has actually gone wrong, every time.** Six defects last session were
+invisible to unit tests and only appeared on hardware, and all six were the same mistake:
+a constant or a model chosen by reasoning rather than measurement. The EC quantizes duty
+to whole percent; a floor deficit hid inside a tolerance meant for verifying writes;
+temperature direction derived per-sample read a quantized cooldown as "steady"; two
+thresholds were set from a 76.8 °C figure that was not the machine's real peak (92.8 °C
+is); a test measured the wrong power limit because a `trap` had reset it. **Measure the
+hardware before choosing a number, and make the test assert its own preconditions.**
 
-Reading before writing is what made both results legible in one line each. **Keep that
-pattern for every knob M3–M5 adds** — an unconditional write hides exactly the question you
-are trying to answer.
-
-**Known gap, not blocking M3:** there is still no systemd unit installed, so the daemon runs
-by hand. `data/` carries the unit; `install-dev.sh` does not install it yet.
+**Fault injection, for things that cannot be produced on demand** — never set in production:
 
 ```bash
-sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
+FW_HELPERD_DEBUG_WEDGE_AFTER=15   # blocks every tokio worker; proves the watchdog
+FW_HELPERD_DEBUG_CEILING_C=55     # lowers the ceiling into reach; can only ever lower it
 ```
 
-### M3 — in progress
+**Open, and deliberately not done:**
 
-Two of ADR 0006's safety layers are built and hardware-verified: the lease itself
-(`fw-helper-core/src/fan.rs`) and `fw-helper-restore-fan`, the crash-path binary. A root
-run on 2026-08-21 took control at 180/255 (fan 0 → 5041 rpm), ramped to 120/255 (3795 rpm),
-released, and the EC was back to 0 rpm within 4 s. It also corrected two assumptions — see
-the two new fan rows in the traps table, and `docs/hardware-baseline.md` for the round-trip
-measurements.
+- The **panic path** is implemented and unit-tested but has never been triggered live.
+  Doing so honestly needs a panic injection in the daemon.
+- Floor observations only ever **rise** within a bucket and now survive restarts, so a
+  one-off anomaly is sticky. Errs loud, so it costs quiet rather than safety, but a
+  machine that cools better later keeps the old floor until the state file is removed.
+- The **battery guard has never fired** and is sized so it should not: measured, the
+  battery rises 2 °C under five minutes of full load. It is a backstop for the unmeasured
+  case — a fan held low for far longer — not a response to observed risk (ADR 0011).
+- **PL2 is untouched** and its `max_power_uw` reads 0. See the traps table.
+- The curve's **sensor is not configurable** (`control_temp()` picks `peci-temp`), and
+  curve *editing* belongs to the GUI in M6. The CLI spec exists to make the engine
+  testable, not to be the editing surface.
 
-The daemon side now holds and releases the lease. `FanLease` is **lock-free on purpose**
-— the panic hook calls into it, and a hook that blocks on a mutex held by the panicking
-thread leaves the process alive with the fan stuck. Releases are unconditional for the
-same reason: our own bookkeeping is what is least trustworthy after a crash.
-
-Verified on hardware 2026-08-21: `fw-helperctl fan 180` pinned 181/255 at 5093 rpm,
-`fan auto` gave it back, and **SIGTERM while holding it** put `pwm1_enable` back to `2`
-with `released manual fan control` in the log. The below-floor refusal fired without
-touching hardware.
-
-**Still not demonstrated:** the panic path (implemented, unit-tested, never triggered
-live) and `ExecStopPost` (wired into the unit and installer, but needs the unit installed
-plus a `kill -9` — that is the M3 exit gate).
-
-**The watchdog is done and hardware-verified** (`fw-helperd/src/watchdog.rs`). A real OS
-thread, not a tokio task — the failure it guards against includes the runtime not
-scheduling anything. It reads `pwm1_enable` rather than trusting our own flag, so a failed
-release retries. Heartbeat is the telemetry poll loop. Test it with
-`FW_HELPERD_DEBUG_WEDGE_AFTER=<secs>`, which blocks every tokio worker; the fan came back
-6.0 s after the heartbeat stopped, with the process still alive.
-
-That test also produced the zbus row in the traps table, and with it a guard: manual fan
-control is **refused on a stale heartbeat**, because D-Bus survives a wedged runtime and
-would otherwise hand the fan to a daemon that is not minding it.
-
-**The firmware-floor clamp is done and hardware-verified** (`fw-helper-core/src/floor.rs`).
-The EC's curve cannot be read, so it is reconstructed by composing two measured tables —
-what firmware does at a temperature, and what a duty produces — and inverted to answer
-"what duty must we hold to be at least as fast as firmware right now". `observe()` raises
-it from live EC behaviour, closing the gap the static table has across the knee.
-
-**It is enforced every poll tick, not at request time.** Clamping only when a duty is
-requested protects nothing: a duty chosen at idle is safe when chosen and stuck-low a
-minute later. `fw-helperctl fan 0` at idle is now legitimate — firmware is silent below
-~45 °C too, and that silence is most of why anyone wants this.
-
-Verified under 16-core load: duty walked 0 → 92 as the machine reached 74.8 °C and back to
-0 at 44.9 °C, staying above firmware's own measured curve at every point. **The first run
-failed that comparison** (2808 rpm where the EC does 2925) because enforcement judged
-"below the floor?" against the quantized read-back with `DUTY_TOLERANCE` of slack, hiding a
-real deficit inside a tolerance meant for verifying writes. Decisions are compared exactly
-now; drift against hardware separately. Unit tests were happy throughout — only comparing
-against measured firmware behaviour caught it.
-
-**The ceiling override is done and hardware-verified** (`fw-helper-core/src/ceiling.rs`).
-Derived from the control sensor's crit minus 15 °C, capped at 100 °C, falling back to
-90 °C when nothing plausible is readable — every value validated, because the -273150
-case would otherwise put the ceiling at absolute zero and kill manual fan control
-permanently. Its ordering against the floor's full-duty point is a **`const` assertion**,
-so getting it wrong fails the build.
-
-Verified with `FW_HELPERD_DEBUG_CEILING_C=55` (it can only ever *lower* the ceiling): took
-the fan at 39.9 °C, released at 55.9 °C, refused at 57.9 °C, allowed again at 44.9 °C.
-
-**The sleep hook is done and hardware-verified.** The fan is released before suspend and
-taken back after the wake, held open by a logind **delay inhibitor lock** — without it the
-release merely races the suspend. The restore re-runs the full clamp rather than replaying
-the raw duty, since the machine may wake warmer than it slept, and a pending restore of
-duty 0 uses a separate flag rather than a sentinel, because 0 is a legitimate setting.
-
-**Every safety point in ADR 0006 is now built and verified on hardware.** The last one,
-`ExecStopPost`, was measured on 2026-08-21: unit installed, fan taken at duty 120 under
-16-core load, `kill -9` on the daemon, **EC control restored in 0.27 s** against a 5 s
-gate. `SIGKILL` runs no handler and the watchdog thread dies with the process, so nothing
-in-process could have covered it.
-
-**The systemd unit is now installed and enabled**, so `fw-helperd` starts at boot.
-`sudo ./scripts/install-dev.sh --uninstall` reverses that.
-
-Two of M3's three exit criteria are met (`kill -9` recovery, suspend/resume). The third is
-the curve holding a target temperature under `stress-ng` without audible hunting, which
-needs the curve to exist.
-
-**The floor now reads firmware rather than modelling it** (ADR 0011). `pwm1` reports the
-EC's own duty while `pwm1_enable=2`, so `FirmwareFloor` records what firmware actually did
-at each temperature; the composed RPM tables survive only as a cold start. Only the
-**ascending** branch is recorded, and an observation of duty 0 is an answer, not a gap —
-which is what makes a genuinely silent machine reachable.
-
-Verified on hardware: after watching firmware climb, `fw-helperctl fan 0` at **51.9 °C**
-was honoured, where the modelled floor had demanded duty 63.
-
-**ADR 0011 also reframes why the floor exists.** The CPU throttles at Tjmax (100 °C), so a
-constrained fan costs performance, not hardware — the floor was never the CPU's guardian.
-What has no protection of its own is the **battery, crit 49.9 °C**, and nothing watches it
-yet. That is the open work ADR 0011 names and does not do.
-
-**The curve engine is built and hardware-verified** (`fw-helper-core/src/curve.rs`). It
-produces a *request*; the floor and battery guard are applied on top every tick, so
-smoothing can never delay a safety response. Hysteresis is asymmetric — rising followed at
-once, falling damped by 2 °C.
-
-**The win is not where M0 predicted.** That reasoning used firmware's descending branch.
-Climbing, firmware is silent through 55–70 °C, so there is little to win going up; the win
-is coming *down*, where firmware holds duty 50–90 to 44.9 °C. Measured, the curve beats it
-by 13–36 counts through that range, with no hunting.
-
-**The observed floor now persists** to `/var/lib/fw-helper/state` as
-`fan_floor=54:0,56:0,...`, saved every 60 s and on clean shutdown — periodically because
-`SIGKILL` is a supported ending and everything since the last write would go with it.
-Verified: 11 observations saved and restored across a restart.
-
-Next: M3 is feature-complete; remaining is M4's power limits, which the plan says to design
-alongside the curve — 10 W of power limit buys ~12 °C, so the two compose.
-
-**`fw-helperctl fan` is still not a curve.** It pins one duty rather than following
-temperature. What it is not, any more, is unbounded — the duty is clamped up to the
-firmware floor and re-enforced every tick, and `fan 0` at idle is legitimate because
-firmware is silent there too.
-
-**Testing note carried forward.** Three defects this session were invisible to unit tests
-and only appeared on hardware: the EC's quantized duty read-back, a floor deficit hiding
-inside `DUTY_TOLERANCE`, and a stale release binary. The curve engine needs the same
-treatment, and a longer loop — hysteresis and ramp limiting only misbehave over minutes of
-changing load.
+**Running hardware tests:** `sudo` cannot be run from the assistant side here — hand the
+user the command prefixed with `!` so it runs in-session, and `tee` the output to a file,
+because terminal output does not always reach the transcript.
 
 ## Layout
 
@@ -234,11 +130,18 @@ avoids needing root and an installed policy.
 
 ## Hard rules
 
-**Fan control can damage the machine.** Once `pwm1_enable=1`, the EC stops managing the fan
-and holds the last duty forever. Stuck-high is merely loud; **stuck-low under load is
-dangerous, and looks identical from outside.** Every path taking manual control must restore
-`pwm1_enable=2` on exit, signal, panic, and suspend. See ADR 0006 — non-negotiable, and
-`kill -9` recovery is a release gate.
+**Never leave the fan in a state nobody is managing.** Once `pwm1_enable=1` the EC stops
+managing it and holds the last duty **forever** — through a crash, a deadlock, a suspend.
+Stuck-high is merely loud; stuck-low looks identical from outside and is silent by
+definition. Every path taking manual control must restore `pwm1_enable=2` on exit, signal,
+panic and suspend. ADR 0006, non-negotiable, and `kill -9` recovery is a release gate.
+
+Note what the danger *is*, since ADR 0011 sharpened it: the CPU throttles at Tjmax (100 °C)
+and protects itself, so a fan held too low costs performance rather than hardware. What has
+no protection of its own is the **battery** (crit 49.9 °C) and the board/DDR sensors
+(~87 °C). A user choosing quiet is making a trade, not a mistake — but a *daemon* that dies
+holding the fan made the choice for them, which is the thing all of ADR 0006 exists to
+prevent.
 
 **Every hardware write follows the same pattern**, established in M2:
 1. polkit check first, per action, failing **closed**
@@ -316,9 +219,16 @@ is the worst bug class here (ADR 0005).
 Measured on the target machine, not estimated:
 
 - Idle: 1.77 W, 43.9 °C, fan 0 rpm
-- PL1 25 W → 24.67 W sustained, 76.8 °C, ~3100 rpm
-- PL1 15 W → 14.68 W sustained, 64.8 °C, ~2925 rpm
-- **10 W of power limit buys ~12 °C.** Why ADR 0007 can drop undervolting
-- Fan curve: 0 rpm at 44.9 °C · ~2020 rpm at 53.9 °C · ~2925 rpm at 64.8 °C · ~3100 rpm at
-  76.8 °C. Off to two thirds of loaded speed in ~9 degrees, then nearly flat for twenty
-  more. **That flat top is where a custom curve wins.**
+- PL1 25 W → 24.67 W sustained, 76.8 °C, ~3100 rpm (M0, controlled)
+- PL1 15 W → 14.68 W sustained, 64.8 °C, ~2925 rpm (M0, controlled)
+- PL1 15 W → **15.02 W, +0.1%**, 62.2 °C — driven through the daemon (M4)
+- **10 W of power limit buys ~12 °C.** Why ADR 0007 can drop undervolting. Rests on the
+  M0 runs; M4's 25 W figure was heat-soaked and does not re-confirm it
+- Tjmax **100 °C** (`coretemp` crit). Peak in ordinary use **92.8 °C**, not 76.8 °C
+- Duty → RPM is **concave**: 30→1107, 50→1879, 77→2693, 90→3052, 120→3840, 180→5201 rpm.
+  Stiction between duty 20 and 30
+- **The EC's curve is hysteretic**, and the descending branch is what M0 recorded. Climbing,
+  firmware is silent past 64.8 °C and starts at 66–73 °C. Falling, it holds duty 50–90 all
+  the way to 44.9 °C — duty 0 vs 92 at the same 61.9 °C.
+  **That descent is where a custom curve wins**, not the "flat top" M0 predicted: measured,
+  the built-in curve beats firmware by 13–36 duty counts through 50–60 °C
