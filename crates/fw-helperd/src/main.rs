@@ -120,10 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the floor and ceiling reflect the machine as it is now rather than as it was when
 /// it went down.
 fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
-    let celsius = sample.control_temp().map(|t| t.celsius);
-    let ceiling = fan::ceiling_for(sample.control_temp().and_then(|t| t.critical));
-
-    match lease.restore_after_resume(celsius, ceiling) {
+    match lease.restore_after_resume(fan::Thermal::from_telemetry(sample)) {
         None => {}
         Some(Ok(applied)) if applied.clamped() => eprintln!(
             "fan: restored after resume at duty {}/255, raised from the requested {} \
@@ -182,8 +179,8 @@ struct Govern {
 ///   is chosen and becomes stuck-low as soon as the machine is loaded.
 fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: &mut Govern) {
     let previous_duty = state.duty;
-    let celsius = sample.control_temp().map(|t| t.celsius);
-    let ceiling = fan::ceiling_for(sample.control_temp().and_then(|t| t.critical));
+    let thermal = fan::Thermal::from_telemetry(sample);
+    let celsius = thermal.celsius;
 
     // Rising or steady. Firmware's descending branch is hysteresis rather than a
     // requirement - measured, it runs duty 0 at 61.9 C climbing and duty 92 at the
@@ -230,7 +227,7 @@ fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: 
         return;
     }
 
-    match lease.enforce_floor(celsius, ceiling) {
+    match lease.enforce_floor(thermal) {
         None => {}
         // Re-asserting the same duty is a real write but not news. It happens because
         // the EC quantizes: a target of 88 settles at 89, so next tick's target of 89
@@ -243,6 +240,14 @@ fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: 
             celsius,
         }) => eprintln!(
             "fan: {celsius:.1} C puts the firmware floor at {floor}/255; moved {from} -> {to}"
+        ),
+        Some(fan::Enforced::ReleasedBatteryHot {
+            celsius,
+            guard,
+            released,
+        }) => eprintln!(
+            "fan: battery at {celsius:.1} C is near its {guard}; it cannot throttle to \
+             protect itself, so the fan goes back to firmware. Returned: {released}"
         ),
         Some(fan::Enforced::ReleasedTooHot {
             celsius,

@@ -94,3 +94,24 @@ ADR 0006's other five points are untouched: releasing on every exit path, the cr
 binary, the watchdog, the ceiling override, and refusing manual control without a sensor.
 All six are verified on hardware. What changes here is only *how low the floor sits* and
 why.
+
+## Measured afterwards
+
+Appended after the fact; the decision above is unchanged.
+
+- **The battery claim above was asserted, not measured, and the measurement weakens it.**
+  This ADR calls the battery "the real exposure". Measured 2026-08-21 across five minutes
+  of 16-core load with firmware driving the fan, on battery power so discharge heating
+  counted too, `battery_temp` rose from **31.9 °C to 33.9 °C** while the CPU went from
+  40.9 °C to 78.8 °C. A 2 °C rise, leaving **16 °C of headroom** below its 49.9 °C crit.
+  The battery is well isolated from the CPU and lags heavily — it was still creeping
+  upward during the cooldown. On this evidence it is in no danger from CPU heat.
+- **Airflow does reach it, though.** During the post-load cooldown, with the fan still
+  running hard, the battery fell to **26.9 °C — below its 31.9 °C idle baseline**. So
+  raising the fan is a real lever on battery temperature, not a hopeful one.
+- **What remains unmeasured is the case that matters**: the same load with the fan held
+  *low* for far longer than five minutes, which is exactly what a user-authored curve
+  will permit. The guard implemented in `fw-helper-core/src/battery.rs` is a backstop for
+  that, sized so it does not fire at any temperature yet observed. It should essentially
+  never trigger; if it does, either the thresholds are wrong or the situation is genuinely
+  new, and both are worth knowing.

@@ -4,6 +4,7 @@
 //! uses `/`; tests point it at a fixture tree so the whole capability and telemetry
 //! stack runs with no hardware attached. See `docs/adr/0004-sysfs-first-hardware-access.md`.
 
+pub mod battery;
 pub mod caps;
 pub mod ceiling;
 pub mod charge;
@@ -13,6 +14,7 @@ pub mod floor;
 pub mod sysfs;
 pub mod telemetry;
 
+pub use battery::BatteryGuard;
 pub use caps::{Cap, Capabilities};
 pub use ceiling::Ceiling;
 pub use charge::{ChargeControl, ChargeError};

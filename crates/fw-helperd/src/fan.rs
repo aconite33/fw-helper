@@ -24,7 +24,7 @@
 //!   not.
 
 use fw_helper_core::fan::DUTY_TOLERANCE;
-use fw_helper_core::{Ceiling, FanControl, FanError, FanMode, FirmwareFloor, Sysfs};
+use fw_helper_core::{BatteryGuard, Ceiling, FanControl, FanError, FanMode, FirmwareFloor, Sysfs};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -37,6 +37,12 @@ pub enum LeaseError {
     AboveCeiling {
         celsius: f64,
         ceiling: Ceiling,
+    },
+    /// The battery is near its own limit. Unlike the CPU it cannot throttle to protect
+    /// itself, so this is not the user's call (ADR 0011).
+    BatteryTooHot {
+        celsius: f64,
+        guard: BatteryGuard,
     },
     Fan(FanError),
 }
@@ -56,8 +62,73 @@ impl fmt::Display for LeaseError {
                  belongs to firmware and configuration does not get a vote \
                  (ADR 0006 point 5). Let the machine cool, then ask again"
             ),
+            Self::BatteryTooHot { celsius, guard } => write!(
+                f,
+                "the battery is at {celsius:.1} C, close to its {guard}. Unlike the CPU \
+                 it cannot throttle to protect itself, so the fan is not configurable \
+                 until it cools (ADR 0011)"
+            ),
             Self::Fan(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// Everything a fan decision needs from the thermal sensors.
+///
+/// Grouped because the decision genuinely depends on all of it, and because passing
+/// four loose arguments through three call sites is how one of them ends up forgotten.
+#[derive(Debug, Clone, Copy)]
+pub struct Thermal {
+    /// The sensor a fan curve follows. `None` when nothing readable.
+    pub celsius: Option<f64>,
+    pub ceiling: Ceiling,
+    /// The battery's temperature, and its limit. `None` when the board has no battery
+    /// sensor, which is a normal state and not a reason to run the fan hard.
+    pub battery_celsius: Option<f64>,
+    pub battery: BatteryGuard,
+}
+
+impl Thermal {
+    /// Read the decision inputs out of a telemetry sample.
+    pub fn from_telemetry(t: &fw_helper_core::Telemetry) -> Self {
+        let control = t.control_temp();
+        let battery = t.battery_temp();
+        Self {
+            celsius: control.map(|c| c.celsius),
+            ceiling: ceiling_for(control.and_then(|c| c.critical)),
+            battery_celsius: battery.map(|b| b.celsius),
+            battery: BatteryGuard::from_crit(battery.and_then(|b| b.critical)),
+        }
+    }
+
+    /// The battery's own demand on the fan, independent of the CPU: the CPU may be
+    /// idle while the battery is warm from charging or from a hot room.
+    /// Thermal inputs for a machine at `celsius` with nothing else of concern. Test
+    /// support, kept beside the type so the fields stay in one place.
+    #[cfg(test)]
+    pub fn default_for_test(celsius: f64) -> Self {
+        Self {
+            celsius: Some(celsius),
+            ceiling: Ceiling::from_crit(Some(119.85)),
+            battery_celsius: Some(30.0),
+            battery: BatteryGuard::from_crit(Some(49.9)),
+        }
+    }
+
+    /// Public view of [`Self::battery_floor`], for reporting the effective floor.
+    pub fn battery_floor_public(&self) -> u8 {
+        self.battery_floor()
+    }
+
+    fn battery_floor(&self) -> u8 {
+        self.battery_celsius
+            .map(|c| self.battery.floor_duty(c))
+            .unwrap_or(0)
+    }
+
+    fn battery_exceeded(&self) -> bool {
+        self.battery_celsius
+            .is_some_and(|c| self.battery.exceeded_by(c))
     }
 }
 
@@ -222,21 +293,27 @@ impl FanLease {
     ///
     /// Returns the duty the EC actually settled on, which is not necessarily what was
     /// asked for — the EC quantizes to whole percent.
-    pub fn set_duty(
-        &self,
-        duty: u8,
-        celsius: Option<f64>,
-        ceiling: Ceiling,
-    ) -> Result<Applied, LeaseError> {
-        let Some(celsius) = celsius.filter(|c| c.is_finite()) else {
+    pub fn set_duty(&self, duty: u8, thermal: Thermal) -> Result<Applied, LeaseError> {
+        let Some(celsius) = thermal.celsius.filter(|c| c.is_finite()) else {
             return Err(LeaseError::NoTemperature);
         };
         // Checked before anything else touches hardware: above the ceiling the answer
         // is no, whatever the duty and whoever is asking.
-        if ceiling.exceeded_by(celsius) {
-            return Err(LeaseError::AboveCeiling { celsius, ceiling });
+        if thermal.ceiling.exceeded_by(celsius) {
+            return Err(LeaseError::AboveCeiling {
+                celsius,
+                ceiling: thermal.ceiling,
+            });
         }
-        let floor = self.floor_duty(celsius);
+        if thermal.battery_exceeded() {
+            return Err(LeaseError::BatteryTooHot {
+                celsius: thermal.battery_celsius.unwrap_or(f64::NAN),
+                guard: thermal.battery,
+            });
+        }
+        // Whichever demands more air. They are independent: the CPU can be idle while
+        // the battery is warm from charging or a hot room.
+        let floor = self.floor_duty(celsius).max(thermal.battery_floor());
         let target = duty.max(floor);
 
         let settled = self.write(target)?;
@@ -261,10 +338,12 @@ impl FanLease {
     ///
     /// Corrects downward too. When the machine cools the floor drops, and the fan is
     /// allowed back to what was actually asked for.
-    pub fn enforce_floor(&self, celsius: Option<f64>, ceiling: Ceiling) -> Option<Enforced> {
+    pub fn enforce_floor(&self, thermal: Thermal) -> Option<Enforced> {
         if !self.held() {
             return None;
         }
+        let celsius = thermal.celsius;
+        let ceiling = thermal.ceiling;
         // Losing the sensor while holding the fan is not a reason to keep holding it
         // blind. Firmware has its own sensors; give it back.
         let Some(celsius) = celsius.filter(|c| c.is_finite()) else {
@@ -285,8 +364,17 @@ impl FanLease {
             });
         }
 
+        if thermal.battery_exceeded() {
+            let released = self.release_now();
+            return Some(Enforced::ReleasedBatteryHot {
+                celsius: thermal.battery_celsius.unwrap_or(f64::NAN),
+                guard: thermal.battery,
+                released,
+            });
+        }
+
         let requested = self.requested.load(Ordering::SeqCst);
-        let floor = self.floor_duty(celsius);
+        let floor = self.floor_duty(celsius).max(thermal.battery_floor());
         let target = requested.max(floor);
 
         let current = self.duty()?;
@@ -365,16 +453,12 @@ impl FanLease {
     /// Deliberately re-runs the full clamp rather than restoring the raw duty: the
     /// machine may have woken warmer than it slept, and the floor is computed from
     /// telemetry read *after* the wake. Returns `None` when there is nothing pending.
-    pub fn restore_after_resume(
-        &self,
-        celsius: Option<f64>,
-        ceiling: Ceiling,
-    ) -> Option<Result<Applied, LeaseError>> {
+    pub fn restore_after_resume(&self, thermal: Thermal) -> Option<Result<Applied, LeaseError>> {
         if !self.restore_pending.swap(false, Ordering::SeqCst) {
             return None;
         }
         let duty = self.restore_duty.load(Ordering::SeqCst);
-        Some(self.set_duty(duty, celsius, ceiling))
+        Some(self.set_duty(duty, thermal))
     }
 
     /// Release without the ability to fail, for panic hooks and signal handlers.
@@ -404,6 +488,12 @@ pub enum Enforced {
     },
     /// The temperature became unreadable, so the fan went back to firmware.
     ReleasedNoSensor {
+        released: bool,
+    },
+    /// The battery reached its guard limit, so the fan went back to firmware.
+    ReleasedBatteryHot {
+        celsius: f64,
+        guard: BatteryGuard,
         released: bool,
     },
     /// Too hot for us to be holding the fan at all (ADR 0006 point 5).
@@ -444,6 +534,33 @@ mod tests {
         Ceiling::from_crit(Some(119.85))
     }
 
+    /// Thermal inputs with a cool battery: the CPU temperature is what varies in most
+    /// of these tests, and a battery at 30 C never influences the result.
+    fn th(celsius: f64) -> Thermal {
+        Thermal {
+            celsius: Some(celsius),
+            ceiling: real_ceiling(),
+            battery_celsius: Some(30.0),
+            battery: BatteryGuard::from_crit(Some(49.9)),
+        }
+    }
+
+    /// No readable CPU sensor.
+    fn th_none() -> Thermal {
+        Thermal {
+            celsius: None,
+            ..th(40.0)
+        }
+    }
+
+    /// A specific battery temperature alongside an idle CPU.
+    fn th_battery(battery_celsius: f64) -> Thermal {
+        Thermal {
+            battery_celsius: Some(battery_celsius),
+            ..th(IDLE_C)
+        }
+    }
+
     fn fixture(tag: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!(
@@ -481,11 +598,11 @@ mod tests {
         let l = lease(&root);
 
         assert!(matches!(
-            l.set_duty(200, None, real_ceiling()),
+            l.set_duty(200, th_none()),
             Err(LeaseError::NoTemperature)
         ));
         assert!(matches!(
-            l.set_duty(200, Some(f64::NAN), real_ceiling()),
+            l.set_duty(200, th(f64::NAN)),
             Err(LeaseError::NoTemperature)
         ));
         assert_eq!(enable(&root), "2", "the EC must still own the fan");
@@ -499,7 +616,7 @@ mod tests {
         let root = fixture("silent");
         let l = lease(&root);
 
-        let applied = l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
+        let applied = l.set_duty(0, th(IDLE_C)).unwrap();
         assert_eq!(applied.floor, 0);
         assert_eq!(applied.target, 0);
         assert!(!applied.clamped());
@@ -510,7 +627,7 @@ mod tests {
         let root = fixture("clamp");
         let l = lease(&root);
 
-        let applied = l.set_duty(0, Some(HOT_C), real_ceiling()).unwrap();
+        let applied = l.set_duty(0, th(HOT_C)).unwrap();
         assert!(applied.clamped(), "{applied:?}");
         assert!(applied.target >= 78, "{applied:?}");
         assert_eq!(applied.requested, 0, "the request itself is remembered");
@@ -524,10 +641,10 @@ mod tests {
         let root = fixture("heats-up");
         let l = lease(&root);
 
-        l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(0, th(IDLE_C)).unwrap();
         assert_eq!(l.duty().unwrap(), 0);
 
-        let outcome = l.enforce_floor(Some(HOT_C), real_ceiling());
+        let outcome = l.enforce_floor(th(HOT_C));
         match outcome {
             Some(Enforced::Corrected { from, to, .. }) => {
                 assert_eq!(from, 0);
@@ -544,11 +661,11 @@ mod tests {
         let root = fixture("cools");
         let l = lease(&root);
 
-        l.set_duty(0, Some(HOT_C), real_ceiling()).unwrap();
+        l.set_duty(0, th(HOT_C)).unwrap();
         let hot_duty = l.duty().unwrap();
         assert!(hot_duty >= 78);
 
-        match l.enforce_floor(Some(IDLE_C), real_ceiling()) {
+        match l.enforce_floor(th(IDLE_C)) {
             Some(Enforced::Corrected { to, .. }) => {
                 assert_eq!(to, 0, "should return to the duty actually requested")
             }
@@ -560,10 +677,10 @@ mod tests {
     fn a_steady_temperature_provokes_no_writes() {
         let root = fixture("steady");
         let l = lease(&root);
-        l.set_duty(120, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(120, th(IDLE_C)).unwrap();
 
         assert!(
-            l.enforce_floor(Some(IDLE_C), real_ceiling()).is_none(),
+            l.enforce_floor(th(IDLE_C)).is_none(),
             "nothing changed, so nothing should be written"
         );
     }
@@ -573,9 +690,9 @@ mod tests {
         // Firmware has its own sensors. Holding the fan blind is the worst option.
         let root = fixture("blind");
         let l = lease(&root);
-        l.set_duty(200, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(200, th(IDLE_C)).unwrap();
 
-        match l.enforce_floor(None, real_ceiling()) {
+        match l.enforce_floor(th_none()) {
             Some(Enforced::ReleasedNoSensor { released }) => assert!(released),
             other => panic!("expected a release, got {other:?}"),
         }
@@ -587,7 +704,7 @@ mod tests {
     fn enforcement_does_nothing_when_the_ec_owns_the_fan() {
         let root = fixture("not-held");
         let l = lease(&root);
-        assert!(l.enforce_floor(Some(HOT_C), real_ceiling()).is_none());
+        assert!(l.enforce_floor(th(HOT_C)).is_none());
         assert_eq!(enable(&root), "2");
     }
 
@@ -612,7 +729,7 @@ mod tests {
 
         l.observe(60.0, 60.0, 0, true);
         assert_eq!(l.floor_duty(60.0), 0);
-        let applied = l.set_duty(0, Some(60.0), real_ceiling()).unwrap();
+        let applied = l.set_duty(0, th(60.0)).unwrap();
         assert!(!applied.clamped(), "{applied:?}");
     }
 
@@ -629,7 +746,7 @@ mod tests {
     fn suspend_releases_the_fan_and_resume_takes_it_back() {
         let root = fixture("sleep");
         let l = lease(&root);
-        l.set_duty(120, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(120, th(IDLE_C)).unwrap();
 
         assert_eq!(l.release_for_sleep(), Some(120));
         assert_eq!(
@@ -639,7 +756,7 @@ mod tests {
         );
         assert!(!l.held());
 
-        let restored = l.restore_after_resume(Some(IDLE_C), real_ceiling());
+        let restored = l.restore_after_resume(th(IDLE_C));
         assert_eq!(restored.unwrap().unwrap().requested, 120);
         assert_eq!(enable(&root), "1");
     }
@@ -650,10 +767,10 @@ mod tests {
         // would quietly lose exactly the setting a quiet-machine user chose.
         let root = fixture("sleep-zero");
         let l = lease(&root);
-        l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(0, th(IDLE_C)).unwrap();
 
         assert_eq!(l.release_for_sleep(), Some(0));
-        let restored = l.restore_after_resume(Some(IDLE_C), real_ceiling());
+        let restored = l.restore_after_resume(th(IDLE_C));
         assert_eq!(restored.unwrap().unwrap().requested, 0);
     }
 
@@ -663,9 +780,7 @@ mod tests {
         let l = lease(&root);
 
         assert_eq!(l.release_for_sleep(), None);
-        assert!(l
-            .restore_after_resume(Some(IDLE_C), real_ceiling())
-            .is_none());
+        assert!(l.restore_after_resume(th(IDLE_C)).is_none());
         assert_eq!(enable(&root), "2");
     }
 
@@ -675,13 +790,10 @@ mod tests {
         // temperature read *after* the wake, not the one from before the sleep.
         let root = fixture("sleep-warm");
         let l = lease(&root);
-        l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(0, th(IDLE_C)).unwrap();
         l.release_for_sleep();
 
-        let applied = l
-            .restore_after_resume(Some(HOT_C), real_ceiling())
-            .unwrap()
-            .unwrap();
+        let applied = l.restore_after_resume(th(HOT_C)).unwrap().unwrap();
         assert!(applied.clamped(), "{applied:?}");
         assert!(applied.target >= 78, "{applied:?}");
     }
@@ -690,13 +802,11 @@ mod tests {
     fn asking_for_ec_control_cancels_a_pending_restore() {
         let root = fixture("sleep-cancel");
         let l = lease(&root);
-        l.set_duty(120, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(120, th(IDLE_C)).unwrap();
         l.release_for_sleep();
         l.release().unwrap();
 
-        assert!(l
-            .restore_after_resume(Some(IDLE_C), real_ceiling())
-            .is_none());
+        assert!(l.restore_after_resume(th(IDLE_C)).is_none());
         assert_eq!(enable(&root), "2");
     }
 
@@ -709,7 +819,7 @@ mod tests {
 
         let too_hot = ceiling.celsius() + 1.0;
         assert!(matches!(
-            l.set_duty(255, Some(too_hot), ceiling),
+            l.set_duty(255, th(too_hot)),
             Err(LeaseError::AboveCeiling { .. })
         ));
         assert_eq!(enable(&root), "2", "the fan must stay with firmware");
@@ -721,10 +831,10 @@ mod tests {
         let root = fixture("ceiling-release");
         let l = lease(&root);
         let ceiling = real_ceiling();
-        l.set_duty(255, Some(IDLE_C), ceiling).unwrap();
+        l.set_duty(255, th(IDLE_C)).unwrap();
         assert_eq!(enable(&root), "1");
 
-        match l.enforce_floor(Some(ceiling.celsius() + 5.0), ceiling) {
+        match l.enforce_floor(th(ceiling.celsius() + 5.0)) {
             Some(Enforced::ReleasedTooHot { released, .. }) => assert!(released),
             other => panic!("expected a ceiling release, got {other:?}"),
         }
@@ -748,7 +858,66 @@ mod tests {
         // ceiling fires there, manual fan control is useless exactly when wanted.
         let root = fixture("ceiling-load");
         let l = lease(&root);
-        assert!(l.set_duty(200, Some(76.8), real_ceiling()).is_ok());
+        assert!(l.set_duty(200, th(76.8)).is_ok());
+    }
+
+    #[test]
+    fn a_hot_battery_raises_the_floor_even_with_an_idle_cpu() {
+        // The battery has an independent say. Measured, it stays around 34 C under
+        // full load, so this only matters in the case nobody has measured: a fan held
+        // low for a long time.
+        let root = fixture("batt-floor");
+        let l = lease(&root);
+        assert_eq!(l.set_duty(0, th_battery(30.0)).unwrap().target, 0);
+
+        let applied = l.set_duty(0, th_battery(45.0)).unwrap();
+        assert!(applied.clamped(), "{applied:?}");
+    }
+
+    #[test]
+    fn a_battery_near_its_limit_takes_the_fan_away() {
+        let root = fixture("batt-release");
+        let l = lease(&root);
+        assert!(matches!(
+            l.set_duty(255, th_battery(48.5)),
+            Err(LeaseError::BatteryTooHot { .. })
+        ));
+        assert_eq!(enable(&root), "2");
+    }
+
+    #[test]
+    fn a_battery_that_heats_while_we_hold_the_fan_gets_it_back() {
+        let root = fixture("batt-enforce");
+        let l = lease(&root);
+        l.set_duty(200, th_battery(30.0)).unwrap();
+
+        match l.enforce_floor(th_battery(48.5)) {
+            Some(Enforced::ReleasedBatteryHot { released, .. }) => assert!(released),
+            other => panic!("expected a battery release, got {other:?}"),
+        }
+        assert_eq!(enable(&root), "2");
+    }
+
+    #[test]
+    fn the_battery_error_explains_why_it_is_not_negotiable() {
+        let msg = LeaseError::BatteryTooHot {
+            celsius: 48.5,
+            guard: BatteryGuard::from_crit(Some(49.9)),
+        }
+        .to_string();
+        assert!(msg.contains("throttle"), "got: {msg}");
+    }
+
+    #[test]
+    fn no_battery_sensor_does_not_constrain_the_fan() {
+        // A normal state, and it must not read as "battery at 0 C" or force airflow.
+        let root = fixture("batt-absent");
+        let l = lease(&root);
+        let thermal = Thermal {
+            battery_celsius: None,
+            ..th(IDLE_C)
+        };
+        assert_eq!(l.set_duty(0, thermal).unwrap().target, 0);
     }
 
     #[test]
@@ -756,12 +925,7 @@ mod tests {
         let root = fixture("lease");
         let l = lease(&root);
 
-        assert_eq!(
-            l.set_duty(200, Some(IDLE_C), real_ceiling())
-                .unwrap()
-                .settled,
-            200
-        );
+        assert_eq!(l.set_duty(200, th(IDLE_C)).unwrap().settled, 200);
         assert!(l.held());
         assert_eq!(enable(&root), "1");
 
@@ -774,7 +938,7 @@ mod tests {
     fn release_now_works_whatever_we_believed() {
         let root = fixture("unconditional");
         let l = lease(&root);
-        l.set_duty(200, Some(IDLE_C), real_ceiling()).unwrap();
+        l.set_duty(200, th(IDLE_C)).unwrap();
 
         // Bookkeeping that has gone wrong: the flag says we hold nothing, the
         // hardware says otherwise. The hardware wins.
@@ -806,7 +970,7 @@ mod tests {
         let root = fixture("drop");
         {
             let l = lease(&root);
-            l.set_duty(200, Some(IDLE_C), real_ceiling()).unwrap();
+            l.set_duty(200, th(IDLE_C)).unwrap();
             assert_eq!(enable(&root), "1");
         }
         assert_eq!(enable(&root), "2", "Drop must have handed the fan back");

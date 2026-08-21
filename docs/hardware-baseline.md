@@ -123,6 +123,14 @@ Consequences, both acted on in [ADR 0011](adr/0011-quiet-is-a-legitimate-choice.
 | `ddr_f75303@4d` | 86.8 °C | No |
 | `battery_temp@b` | **49.9 °C** | **No** — and it is the lowest on the board |
 
+**Battery temperature barely moves under CPU load.** Measured across five minutes of
+16-core load with firmware driving the fan, on battery power: `battery_temp` went
+**31.9 → 33.9 °C** while `peci-temp` went 40.9 → 78.8 °C. That is 16 °C of headroom below
+its 49.9 °C crit. It lags heavily and was still rising during the cooldown. During that
+cooldown, with the fan still running hard, it fell to **26.9 °C — below its idle
+baseline** — so airflow does cool it. What is *not* measured is a long run with the fan
+held low, which is what a user-authored curve will allow.
+
 **The CPU protects itself at 100 °C.** Constraining the fan costs performance, not
 hardware. The components with no protection of their own are the battery above all, then
 the board and DDR sensors — nothing currently watches any of them.

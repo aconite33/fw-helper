@@ -23,6 +23,19 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
+    /// The battery's own temperature sensor, if this board exposes one.
+    ///
+    /// Worth having separately from [`Self::control_temp`] because the battery is the
+    /// one component here with a low limit and **no protection of its own**: on the
+    /// reference board `battery_temp@b` reports crit at 49.9 °C, against 100 °C for the
+    /// CPU, and the CPU throttles while the battery simply degrades (ADR 0011).
+    ///
+    /// Resolved by label, never by index — sensor ordering is no more stable than
+    /// hwmon numbering.
+    pub fn battery_temp(&self) -> Option<&TempReading> {
+        self.temps.iter().find(|t| t.label.starts_with("battery"))
+    }
+
     /// The sensor a fan curve should follow. `peci-temp` is the CPU package on the
     /// reference board; fall back to anything CPU-ish, then to the hottest reading.
     pub fn control_temp(&self) -> Option<&TempReading> {
@@ -150,6 +163,43 @@ mod tests {
         assert!(!Monitor::plausible_threshold(-273.15));
         assert!(Monitor::plausible_threshold(87.85));
         assert!(!Monitor::plausible_threshold(1000.0));
+    }
+
+    #[test]
+    fn finds_the_battery_sensor_by_label() {
+        let t = Telemetry {
+            temps: vec![
+                TempReading {
+                    label: "peci-temp".into(),
+                    celsius: 70.0,
+                    critical: Some(119.85),
+                },
+                TempReading {
+                    label: "battery_temp@b".into(),
+                    celsius: 38.0,
+                    critical: Some(49.9),
+                },
+            ],
+            ..Default::default()
+        };
+        let b = t.battery_temp().expect("battery sensor");
+        assert_eq!(b.celsius, 38.0);
+        assert_eq!(b.critical, Some(49.9));
+        // And it must not be mistaken for the fan curve's input.
+        assert_eq!(t.control_temp().unwrap().label, "peci-temp");
+    }
+
+    #[test]
+    fn no_battery_sensor_is_not_an_error() {
+        let t = Telemetry {
+            temps: vec![TempReading {
+                label: "peci-temp".into(),
+                celsius: 70.0,
+                critical: None,
+            }],
+            ..Default::default()
+        };
+        assert!(t.battery_temp().is_none());
     }
 
     #[test]

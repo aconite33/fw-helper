@@ -69,10 +69,10 @@ impl Daemon {
         self.latest.control_temp().map(|t| t.celsius)
     }
 
-    /// The temperature above which the fan belongs to firmware, derived from the
-    /// control sensor's own critical point (ADR 0006 point 5).
-    fn ceiling(&self) -> fw_helper_core::Ceiling {
-        crate::fan::ceiling_for(self.latest.control_temp().and_then(|t| t.critical))
+    /// Everything a fan decision needs from the thermal sensors, read from the same
+    /// telemetry the daemon publishes.
+    fn thermal(&self) -> crate::fan::Thermal {
+        crate::fan::Thermal::from_telemetry(&self.latest)
     }
 
     /// Authorize a caller for one action, or say why not.
@@ -241,7 +241,11 @@ impl Daemon {
     #[zbus(property)]
     async fn fan_floor(&self) -> u8 {
         match self.control_celsius() {
-            Some(c) => self.fan.floor_duty(c),
+            // The battery has an independent say: it can be warm while the CPU is idle.
+            Some(c) => self
+                .fan
+                .floor_duty(c)
+                .max(crate::fan::Thermal::from_telemetry(&self.latest).battery_floor_public()),
             None => u8::MAX,
         }
     }
@@ -294,7 +298,7 @@ impl Daemon {
         let celsius = self.control_celsius();
         let applied = self
             .fan
-            .set_duty(duty, celsius, self.ceiling())
+            .set_duty(duty, self.thermal())
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         if applied.clamped() {

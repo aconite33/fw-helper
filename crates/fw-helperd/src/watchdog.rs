@@ -137,7 +137,7 @@ impl Watchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fw_helper_core::{Ceiling, Sysfs};
+    use fw_helper_core::Sysfs;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicU32;
@@ -178,7 +178,9 @@ mod tests {
     fn does_not_trip_while_the_heartbeat_is_fresh() {
         let root = fixture("fresh");
         let (lease, wd) = watchdog(&root);
-        lease.set_duty(200, Some(40.0), Ceiling::default()).unwrap();
+        lease
+            .set_duty(200, crate::fan::Thermal::default_for_test(40.0))
+            .unwrap();
 
         wd.beat();
         assert!(!wd.check());
@@ -190,7 +192,9 @@ mod tests {
     fn releases_the_fan_when_the_heartbeat_stops() {
         let root = fixture("stale");
         let (lease, wd) = watchdog(&root);
-        lease.set_duty(200, Some(40.0), Ceiling::default()).unwrap();
+        lease
+            .set_duty(200, crate::fan::Thermal::default_for_test(40.0))
+            .unwrap();
         wd.beat();
 
         std::thread::sleep(Duration::from_millis(80));
@@ -220,7 +224,9 @@ mod tests {
         // manual control behind the lease's back.
         let root = fixture("retry");
         let (lease, wd) = watchdog(&root);
-        lease.set_duty(200, Some(40.0), Ceiling::default()).unwrap();
+        lease
+            .set_duty(200, crate::fan::Thermal::default_for_test(40.0))
+            .unwrap();
         wd.beat();
         std::thread::sleep(Duration::from_millis(80));
 
@@ -239,12 +245,16 @@ mod tests {
     fn a_beat_after_a_trip_stops_further_intervention() {
         let root = fixture("recover");
         let (lease, wd) = watchdog(&root);
-        lease.set_duty(200, Some(40.0), Ceiling::default()).unwrap();
+        lease
+            .set_duty(200, crate::fan::Thermal::default_for_test(40.0))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(80));
         assert!(wd.check());
 
         // Daemon recovers and takes the fan again.
-        lease.set_duty(200, Some(40.0), Ceiling::default()).unwrap();
+        lease
+            .set_duty(200, crate::fan::Thermal::default_for_test(40.0))
+            .unwrap();
         wd.beat();
         assert!(!wd.check());
         assert_eq!(enable(&root), "1");

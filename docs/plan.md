@@ -301,6 +301,16 @@ The highest-value and highest-risk feature. Do not shortcut
         Hardware caught three defects that unit tests passed: the quantized read-back, a
         floor deficit hiding inside `DUTY_TOLERANCE`, and direction derived per-sample
         reading a quantized cooldown as "steady" and recording the descending branch
+  - [x] **Battery guard** (`fw-helper-core/src/battery.rs`, 2026-08-21). The battery is
+        the one component with a low limit (crit 49.9 °C) and no protection of its own —
+        the CPU throttles, the battery simply degrades. It raises the floor independently
+        of the CPU, and takes the fan back entirely near its limit.
+        **Sized as a backstop, not a response to observed risk**: measured, the battery
+        rises only 2 °C (31.9 → 33.9) across five minutes of 16-core load, leaving 16 °C
+        of headroom, so the guard fires at no temperature yet seen. The unmeasured case it
+        exists for is a fan held low for far longer, which the curve engine will make
+        possible. Airflow *does* reach the battery — during a post-load cooldown with the
+        fan running hard it fell to 26.9 °C, below its idle baseline
   - [x] **`temp*_crit`-derived ceiling override, with sanity validation**
         (`fw-helper-core/src/ceiling.rs`, 2026-08-21). Derived from the control
         sensor's critical point minus a 15 °C margin — intervening *at* crit would be
