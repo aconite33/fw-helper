@@ -161,10 +161,22 @@ constrained fan costs performance, not hardware — the floor was never the CPU'
 What has no protection of its own is the **battery, crit 49.9 °C**, and nothing watches it
 yet. That is the open work ADR 0011 names and does not do.
 
-Next: the **curve engine** — interpolated temp→duty points, hysteresis, ramp limiting. It
-is the only part left that a user would recognise as the feature, because everything
-underneath it is what makes exposing it defensible. Design it alongside M4's power
-profiles rather than after: 10 W of power limit buys ~12 °C, so the two compose.
+**The curve engine is built and hardware-verified** (`fw-helper-core/src/curve.rs`). It
+produces a *request*; the floor and battery guard are applied on top every tick, so
+smoothing can never delay a safety response. Hysteresis is asymmetric — rising followed at
+once, falling damped by 2 °C.
+
+**The win is not where M0 predicted.** That reasoning used firmware's descending branch.
+Climbing, firmware is silent through 55–70 °C, so there is little to win going up; the win
+is coming *down*, where firmware holds duty 50–90 to 44.9 °C. Measured, the curve beats it
+by 13–36 counts through that range, with no hunting.
+
+**Open limitation:** the observed floor is lost on daemon restart, and the cold-start model
+is the loud one — measured, a curve asking for silence at 55 °C got duty 61 right after a
+restart. Persisting observations to `/var/lib/fw-helper/state` is the obvious fix.
+
+Next: M3 is feature-complete; remaining is M4's power limits, which the plan says to design
+alongside the curve — 10 W of power limit buys ~12 °C, so the two compose.
 
 **`fw-helperctl fan` is still not a curve.** It pins one duty rather than following
 temperature. What it is not, any more, is unbounded — the duty is clamped up to the
@@ -206,6 +218,7 @@ sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 sudo pkill -x fw-helperd
 fw-helperctl status | watch [secs] | charge-limit N
 fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the firmware floor
+fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey

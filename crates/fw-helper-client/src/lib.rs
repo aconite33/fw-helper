@@ -50,6 +50,13 @@ pub trait Daemon {
 
     /// Hand the fan back to the EC. May prompt via polkit.
     fn set_fan_auto(&self) -> zbus::Result<()>;
+
+    /// The active curve as (temperature, duty) pairs; empty when none is running.
+    #[zbus(property)]
+    fn fan_curve(&self) -> zbus::Result<Vec<(f64, u8)>>;
+
+    /// Follow a temperature → duty curve. May prompt via polkit.
+    fn set_fan_curve(&self, points: Vec<(f64, u8)>) -> zbus::Result<u8>;
 }
 
 /// Highest interface version this client understands.
@@ -105,6 +112,8 @@ pub struct Snapshot {
     /// Lowest duty permitted at the current temperature, so a client can explain a
     /// slider that will not go lower instead of appearing to ignore the user.
     pub fan_floor: Option<u8>,
+    /// The active curve, empty when the fan is pinned or firmware owns it.
+    pub fan_curve: Vec<(f64, u8)>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -144,6 +153,7 @@ impl Snapshot {
             fan_mode: d.fan_mode().ok(),
             fan_duty: d.fan_duty().ok(),
             fan_floor: d.fan_floor().ok(),
+            fan_curve: d.fan_curve().unwrap_or_default(),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

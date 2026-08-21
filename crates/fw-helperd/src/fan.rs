@@ -24,7 +24,9 @@
 //!   not.
 
 use fw_helper_core::fan::DUTY_TOLERANCE;
-use fw_helper_core::{BatteryGuard, Ceiling, FanControl, FanError, FanMode, FirmwareFloor, Sysfs};
+use fw_helper_core::{
+    BatteryGuard, Ceiling, Curve, CurveEngine, FanControl, FanError, FanMode, FirmwareFloor, Sysfs,
+};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -209,6 +211,10 @@ pub struct FanLease {
     /// setting a quiet-machine user cares about.
     restore_pending: AtomicBool,
     restore_duty: AtomicU8,
+    /// The active curve, when the fan is following one rather than pinned.
+    ///
+    /// Behind the same rule as the floor: **no release path may touch this lock.**
+    curve: Mutex<Option<CurveEngine>>,
     /// The firmware floor, learned as it goes.
     ///
     /// **The release paths never lock this.** `release_now` runs from the panic hook,
@@ -226,6 +232,7 @@ impl FanLease {
             applied: AtomicU8::new(0),
             restore_pending: AtomicBool::new(false),
             restore_duty: AtomicU8::new(0),
+            curve: Mutex::new(None),
             floor: Mutex::new(FirmwareFloor::new()),
         }
     }
@@ -373,7 +380,16 @@ impl FanLease {
             });
         }
 
-        let requested = self.requested.load(Ordering::SeqCst);
+        // A curve moves the request every tick; a pinned duty keeps the one it was
+        // given. Either way the floor is applied afterwards, so the curve cannot make
+        // the machine unsafe and the floor is never smoothed.
+        let requested = match self.curve_tick(celsius) {
+            Some(duty) => {
+                self.requested.store(duty, Ordering::SeqCst);
+                duty
+            }
+            None => self.requested.load(Ordering::SeqCst),
+        };
         let floor = self.floor_duty(celsius).max(thermal.battery_floor());
         let target = requested.max(floor);
 
@@ -419,8 +435,59 @@ impl FanLease {
         Ok(settled)
     }
 
+    /// Follow `curve` from now on, re-evaluated every tick.
+    ///
+    /// The curve produces a *request*; the firmware floor and the battery guard are
+    /// applied to it afterwards, so a badly drawn curve is bounded by the same limits a
+    /// pinned duty is. Returns what the first tick settled on.
+    pub fn set_curve(&self, curve: Curve, thermal: Thermal) -> Result<Applied, LeaseError> {
+        let Some(celsius) = thermal.celsius.filter(|c| c.is_finite()) else {
+            return Err(LeaseError::NoTemperature);
+        };
+        let mut engine = CurveEngine::new(curve);
+        let wanted = engine.tick(celsius);
+        let applied = self.set_duty(wanted, thermal)?;
+        // Only after the write is accepted: a stored curve with no lease behind it
+        // would drive the next tick from a state that never happened.
+        if let Ok(mut slot) = self.curve.lock() {
+            *slot = Some(engine);
+        }
+        Ok(applied)
+    }
+
+    pub fn curve_active(&self) -> bool {
+        self.curve.lock().map(|c| c.is_some()).unwrap_or(false)
+    }
+
+    /// A description of the active curve, for reporting.
+    pub fn curve_points(&self) -> Option<Vec<(f64, u8)>> {
+        let slot = self.curve.lock().ok()?;
+        let engine = slot.as_ref()?;
+        Some(
+            engine
+                .curve()
+                .points()
+                .iter()
+                .map(|p| (p.celsius, p.duty))
+                .collect(),
+        )
+    }
+
+    fn clear_curve(&self) {
+        if let Ok(mut slot) = self.curve.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Advance the curve one tick and return the duty it asks for, if one is active.
+    fn curve_tick(&self, celsius: f64) -> Option<u8> {
+        let mut slot = self.curve.lock().ok()?;
+        slot.as_mut().map(|e| e.tick(celsius))
+    }
+
     /// Hand the fan back and confirm the EC took it.
     pub fn release(&self) -> Result<(), LeaseError> {
+        self.clear_curve();
         self.requested.store(0, Ordering::SeqCst);
         self.applied.store(0, Ordering::SeqCst);
         // Asking for EC control means asking for it after the next resume too.
@@ -456,6 +523,14 @@ impl FanLease {
     pub fn restore_after_resume(&self, thermal: Thermal) -> Option<Result<Applied, LeaseError>> {
         if !self.restore_pending.swap(false, Ordering::SeqCst) {
             return None;
+        }
+        // The ramp state from before the sleep says nothing about now: the machine may
+        // have woken at a different temperature entirely, and easing from a duty it held
+        // ten minutes ago would be smoothing across a discontinuity.
+        if let Ok(mut slot) = self.curve.lock() {
+            if let Some(engine) = slot.as_mut() {
+                engine.reset();
+            }
         }
         let duty = self.restore_duty.load(Ordering::SeqCst);
         Some(self.set_duty(duty, thermal))

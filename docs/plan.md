@@ -205,9 +205,30 @@ out, without needing any intervention in the second.
 The highest-value and highest-risk feature. Do not shortcut
 [ADR 0006](adr/0006-fail-safe-fan-control.md).
 
-- Curve engine: interpolated temp→duty points, configurable sensor, hysteresis to stop
-  oscillation, ramp limiting so the fan does not step audibly
-- **Where the benefit actually is** (from Q6): the stock EC curve sits at 0 rpm at 43.9 °C and
+- [x] **Curve engine** (`fw-helper-core/src/curve.rs`, 2026-08-21): validated
+  interpolated temp→duty points, asymmetric hysteresis, ramp limiting. Reached over D-Bus
+  as `SetFanCurve` and from `fw-helperctl fan curve [T:D,...]`. The curve produces a
+  *request*; the firmware floor and battery guard are applied on top every tick, so a
+  badly drawn curve is bounded exactly as a pinned duty is, and smoothing never delays a
+  safety response. Hysteresis is asymmetric — rising is followed at once, falling is
+  damped by 2 °C — because heat should be answered immediately while quiet can arrive
+  late. Configurable *sensor* is deferred: `control_temp()` picks `peci-temp`, and curve
+  editing proper belongs to the GUI in M6.
+  **Verified on hardware** under 3 minutes of 16-core load: held 70.8–80.8 °C at duty
+  92–112, with **2 duty direction reversals across 45 settled samples** (no hunting) and
+  no step beyond the ramp limit. Coming down it beat firmware at every point measured —
+  duty 77 vs ~90 at 60 °C, 61 vs ~82 at 55 °C, 38 vs ~74 at 50 °C.
+  **Known limitation**: the run also showed the curve asking for 0 at 55 °C and getting
+  61, because the daemon had just restarted and the observed floor was empty, so the
+  cold-start model applied. Persisting observations across restarts is the obvious fix
+  and is not done
+- **Where the benefit actually is — revised 2026-08-21.** The paragraph below was written
+  from Q6 data that turned out to be firmware's *descending* branch. Measured while
+  heating, firmware is silent right through the 55–70 °C band and does not start the fan
+  until 66–73 °C, so there is little to win on the way up. The win is on the way **down**:
+  firmware's hysteresis holds the fan at duty 50–90 all the way to 44.9 °C after a load
+  spike. Measured, the curve beats it by 13–36 duty counts through that range.
+- **Original M0 reasoning, retained for the record** (from Q6): the stock EC curve sits at 0 rpm at 43.9 °C and
   still 0 rpm at 44.9 °C, but ~2900 rpm at 64.8 °C, and only reaches ~3100 rpm at 76.8 °C.
   So the fan-start knee is above 45 °C and the ramp to ~2900 rpm is compressed into a narrow
   band, then flattens. The audible win is a gentler curve through the 55–70 °C

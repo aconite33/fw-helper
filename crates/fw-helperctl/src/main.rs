@@ -19,6 +19,8 @@ USAGE:
     fw-helperctl charge-limit N  set the battery charge limit (20-100)
     fw-helperctl fan N           pin the fan at duty N (0, or 30-255)
     fw-helperctl fan auto        hand the fan back to the EC
+    fw-helperctl fan curve        follow the built-in quiet curve
+    fw-helperctl fan curve T:D,.. follow a custom curve, e.g. 55:0,70:65,85:120
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -85,6 +87,16 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
         // Say who is driving. Under manual control the EC's curve is not running, and
         // an RPM with no owner shown is indistinguishable from a stuck fan (ADR 0006).
         match s.fan_mode.as_deref() {
+            Some("curve") => {
+                let duty = s.fan_duty.unwrap_or(0);
+                println!("  fan                {r} rpm  (CURVE, currently duty {duty}/255)");
+                let spec: Vec<String> = s
+                    .fan_curve
+                    .iter()
+                    .map(|(c, d)| format!("{c:.0}C:{d}"))
+                    .collect();
+                println!("                     {}", spec.join("  "));
+            }
             Some("manual") => {
                 let duty = s.fan_duty.unwrap_or(0);
                 let percent = (f64::from(duty) * 100.0 / 255.0).round();
@@ -225,6 +237,12 @@ fn fan(arg: Option<&str>) {
         }
     };
 
+    if arg == "curve" {
+        set_curve(&d, None);
+    }
+    if let Some(spec) = arg.strip_prefix("curve ") {
+        set_curve(&d, Some(spec));
+    }
     if arg == "auto" {
         match d.set_fan_auto() {
             Ok(()) => println!("fan returned to EC control"),
@@ -261,6 +279,75 @@ fn fan(arg: Option<&str>) {
             std::process::exit(1);
         }
     }
+}
+
+/// Send a curve to the daemon. `None` means the built-in one.
+///
+/// The daemon validates: points must ascend in temperature, must not fall in duty, and
+/// must not ask for a duty that cannot turn the fan. Its message says which rule was
+/// broken, so there is nothing to duplicate here.
+fn set_curve(d: &DaemonProxyBlocking<'_>, spec: Option<&str>) -> ! {
+    let points: Vec<(f64, u8)> = match spec {
+        None => Vec::new(),
+        Some(s) => match parse_curve(s) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                eprintln!("expected temperature:duty pairs, e.g. 55:0,70:65,85:120");
+                std::process::exit(2);
+            }
+        },
+    };
+    // An empty list means "use the built-in", resolved here rather than in the daemon
+    // so the wire stays a plain list of points.
+    let points = if points.is_empty() {
+        vec![
+            (55.0, 0u8),
+            (62.0, 40),
+            (70.0, 65),
+            (80.0, 92),
+            (90.0, 130),
+            (100.0, 255),
+        ]
+    } else {
+        points
+    };
+
+    match d.set_fan_curve(points.clone()) {
+        Ok(settled) => {
+            println!("following a fan curve; currently duty {settled}/255");
+            for (c, duty) in &points {
+                println!("  {c:>5.1} C -> {duty:>3}/255");
+            }
+            println!("  the firmware floor still applies on top of this");
+            println!("  'fw-helperctl fan auto' returns control to the EC");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_curve(spec: &str) -> Result<Vec<(f64, u8)>, String> {
+    spec.split(',')
+        .map(|pair| {
+            let (t, d) = pair
+                .trim()
+                .split_once(':')
+                .ok_or_else(|| format!("'{pair}' is not temperature:duty"))?;
+            let celsius: f64 = t
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{t}' is not a temperature"))?;
+            let duty: u8 = d
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{d}' is not a duty"))?;
+            Ok((celsius, duty))
+        })
+        .collect()
 }
 
 fn watch(secs: u64) {

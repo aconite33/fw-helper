@@ -220,6 +220,10 @@ impl Daemon {
     #[zbus(property)]
     async fn fan_mode(&self) -> String {
         match self.fan.mode() {
+            // "manual" and "curve" are both us driving, but they mean different things
+            // to a user: one is a number they chose, the other is a rule that keeps
+            // choosing. Reporting them the same forces every client to infer it.
+            Some(fw_helper_core::FanMode::Manual) if self.fan.curve_active() => "curve".into(),
             Some(m) => m.to_string(),
             None => "unavailable".into(),
         }
@@ -313,6 +317,59 @@ impl Daemon {
         } else {
             eprintln!("fan set to duty {}/255 by {sender}", applied.settled);
         }
+        Ok(applied.settled)
+    }
+
+    /// The active fan curve as (temperature, duty) pairs, empty when none is running.
+    #[zbus(property)]
+    async fn fan_curve(&self) -> Vec<(f64, u8)> {
+        self.fan.curve_points().unwrap_or_default()
+    }
+
+    /// Follow a temperature → duty curve.
+    ///
+    /// Points must ascend in temperature and must not fall in duty; a duty between 1
+    /// and the stiction threshold is refused, because it describes a stopped fan while
+    /// looking like a slow one. The curve is a *request*: the firmware floor and the
+    /// battery guard are applied on top of it every tick, so a badly drawn curve is
+    /// bounded exactly as a pinned duty is.
+    async fn set_fan_curve(
+        &self,
+        points: Vec<(f64, u8)>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<u8> {
+        if let fw_helper_core::Cap::No(reason) = &self.caps.fan_control {
+            return Err(zbus::fdo::Error::NotSupported(reason.clone()));
+        }
+        let stale = self.watchdog.since_beat();
+        if stale > crate::watchdog::TIMEOUT {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "refusing fan control: this daemon's telemetry loop has not run for \
+                 {:.0}s, so nothing would be following the curve. Restart fw-helperd",
+                stale.as_secs_f64()
+            )));
+        }
+        // Validate before authorizing: a malformed curve is a malformed curve whether
+        // or not the caller could have been allowed to set a good one.
+        let curve = fw_helper_core::Curve::new(
+            points
+                .into_iter()
+                .map(|(celsius, duty)| fw_helper_core::Point { celsius, duty })
+                .collect(),
+        )
+        .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
+
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+        let applied = self
+            .fan
+            .set_curve(curve, self.thermal())
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        eprintln!(
+            "fan: following a curve, requested by {sender}; first tick duty {}/255",
+            applied.settled
+        );
         Ok(applied.settled)
     }
 
