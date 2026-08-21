@@ -84,4 +84,5 @@ pub async fn check(conn: &zbus::Connection, sender: &str, action: &str) -> Resul
 
 pub mod actions {
     pub const SET_CHARGE_LIMIT: &str = "org.fwhelper.set-charge-limit";
+    pub const SET_FAN: &str = "org.fwhelper.set-fan";
 }

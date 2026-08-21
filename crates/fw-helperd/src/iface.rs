@@ -1,13 +1,14 @@
 //! The `org.fwhelper.Daemon1` interface.
 //!
-//! M1b is read-only: properties only, no methods that touch hardware. Writes arrive
-//! with M2 onward, each behind its own polkit action (ADR 0003).
+//! Properties are read-only and unauthenticated; every method that touches hardware
+//! goes through `authorize` first, per action, failing closed (ADR 0003).
 
+use crate::fan::FanLease;
 use crate::state::State;
 use crate::{polkit, wire};
 use fw_helper_core::{Capabilities, ChargeControl, Sysfs, Telemetry};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use zbus::zvariant::OwnedValue;
 
 /// Outcome of [`Daemon::reapply_charge_limit`].
@@ -36,16 +37,41 @@ pub struct Daemon {
     /// can legitimately take tens of seconds — which would stall telemetry for every
     /// client while a password dialog sits on screen.
     state: Mutex<State>,
+    /// Shared with `main`, which releases it on every shutdown path. Lock-free by
+    /// design so the panic hook can use it (ADR 0006).
+    fan: Arc<FanLease>,
 }
 
 impl Daemon {
-    pub fn new(fs: Sysfs, caps: Capabilities, state: State) -> Self {
+    pub fn new(fs: Sysfs, caps: Capabilities, state: State, fan: Arc<FanLease>) -> Self {
         Self {
             fs,
             caps,
             latest: Telemetry::default(),
             state: Mutex::new(state),
+            fan,
         }
+    }
+
+    /// Authorize a caller for one action, or say why not.
+    ///
+    /// Every hardware-touching method starts here. Factored out because the sequence
+    /// — identify the caller, then check the action, failing closed — must be
+    /// identical for each one, and a method that forgets a step is a method that
+    /// writes to hardware unauthenticated.
+    async fn authorize(
+        header: &zbus::message::Header<'_>,
+        conn: &zbus::Connection,
+        action: &str,
+    ) -> zbus::fdo::Result<String> {
+        let sender = header
+            .sender()
+            .map(|s| s.to_string())
+            .ok_or_else(|| zbus::fdo::Error::AuthFailed("no caller identity".into()))?;
+        polkit::check(conn, &sender, action)
+            .await
+            .map_err(zbus::fdo::Error::AuthFailed)?;
+        Ok(sender)
     }
 
     /// Re-apply the persisted charge limit. Called at startup, because
@@ -153,14 +179,7 @@ impl Daemon {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        let sender = header
-            .sender()
-            .map(|s| s.to_string())
-            .ok_or_else(|| zbus::fdo::Error::AuthFailed("no caller identity".into()))?;
-
-        polkit::check(conn, &sender, polkit::actions::SET_CHARGE_LIMIT)
-            .await
-            .map_err(zbus::fdo::Error::AuthFailed)?;
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_CHARGE_LIMIT).await?;
 
         ChargeControl::new(&self.fs)
             .set(percent)
@@ -172,6 +191,80 @@ impl Daemon {
             state.save();
         }
         eprintln!("charge limit set to {percent}% by {sender}");
+        Ok(())
+    }
+
+    /// How the fan is currently driven: `auto`, `manual`, or `unavailable`.
+    #[zbus(property)]
+    async fn fan_mode(&self) -> String {
+        match self.fan.mode() {
+            Some(m) => m.to_string(),
+            None => "unavailable".into(),
+        }
+    }
+
+    /// Current duty 0-255 as the EC reports it, or 0 when unavailable. Under EC
+    /// control this reads 0 regardless of how fast the fan is actually turning, so it
+    /// is only meaningful alongside `FanMode` - read `Telemetry`'s fan rpm for speed.
+    #[zbus(property)]
+    async fn fan_duty(&self) -> u8 {
+        self.fan.duty().unwrap_or(0)
+    }
+
+    /// Take manual fan control and hold `duty` (0-255).
+    ///
+    /// Returns the duty the EC actually settled on, which may differ by a count or
+    /// two: the EC stores whole percent, so 180 comes back as 181.
+    ///
+    /// **This is not a fan curve.** It pins one duty until something changes it, with
+    /// no temperature feedback whatsoever, and the safety layers that make a curve
+    /// safe to expose (firmware-floor clamp, critical-temperature override, watchdog)
+    /// are not built yet. The flat `MIN_DUTY` floor is what stands in for them, and it
+    /// is a poor substitute - see `fan::MIN_DUTY`.
+    async fn set_fan_duty(
+        &self,
+        duty: u8,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<u8> {
+        // Capability before authorization: there is no point prompting for a password
+        // to do something this machine cannot do, and the reason is more useful than
+        // an auth failure would be.
+        if let fw_helper_core::Cap::No(reason) = &self.caps.fan_control {
+            return Err(zbus::fdo::Error::NotSupported(reason.clone()));
+        }
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+
+        let settled = self
+            .fan
+            .set_duty(duty)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        eprintln!("fan set to duty {settled}/255 by {sender}");
+        Ok(settled)
+    }
+
+    /// Hand the fan back to the EC.
+    ///
+    /// Deliberately requires the same authorization as taking control. It is the safe
+    /// direction, but it is still a change to how the machine behaves, and a caller
+    /// permitted to undo another user's setting without authenticating would be a
+    /// surprise.
+    async fn set_fan_auto(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        if let fw_helper_core::Cap::No(reason) = &self.caps.fan_control {
+            return Err(zbus::fdo::Error::NotSupported(reason.clone()));
+        }
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+
+        self.fan
+            .release()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        eprintln!("fan returned to EC control by {sender}");
         Ok(())
     }
 }
@@ -206,7 +299,8 @@ mod tests {
         let state = State {
             charge_limit: persisted,
         };
-        Daemon::new(fs_, caps, state)
+        let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));
+        Daemon::new(fs_, caps, state, lease)
     }
 
     fn write_attr(root: &Path, value: &str) {

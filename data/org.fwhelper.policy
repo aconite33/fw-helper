@@ -19,4 +19,19 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+  <action id="org.fwhelper.set-fan">
+    <description>Control the fan</description>
+    <message>Authentication is required to take manual control of the fan</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!--
+        Same auth_admin_keep reasoning as the charge limit: a fan control that
+        prompts on every adjustment trains people to click through prompts.
+        Note this action also governs handing the fan back to the EC. That is the
+        safe direction, but it is still someone else's setting being changed.
+      -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

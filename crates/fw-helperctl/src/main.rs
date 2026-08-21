@@ -17,6 +17,8 @@ USAGE:
     fw-helperctl status          capabilities and one telemetry sample
     fw-helperctl watch [secs]    live telemetry, 1 Hz (default 10s)
     fw-helperctl charge-limit N  set the battery charge limit (20-100)
+    fw-helperctl fan N           pin the fan at duty N (77-255)
+    fw-helperctl fan auto        hand the fan back to the EC
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -28,6 +30,7 @@ fn main() {
         Some("status") | None => status(),
         Some("watch") => watch(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10)),
         Some("charge-limit") => charge_limit(args.get(1).map(String::as_str)),
+        Some("fan") => fan(args.get(1).map(String::as_str)),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -79,7 +82,17 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
         None => println!("  package power      <unavailable>"),
     }
     if let Some(r) = s.fan_rpm {
-        println!("  fan                {r} rpm");
+        // Say who is driving. Under manual control the EC's curve is not running, and
+        // an RPM with no owner shown is indistinguishable from a stuck fan (ADR 0006).
+        match s.fan_mode.as_deref() {
+            Some("manual") => {
+                let duty = s.fan_duty.unwrap_or(0);
+                let percent = (f64::from(duty) * 100.0 / 255.0).round();
+                println!("  fan                {r} rpm  (MANUAL, duty {duty}/255 = {percent:.0}%)");
+                println!("                     EC curve is not running; 'fw-helperctl fan auto' restores it");
+            }
+            _ => println!("  fan                {r} rpm  (EC automatic)"),
+        }
     }
     if let Some(p) = &s.platform_profile {
         println!("  platform profile   {p}");
@@ -176,6 +189,58 @@ fn charge_limit(arg: Option<&str>) {
     };
     match d.set_charge_limit(percent) {
         Ok(()) => println!("charge limit set to {percent}%"),
+        Err(e) => {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Manual fan control. Requires the daemon for the same reason the charge limit does.
+///
+/// There is no curve behind this: it pins one duty with no temperature feedback at
+/// all. `auto` is the way back, and is what should be used to make the fan quieter at
+/// idle - the EC can run it slower than this command is allowed to.
+fn fan(arg: Option<&str>) {
+    let Some(arg) = arg else {
+        eprintln!("usage: fw-helperctl fan <77-255|auto>");
+        std::process::exit(2);
+    };
+
+    let (d, _) = match connect() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fw-helperd unavailable ({e}); fan control requires it");
+            std::process::exit(1);
+        }
+    };
+
+    if arg == "auto" {
+        match d.set_fan_auto() {
+            Ok(()) => println!("fan returned to EC control"),
+            Err(e) => {
+                eprintln!("failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let Ok(duty) = arg.parse::<u8>() else {
+        eprintln!("not a duty or 'auto': {arg}");
+        std::process::exit(2);
+    };
+    match d.set_fan_duty(duty) {
+        // Report what the EC took, not what was asked for: it quantizes to whole
+        // percent, so these differ by a count or two and the difference is real.
+        Ok(settled) => {
+            let percent = (f64::from(settled) * 100.0 / 255.0).round();
+            println!("fan pinned at duty {settled}/255 ({percent:.0}%)");
+            if settled != duty {
+                println!("  (asked for {duty}; the EC stores whole percent)");
+            }
+            println!("  'fw-helperctl fan auto' returns control to the EC");
+        }
         Err(e) => {
             eprintln!("failed: {e}");
             std::process::exit(1);

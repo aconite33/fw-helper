@@ -231,11 +231,32 @@ The highest-value and highest-risk feature. Do not shortcut
   - [x] **`fw-helper-restore-fan`** (2026-08-21) — its own crate, depending on nothing but
         the dependency-free core: no async runtime, no D-Bus, 478 KB. Not yet wired to
         `ExecStopPost`; there is still no installed unit
-  - [ ] restore `pwm1_enable=2` on exit, signal, and panic — the daemon side, not started
+  - [x] **restore `pwm1_enable=2` on exit, signal and panic** (`fw-helperd/src/fan.rs`,
+        2026-08-21). `FanLease` is deliberately lock-free — a panic can happen while
+        another thread holds a lock, and a hook that blocks there would leave the process
+        alive with the fan held. Releases are unconditional: the flag saying whether we
+        hold the lease can be wrong in exactly the case that matters, and the write is
+        idempotent. Startup also reclaims a fan left manual by a previous instance,
+        reading before writing so the log says which case it was.
+        **SIGTERM verified on hardware**: fan pinned at 181/255 and 5093 rpm, `pkill
+        -TERM`, `pwm1_enable` back to `2` with `released manual fan control` in the log.
+        The panic path is implemented and unit-tested but **has not been triggered live**
+  - [x] **`ExecStopPost` wired** — uncommented in `data/fw-helperd.service`, and
+        `install-dev.sh --systemd` now installs `fw-helper-restore-fan` and refuses to
+        install a unit without it. **Not yet demonstrated**: that needs the unit
+        installed and a `kill -9`, which is the M3 exit gate
   - [ ] watchdog thread with independent timer
   - firmware-floor clamp (never quieter than the EC would be)
   - `temp*_crit`-derived ceiling override, with sanity validation
   - refuse manual control if the sensor is unreadable
+- Fan control reached over D-Bus (`SetFanDuty` / `SetFanAuto`, polkit action
+  `org.fwhelper.set-fan`) and from `fw-helperctl fan <duty|auto>`. **This is not a
+  curve** — it pins one duty with no temperature feedback. A flat `MIN_DUTY` floor of
+  77/255 stands in for the firmware-floor clamp until that exists; `fan auto` is the
+  route to a genuinely quieter fan, since the EC may run it slower safely
+- `status` names the fan's owner. An RPM shown without saying the EC curve is
+  suspended is indistinguishable from a stuck fan, which is the failure ADR 0006 asks
+  the UI to make visible
 - logind `PrepareForSleep` handling
 
 **Exit:** `kill -9` on the daemon under sustained load restores EC fan control within 5 s.

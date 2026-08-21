@@ -9,7 +9,8 @@
 #   sudo ./scripts/install-dev.sh --enable-charge-control
 #   sudo ./scripts/install-dev.sh --uninstall
 #
-# Installs nothing that writes to hardware: M1b is read-only.
+# Installs the polkit actions that gate hardware writes, and with --systemd the
+# fan restore binary the unit's ExecStopPost depends on.
 
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "ERROR: run with sudo" >&2; exit 1; }
@@ -18,6 +19,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 POLICY=/etc/dbus-1/system.d/org.fwhelper.Daemon1.conf
 UNIT=/etc/systemd/system/fw-helperd.service
 BIN=/usr/libexec/fw-helperd
+RESTORE=/usr/libexec/fw-helper-restore-fan
 CTL=/usr/local/bin/fw-helperctl
 POLKIT=/usr/share/polkit-1/actions/org.fwhelper.policy
 MODPROBE=/etc/modprobe.d/fw-helper.conf
@@ -44,7 +46,7 @@ fi
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl disable --now fw-helperd.service 2>/dev/null || true
-    rm -fv "$POLICY" "$UNIT" "$BIN" "$CTL" "$POLKIT" "$MODPROBE"
+    rm -fv "$POLICY" "$UNIT" "$BIN" "$RESTORE" "$CTL" "$POLKIT" "$MODPROBE"
     systemctl daemon-reload
     systemctl reload dbus 2>/dev/null || true
     echo "removed."
@@ -100,7 +102,14 @@ install -m 644 -v "$REPO/data/org.fwhelper.policy" "$POLKIT"
 if [[ "${1:-}" == "--systemd" ]]; then
     [[ -x "$REPO/target/release/fw-helperd" ]] || {
         echo "ERROR: build first: cargo build --release -p fw-helperd" >&2; exit 1; }
+    # The unit's ExecStopPost points at this, and a unit referencing a missing
+    # ExecStopPost binary fails to start. More to the point, it is the only thing
+    # standing between a SIGKILLed daemon and a fan stuck at a fixed duty (ADR 0006),
+    # so refuse to install a unit that cannot run it.
+    [[ -x "$REPO/target/release/fw-helper-restore-fan" ]] || {
+        echo "ERROR: build first: cargo build --release -p fw-helper-restore-fan" >&2; exit 1; }
     install -m 755 -v "$REPO/target/release/fw-helperd" "$BIN"
+    install -m 755 -v "$REPO/target/release/fw-helper-restore-fan" "$RESTORE"
     install -m 644 -v "$REPO/data/fw-helperd.service" "$UNIT"
     systemctl daemon-reload
     systemctl enable --now fw-helperd.service

@@ -1,9 +1,15 @@
 //! `fw-helperd` — privileged daemon for fw-helper.
 //!
 //! Owns all hardware access; the GUI and CLI hold none and reach it over D-Bus
-//! (ADR 0003). **M1b is entirely read-only** — it publishes telemetry and
-//! capabilities and writes nothing. Hardware writes arrive with M2.
+//! (ADR 0003). Writes arrived with M2 (charge limit) and M3 (fan).
+//!
+//! Manual fan control is the one thing here that can damage the machine, so the
+//! shutdown paths are not boilerplate: every route out of this process must return
+//! `pwm1_enable=2` (ADR 0006). Clean exit, `SIGTERM`, `SIGINT` and panic are covered
+//! below; `SIGKILL` and a hung process are not, and are covered by `ExecStopPost` and
+//! the watchdog respectively.
 
+mod fan;
 mod iface;
 mod logind;
 mod polkit;
@@ -11,6 +17,7 @@ mod state;
 mod wire;
 
 use fw_helper_core::{Capabilities, Monitor, Sysfs};
+use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,11 +42,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("note: package power needs root; running unprivileged?");
     }
 
+    // Before anything else: if a previous instance died holding manual fan control,
+    // take it back. This runs even when fan control is unsupported, where it is a
+    // no-op, because the cost of asking is one read.
+    let lease = Arc::new(fan::FanLease::new(fs.clone()));
+    lease.reclaim_at_startup();
+    install_panic_hook(Arc::clone(&lease));
+
     let state = state::State::load();
     if let Some(limit) = state.charge_limit {
         eprintln!("persisted charge limit: {limit}%");
     }
-    let daemon = iface::Daemon::new(fs.clone(), caps, state);
+    let daemon = iface::Daemon::new(fs.clone(), caps, state, Arc::clone(&lease));
     daemon.reapply_charge_limit();
 
     // The session bus is a development affordance: claiming a name on the system bus
@@ -65,15 +79,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let poll = tokio::spawn(poll_loop(conn.clone(), Monitor::new(fs), resumed));
 
-    // Shut down cleanly on either signal. From M3 this is also where manual fan
-    // control gets released, so the structure matters more than it looks (ADR 0006).
+    // Shut down cleanly on either signal, and hand the fan back before doing anything
+    // else — the poll task is irrelevant if the fan is stuck (ADR 0006).
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => eprintln!("SIGINT, shutting down"),
         _ = sigterm.recv()          => eprintln!("SIGTERM, shutting down"),
     }
+    shut_down_fan(&lease);
     poll.abort();
     Ok(())
+}
+
+/// Release manual fan control on the way out, saying which case it was.
+///
+/// Reads before writing for the same reason M2's charge re-apply does: "we were not
+/// holding it" and "we were, and gave it back" are different facts, and a log line
+/// that cannot tell them apart cannot show that the restore paths work.
+fn shut_down_fan(lease: &fan::FanLease) {
+    let held = lease.held();
+    if lease.release_now() {
+        if held {
+            eprintln!("released manual fan control; fan is back under EC control");
+        }
+    } else {
+        eprintln!(
+            "WARNING: could not return the fan to EC control. Run \
+             fw-helper-restore-fan as root"
+        );
+    }
+}
+
+/// Release the fan on panic, then let the normal hook print the backtrace.
+///
+/// The hook must not lock anything: a panic can occur while another thread holds a
+/// lock, and blocking here would leave the process alive with the fan held — the
+/// exact failure ADR 0006 is written against. [`fan::FanLease`] is lock-free for this
+/// reason.
+fn install_panic_hook(lease: Arc<fan::FanLease>) {
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let ok = lease.release_now();
+        eprintln!(
+            "fw-helperd panicked; fan {}",
+            if ok {
+                "returned to EC control"
+            } else {
+                "NOT returned to EC control - run fw-helper-restore-fan as root"
+            }
+        );
+        previous(info);
+    }));
 }
 
 async fn poll_loop(conn: zbus::Connection, mut mon: Monitor, resumed: Arc<AtomicBool>) {

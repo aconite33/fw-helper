@@ -30,6 +30,21 @@ pub trait Daemon {
 
     /// Set the battery charge limit. May prompt via polkit.
     fn set_charge_limit(&self, percent: u8) -> zbus::Result<()>;
+
+    /// How the fan is driven: `auto`, `manual`, or `unavailable`.
+    #[zbus(property)]
+    fn fan_mode(&self) -> zbus::Result<String>;
+
+    /// Duty 0-255 as the EC reports it. Meaningless unless `fan_mode` is `manual`.
+    #[zbus(property)]
+    fn fan_duty(&self) -> zbus::Result<u8>;
+
+    /// Pin the fan at `duty` (0-255), returning what the EC settled on. Not a curve:
+    /// there is no temperature feedback. May prompt via polkit.
+    fn set_fan_duty(&self, duty: u8) -> zbus::Result<u8>;
+
+    /// Hand the fan back to the EC. May prompt via polkit.
+    fn set_fan_auto(&self) -> zbus::Result<()>;
 }
 
 /// Highest interface version this client understands.
@@ -74,6 +89,14 @@ pub struct Snapshot {
     pub temps: Vec<Sensor>,
     /// `None` when charge control is unsupported on this machine.
     pub charge_limit: Option<u8>,
+    /// Who is driving the fan: `auto`, `manual`, or `unavailable`.
+    ///
+    /// A consumer that shows fan speed must show this too. Under manual control the
+    /// fan ignores the EC's curve entirely, and a user who cannot see that has no way
+    /// to tell deliberate control from a stuck fan (ADR 0006).
+    pub fan_mode: Option<String>,
+    /// Duty 0-255. Only meaningful when `fan_mode` is `manual`.
+    pub fan_duty: Option<u8>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -110,6 +133,8 @@ impl Snapshot {
             // The daemon reports 0 for "unsupported"; keep that distinction here
             // rather than leaking a sentinel value to consumers.
             charge_limit: d.charge_limit().ok().filter(|v| *v > 0),
+            fan_mode: d.fan_mode().ok(),
+            fan_duty: d.fan_duty().ok(),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

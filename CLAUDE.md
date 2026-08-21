@@ -74,9 +74,27 @@ released, and the EC was back to 0 rpm within 4 s. It also corrected two assumpt
 the two new fan rows in the traps table, and `docs/hardware-baseline.md` for the round-trip
 measurements.
 
-**Nothing drives the fan yet.** No control loop, no D-Bus method, no CLI verb. Next, in
-this order: restore on exit/signal/panic in the daemon, `ExecStopPost` wiring, then the
-watchdog — all of it before the curve becomes user-editable. ADR 0006 is not negotiable.
+The daemon side now holds and releases the lease. `FanLease` is **lock-free on purpose**
+— the panic hook calls into it, and a hook that blocks on a mutex held by the panicking
+thread leaves the process alive with the fan stuck. Releases are unconditional for the
+same reason: our own bookkeeping is what is least trustworthy after a crash.
+
+Verified on hardware 2026-08-21: `fw-helperctl fan 180` pinned 181/255 at 5093 rpm,
+`fan auto` gave it back, and **SIGTERM while holding it** put `pwm1_enable` back to `2`
+with `released manual fan control` in the log. The below-floor refusal fired without
+touching hardware.
+
+**Still not demonstrated:** the panic path (implemented, unit-tested, never triggered
+live) and `ExecStopPost` (wired into the unit and installer, but needs the unit installed
+plus a `kill -9` — that is the M3 exit gate).
+
+Next: the **watchdog** with an independent timer, then the firmware-floor clamp and the
+`temp*_crit` ceiling. Only then does a curve become user-editable. ADR 0006 is not
+negotiable.
+
+**`fw-helperctl fan` is not a curve.** It pins one duty with no temperature feedback.
+The flat 77/255 floor is a placeholder for the firmware-floor clamp — replace it with
+the real clamp, do not merely lower it.
 
 ## Layout
 
@@ -106,6 +124,7 @@ sudo ./scripts/install-dev.sh --uninstall
 sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 sudo pkill -x fw-helperd
 fw-helperctl status | watch [secs] | charge-limit N
+fw-helperctl fan 180 | fan auto            # manual duty 77-255; 'auto' returns it to the EC
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey
