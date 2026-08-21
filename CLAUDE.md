@@ -147,6 +147,20 @@ Two of M3's three exit criteria are met (`kill -9` recovery, suspend/resume). Th
 the curve holding a target temperature under `stress-ng` without audible hunting, which
 needs the curve to exist.
 
+**The floor now reads firmware rather than modelling it** (ADR 0011). `pwm1` reports the
+EC's own duty while `pwm1_enable=2`, so `FirmwareFloor` records what firmware actually did
+at each temperature; the composed RPM tables survive only as a cold start. Only the
+**ascending** branch is recorded, and an observation of duty 0 is an answer, not a gap —
+which is what makes a genuinely silent machine reachable.
+
+Verified on hardware: after watching firmware climb, `fw-helperctl fan 0` at **51.9 °C**
+was honoured, where the modelled floor had demanded duty 63.
+
+**ADR 0011 also reframes why the floor exists.** The CPU throttles at Tjmax (100 °C), so a
+constrained fan costs performance, not hardware — the floor was never the CPU's guardian.
+What has no protection of its own is the **battery, crit 49.9 °C**, and nothing watches it
+yet. That is the open work ADR 0011 names and does not do.
+
 Next: the **curve engine** — interpolated temp→duty points, hysteresis, ramp limiting. It
 is the only part left that a user would recognise as the feature, because everything
 underneath it is what makes exposing it defensible. Design it alongside M4's power
@@ -251,6 +265,10 @@ All of these cost real time once. Do not rediscover them.
 | Fan duty read-back ≠ what you wrote | The EC stores whole percent: write 180, read 181. Verify with `DUTY_TOLERANCE`, not equality. `pwm1` is also zeroed a few seconds *after* release, so it never tells you who owns the fan — read `pwm1_enable` |
 | `PrepareForSleep` does **not** wait for you | It is a notification, not a request for permission. Without a logind **delay inhibitor lock**, a pre-suspend write races the suspend. Also: `rtcwake -m mem` writes `/sys/power/state` directly and never emits the signal at all, so it cannot test any of this |
 | Handing the fan back to the EC **reduces** airflow | Firmware's curve tops out near 3100 rpm; manual reaches ~5200. Releasing is a last resort that defers to firmware's *whole* thermal protection, not a cooling escalation. Demand full duty first |
+| **The EC's fan curve is hysteretic** | At 61.9 °C firmware runs duty **0** heating and **92** cooling, and holds the fan on down to 44.9 °C. "Never quieter than firmware" is meaningless without naming a branch. Only the ascending branch says what a temperature needs (ADR 0011) |
+| Temperature direction needs **hysteresis of its own** | `peci-temp` is quantized to ~1 °C, so a cooldown reads as long runs of identical values. Deriving rising/falling from consecutive samples treats those as "steady" — count steady as rising and you record the whole descending branch. Carry the direction through plateaus |
+| The CPU **protects itself** at Tjmax | `coretemp` crit = 100 °C on every core. A constrained fan costs performance, not hardware. `peci-temp` crit reads 119.8 °C, *above* Tjmax, so it is not a usable limit. What has no protection is the **battery** (crit 49.9 °C) |
+| The machine reaches **92.8 °C** in normal use | Not 76.8 °C — that was one M0 PL1 test. Two thresholds were set from the lower figure and both sat below normal operation |
 | Fan duty→RPM is **concave** | A line through the high points (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty 77; the measured answer is ~85. Fitting a line would set the firmware floor *below* firmware. Interpolate the measured table |
 | Fan stiction is between duty 20 and 30 | Duty 20 = 0 rpm, duty 30 = 1107 rpm. A duty of 1–29 is a stopped fan, not a slow one. Refuse it; do not accept and ignore it |
 | **zbus does not run on the tokio runtime** | With default features zbus 5 uses its own `async-io` executor. Blocking every tokio worker leaves D-Bus answering normally with stale telemetry, so "the daemon is wedged" is not all-or-nothing. Never infer daemon health from the interface responding |

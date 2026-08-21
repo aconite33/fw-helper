@@ -1,6 +1,6 @@
 # 0006 — Fan control must fail safe, never fail silent
 
-- **Status:** Accepted
+- **Status:** Accepted — **point 4 amended by [0011](0011-quiet-is-a-legitimate-choice.md)**
 - **Date:** 2026-08-18
 
 ## Context

@@ -140,6 +140,36 @@ fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
     }
 }
 
+/// Is the machine heating? Carries the previous answer through unchanged readings.
+///
+/// Split out and pure so the plateau case can be tested: the die sensor is quantized
+/// to ~1 C, so a slow cooldown produces long runs of identical readings. Deriving
+/// direction from each pair alone treats those as "steady", and steady was counted as
+/// rising, so most of the descending branch got recorded. That is exactly what the
+/// ascending-only rule exists to exclude. Hardware caught it; the unit tests were happy.
+fn next_direction(celsius: Option<f64>, previous: Option<f64>, was_rising: bool) -> bool {
+    match (celsius, previous) {
+        (Some(now), Some(before)) if now > before => true,
+        (Some(now), Some(before)) if now < before => false,
+        // Unchanged reading: keep going the way we were. A plateau while heating is
+        // sustained load, and the most valuable observation available - it is firmware
+        // stating what this temperature actually needs.
+        (Some(_), Some(_)) => was_rising,
+        // No history: assume rising so a cold start learns something.
+        (Some(_), None) => true,
+        _ => was_rising,
+    }
+}
+
+/// What `govern_fan` has to remember between ticks.
+#[derive(Default)]
+struct Govern {
+    celsius: Option<f64>,
+    duty: Option<u8>,
+    /// Which way the temperature was last seen moving. Persists through plateaus.
+    rising: bool,
+}
+
 /// One tick of fan governance: learn what firmware does, and hold ourselves to it.
 ///
 /// Two halves, and which one runs depends on who owns the fan:
@@ -150,13 +180,52 @@ fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
 /// - **We own it:** re-enforce the floor. This is the half that matters. Clamping only
 ///   when a duty is requested protects nothing — a duty chosen at idle is safe when it
 ///   is chosen and becomes stuck-low as soon as the machine is loaded.
-fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
+fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: &mut Govern) {
+    let previous_duty = state.duty;
     let celsius = sample.control_temp().map(|t| t.celsius);
     let ceiling = fan::ceiling_for(sample.control_temp().and_then(|t| t.critical));
 
+    // Rising or steady. Firmware's descending branch is hysteresis rather than a
+    // requirement - measured, it runs duty 0 at 61.9 C climbing and duty 92 at the
+    // same temperature falling - so only the ascending branch says anything about what
+    // a temperature actually needs.
+    let previous = state.celsius;
+    // Direction has to PERSIST across plateaus rather than be re-derived from each
+    // pair of samples. The sensor is quantized to ~1 C, so a slow cooldown produces
+    // long runs of identical readings; an earlier version treated "steady" as rising
+    // and therefore recorded most of the descending branch, which is precisely what
+    // the ascending-only rule exists to exclude. Measured on hardware: it learned
+    // duty 61 at 52.9 C while cooling, where firmware climbing is silent.
+    //
+    // Steady still counts as rising once we are rising, because a plateau under
+    // sustained load is the single most valuable observation there is: it is firmware
+    // stating what this temperature actually needs.
+    state.rising = next_direction(celsius, previous, state.rising);
+    let rising = celsius.is_some() && state.rising;
+    state.celsius = celsius;
+
     if !lease.held() {
-        if let (Some(c), Some(rpm)) = (celsius, sample.fan_rpm) {
-            lease.observe(c, rpm);
+        // pwm1 reports firmware's OWN duty while the EC owns the fan, so this reads
+        // the real curve rather than inferring it from RPM through two tables.
+        if let (Some(c), Some(duty)) = (celsius, lease.duty()) {
+            // Credit the whole span since the last sample, not just this point: the die
+            // sensor climbs ~4 C/s under load, so consecutive 1 Hz samples skip whole
+            // buckets and endpoint-only recording learns almost nothing per event.
+            //
+            // Only when firmware's duty was the SAME at both ends, though. If it
+            // changed, we do not know where in the interval it changed, and crediting
+            // the new duty to the whole span would attribute a spun-up fan to every
+            // cooler bucket the ramp passed through - erring loud, but erasing the
+            // record that firmware runs the fan off down there, which is the finding
+            // this whole mechanism exists to capture.
+            let from = match (previous, previous_duty) {
+                (Some(p), Some(pd)) if pd == duty => p,
+                _ => c,
+            };
+            lease.observe(from, c, duty, rising);
+            state.duty = Some(duty);
+        } else {
+            state.duty = None;
         }
         return;
     }
@@ -308,6 +377,7 @@ async fn poll_loop(
 
     let started = std::time::Instant::now();
     let mut restore_fan_after_resume = false;
+    let mut govern = Govern::default();
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
@@ -341,7 +411,7 @@ async fn poll_loop(
         if std::mem::take(&mut restore_fan_after_resume) {
             restore_fan(&lease, &sample);
         }
-        govern_fan(&lease, &sample);
+        govern_fan(&lease, &sample, &mut govern);
 
         let mut guard = iface_ref.get_mut().await;
         if guard.update(sample) {
@@ -349,5 +419,54 @@ async fn poll_loop(
             let _ = guard.telemetry_changed(emitter).await;
             let _ = guard.critical_temperatures_changed(emitter).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_direction;
+
+    #[test]
+    fn a_plateau_keeps_the_direction_it_arrived_with() {
+        // The bug hardware caught. Cooling from 60 C, the sensor reports
+        // 53.9, 53.9, 53.9 ... and each identical pair looks "steady". Treating that
+        // as rising recorded firmware's descending duty - measured, duty 61 at 52.9 C,
+        // where firmware climbing through the same temperature is silent.
+        let mut rising = true;
+        for t in [60.0, 58.0, 56.0] {
+            rising = next_direction(Some(t), Some(t + 2.0), rising);
+        }
+        assert!(!rising, "should be falling after a descent");
+
+        for _ in 0..10 {
+            rising = next_direction(Some(53.9), Some(53.9), rising);
+            assert!(
+                !rising,
+                "a plateau during a cooldown must not read as heating"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plateau_under_sustained_load_still_counts_as_heating() {
+        // The other half: holding at temperature under load is firmware telling us
+        // what that temperature needs, and must be recorded.
+        let mut rising = next_direction(Some(70.0), Some(65.0), false);
+        assert!(rising);
+        for _ in 0..10 {
+            rising = next_direction(Some(70.0), Some(70.0), rising);
+            assert!(rising, "a plateau while heating is sustained load");
+        }
+    }
+
+    #[test]
+    fn direction_flips_on_a_real_change() {
+        assert!(next_direction(Some(50.0), Some(49.0), false));
+        assert!(!next_direction(Some(49.0), Some(50.0), true));
+    }
+
+    #[test]
+    fn a_cold_start_assumes_heating() {
+        assert!(next_direction(Some(40.0), None, false));
     }
 }

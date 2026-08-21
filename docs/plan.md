@@ -288,6 +288,19 @@ The highest-value and highest-risk feature. Do not shortcut
         inside a tolerance meant for verifying writes. Decisions are now compared
         exactly, and drift against hardware separately. Unit tests did not catch this;
         comparing against measured firmware behaviour did
+  - [x] **The floor reads firmware instead of modelling it** (2026-08-21,
+        [ADR 0011](adr/0011-quiet-is-a-legitimate-choice.md)). `pwm1` reports the EC's own
+        duty while it owns the fan, confirmed across 60 samples matching the duty→RPM
+        table to within 2.5%. Only the ascending branch is recorded — firmware's
+        descending duty is hysteresis (0 vs 92 at the same 61.9 °C), not a requirement.
+        Observations are credited across the whole span since the last sample, because the
+        die sensor climbs ~4 °C/s and 1 Hz sampling otherwise skips most buckets, and only
+        when firmware's duty was unchanged at both ends. Thresholds retuned against a
+        measured 92.8 °C peak rather than M0's unrepresentative 76.8 °C.
+        **Verified**: `fan 0` honoured at 51.9 °C, where the modelled floor demanded 63.
+        Hardware caught three defects that unit tests passed: the quantized read-back, a
+        floor deficit hiding inside `DUTY_TOLERANCE`, and direction derived per-sample
+        reading a quantized cooldown as "steady" and recording the descending branch
   - [x] **`temp*_crit`-derived ceiling override, with sanity validation**
         (`fw-helper-core/src/ceiling.rs`, 2026-08-21). Derived from the control
         sensor's critical point minus a 15 °C margin — intervening *at* crit would be

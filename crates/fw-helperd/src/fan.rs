@@ -159,12 +159,15 @@ impl FanLease {
         }
     }
 
-    /// Record what the EC does at a temperature. Call only while the EC owns the fan:
-    /// under manual control the RPM is ours, and feeding it back would ratchet the
-    /// floor up to whatever we last chose.
-    pub fn observe(&self, celsius: f64, rpm: u64) {
+    /// Record the duty firmware chose at this temperature.
+    ///
+    /// Call only while the EC owns the fan: under manual control `pwm1` is our own
+    /// duty, and feeding it back would ratchet the floor up to whatever we last chose.
+    /// `rising` must be false when the machine is cooling — firmware's descending
+    /// branch is hysteresis, not a requirement.
+    pub fn observe(&self, from_celsius: f64, to_celsius: f64, ec_duty: u8, rising: bool) {
         if let Ok(mut floor) = self.floor.lock() {
-            floor.observe(celsius, rpm);
+            floor.observe_span(from_celsius, to_celsius, ec_duty, rising);
         }
     }
 
@@ -589,15 +592,37 @@ mod tests {
     }
 
     #[test]
-    fn observation_raises_the_floor_the_daemon_enforces() {
-        // The static table has a large gap across the EC's knee. Watching firmware is
-        // what closes it.
+    fn watching_firmware_changes_the_floor_the_daemon_enforces() {
         let root = fixture("observe");
         let l = lease(&root);
         let before = l.floor_duty(48.0);
 
-        l.observe(48.0, 2500);
+        l.observe(48.0, 48.0, 120, true);
         assert!(l.floor_duty(48.0) > before);
+    }
+
+    #[test]
+    fn observing_firmware_idle_permits_a_silent_fan_where_the_model_would_not() {
+        // Measured: firmware runs the fan off at 60 C while heating, but the model -
+        // built from descending-branch data - demands airflow there. Watching
+        // firmware is what unlocks the quiet.
+        let root = fixture("observe-quiet");
+        let l = lease(&root);
+        assert!(l.floor_duty(60.0) > 0);
+
+        l.observe(60.0, 60.0, 0, true);
+        assert_eq!(l.floor_duty(60.0), 0);
+        let applied = l.set_duty(0, Some(60.0), real_ceiling()).unwrap();
+        assert!(!applied.clamped(), "{applied:?}");
+    }
+
+    #[test]
+    fn cooling_observations_never_reach_the_floor() {
+        let root = fixture("observe-cool");
+        let l = lease(&root);
+        let before = l.floor_duty(61.9);
+        l.observe(61.9, 61.9, 92, false);
+        assert_eq!(l.floor_duty(61.9), before);
     }
 
     #[test]

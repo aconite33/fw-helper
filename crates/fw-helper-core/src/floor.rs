@@ -5,14 +5,24 @@
 //! necessary" — an annoyance rather than a thermal event. This is what makes it
 //! defensible to expose curve editing at all.
 //!
-//! The EC's curve lives in firmware and cannot be read, so it is reconstructed from
-//! two measured tables (see `docs/hardware-baseline.md`):
+//! **Firmware's duty can be read directly.** While `pwm1_enable=2`, `pwm1` reports the
+//! duty the EC has chosen — confirmed 2026-08-21 across 60 samples, whose RPM matched
+//! the measured duty→RPM table to within 2.5% on average. So the floor is *observed*,
+//! not modelled: [`FirmwareFloor::observe`] records what firmware actually did at each
+//! temperature, and that is what the floor returns.
 //!
-//! 1. What the EC does at a given temperature, in RPM.
-//! 2. What a given duty produces, in RPM.
+//! The two measured tables below remain only as the **cold start**, for temperatures
+//! nothing has been seen at yet. Composing them (temperature→RPM, then RPM→duty) was
+//! the original mechanism and it carries the interpolation error of both; a direct
+//! observation always beats it and always wins.
 //!
-//! Composing them answers the only question that matters: *what duty must we hold to
-//! be at least as fast as firmware would be right now?*
+//! **Only observations taken while the temperature is rising or steady are recorded.**
+//! The EC has enormous hysteresis — measured, at 61.9 °C it runs duty 0 on the way up
+//! and duty 92 on the way down, and it does not stop the fan until below 44.9 °C. The
+//! descending branch is not firmware's answer to "what does this temperature need"; it
+//! is firmware avoiding oscillation while shedding heat. Recording it would ratchet the
+//! floor up to a duty firmware only uses on the way down, and would make a silent idle
+//! impossible for ten minutes after any load.
 //!
 //! Two honesty notes about the tables:
 //!
@@ -22,10 +32,11 @@
 //!   direction, so the table is used directly and interpolated only between measured
 //!   points.
 //! - The EC table has **four points and a large gap across the knee** (44.9 °C to
-//!   53.9 °C, over which it goes from silent to 2020 rpm). Linear interpolation across
-//!   that gap is a guess. [`FirmwareFloor::observe`] is what turns it into a
-//!   measurement: while the EC owns the fan, every sample raises the floor to what
-//!   firmware was actually seen doing. The static table is only the cold start.
+//!   53.9 °C, over which it goes from silent to 2020 rpm), and worse, those points come
+//!   from measurements taken under sustained load — the *descending* branch. Measured
+//!   later while heating, firmware runs the fan at 0 rpm at both 53.9 °C and 64.8 °C.
+//!   So the table is not just sparse, it describes the wrong branch. It survives only
+//!   as a cold start, and any observation supersedes it.
 
 /// Below this the fan does not turn at all: duty 20 measured 0 rpm, duty 30 measured
 /// 1107 rpm. A duty between 1 and 29 is not a slow fan, it is a stopped one, and
@@ -55,7 +66,15 @@ const FLOOR_MARGIN_DUTY: u8 = 2;
 /// matters because of a measured fact: the EC's curve tops out near 3100 rpm while
 /// full duty reaches ~5200, so releasing to firmware *reduces* airflow. Maximum
 /// cooling has to be tried first; releasing is the last resort, not the escalation.
-const FULL_DUTY_ABOVE_C: f64 = crate::ceiling::FALLBACK_CEILING_C - 5.0;
+///
+/// **Was 85 °C, which was wrong**, for the same reason the old fallback ceiling was: it
+/// was set from a belief that this machine tops out near 76.8 °C. Measured 92.8 °C
+/// under ordinary multi-core load with firmware driving, where firmware chose duty
+/// 94/255. An 85 °C threshold would have pinned the fan at 255 there — roughly 5200 rpm
+/// against firmware's 3321 — in a band the machine uses routinely. Being *louder* than
+/// firmware is safe, but it is not free, and "never quieter than the EC" was never a
+/// licence to be arbitrarily louder.
+const FULL_DUTY_ABOVE_C: f64 = 95.0;
 
 /// What the EC does, unloaded and loaded, as measured. Temperature ascending.
 const EC_CURVE: [(f64, u16); 5] = [
@@ -91,10 +110,16 @@ const BUCKETS: usize = 40; // 30 °C to 110 °C
 /// The EC's floor, as a duty, for the current temperature.
 #[derive(Debug, Clone)]
 pub struct FirmwareFloor {
-    /// Highest RPM the EC has been *seen* running at, per temperature bucket. Only
-    /// ever raised: a single quiet sample proves nothing, because the EC may simply
-    /// not have spun up yet, whereas a loud one is proof it will.
-    observed: [u16; BUCKETS],
+    /// Highest **duty** the EC has been seen running at, per temperature bucket, while
+    /// the temperature was rising or steady.
+    ///
+    /// Only ever raised within a bucket: a quiet sample proves nothing on its own,
+    /// because firmware may not have spun up yet, whereas a loud one is proof it will.
+    observed: [u8; BUCKETS],
+    /// Whether anything has been recorded for a bucket. Distinguishes "firmware ran
+    /// duty 0 here" — a real observation, and what firmware does below ~65 °C — from
+    /// "nothing seen yet", which must fall back to the model.
+    seen: [bool; BUCKETS],
 }
 
 impl Default for FirmwareFloor {
@@ -107,6 +132,7 @@ impl FirmwareFloor {
     pub fn new() -> Self {
         Self {
             observed: [0; BUCKETS],
+            seen: [false; BUCKETS],
         }
     }
 
@@ -118,27 +144,73 @@ impl FirmwareFloor {
         (idx < BUCKETS).then_some(idx)
     }
 
-    /// Record what firmware was seen doing. Call only while the EC owns the fan —
-    /// under manual control the RPM is ours, and feeding it back would ratchet the
-    /// floor up to whatever we last chose.
-    pub fn observe(&mut self, celsius: f64, rpm: u64) {
-        let Some(i) = Self::bucket(celsius) else {
+    /// Record the duty firmware chose at this temperature.
+    ///
+    /// Call **only while the EC owns the fan** (`pwm1_enable=2`): under manual control
+    /// `pwm1` is our own duty, and feeding it back would ratchet the floor up to
+    /// whatever we last chose, forever.
+    ///
+    /// `rising` must be false when the machine is cooling — see the module note.
+    pub fn observe(&mut self, celsius: f64, ec_duty: u8, rising: bool) {
+        self.observe_span(celsius, celsius, ec_duty, rising);
+    }
+
+    /// Record firmware's duty across the whole temperature span covered since the last
+    /// sample, not just the endpoint.
+    ///
+    /// Sampling at 1 Hz against a die sensor that climbs **4 °C per second** under load
+    /// — measured: 42.9 → 64.8 °C in five seconds — means consecutive samples routinely
+    /// skip whole buckets, and a floor that only ever learns the buckets it happened to
+    /// land in fills in glacially. Firmware held `ec_duty` throughout the interval, so
+    /// attributing it to the interval is a record of what happened rather than an
+    /// interpolation of it.
+    ///
+    /// Conservative in the one direction that matters: if firmware raised its duty
+    /// during the span, the endpoint value is the higher one, so the cooler buckets are
+    /// credited with *more* airflow than firmware may have been giving them, which
+    /// errs loud.
+    pub fn observe_span(&mut self, from_celsius: f64, to_celsius: f64, ec_duty: u8, rising: bool) {
+        if !rising {
+            return;
+        }
+        let (lo, hi) = if from_celsius <= to_celsius {
+            (from_celsius, to_celsius)
+        } else {
+            (to_celsius, from_celsius)
+        };
+        let (Some(a), Some(b)) = (Self::bucket(lo), Self::bucket(hi)) else {
+            // One end outside the tracked range: still record the end that is inside.
+            for c in [lo, hi] {
+                if let Some(i) = Self::bucket(c) {
+                    self.record(i, ec_duty);
+                }
+            }
             return;
         };
-        let rpm = rpm.min(u64::from(u16::MAX)) as u16;
-        if rpm > self.observed[i] {
-            self.observed[i] = rpm;
+        for i in a..=b {
+            self.record(i, ec_duty);
         }
     }
 
-    /// The RPM the EC would be running at this temperature, as best we know.
-    pub fn floor_rpm(&self, celsius: f64) -> u16 {
-        let modelled = interpolate_rpm(celsius);
-        // A bucket only raises the floor. It never lowers it below the modelled
-        // value, because "we have not seen the EC do more" is not evidence that it
-        // would not.
-        let seen = Self::bucket(celsius).map(|i| self.observed[i]).unwrap_or(0);
-        modelled.max(seen)
+    fn record(&mut self, i: usize, ec_duty: u8) {
+        if !self.seen[i] || ec_duty > self.observed[i] {
+            self.observed[i] = ec_duty;
+            self.seen[i] = true;
+        }
+    }
+
+    /// What firmware has been observed doing here, if anything.
+    pub fn observed_duty(&self, celsius: f64) -> Option<u8> {
+        let i = Self::bucket(celsius)?;
+        self.seen[i].then(|| self.observed[i])
+    }
+
+    /// The RPM the model predicts firmware would run at this temperature.
+    ///
+    /// Cold start only. [`Self::floor_duty`] prefers a direct observation whenever one
+    /// exists, because measuring firmware beats interpolating two tables about it.
+    pub fn modelled_rpm(&self, celsius: f64) -> u16 {
+        interpolate_rpm(celsius)
     }
 
     /// The lowest duty we may hold at this temperature.
@@ -147,7 +219,20 @@ impl FirmwareFloor {
     /// the EC, and the EC runs the fan at 0 rpm below ~45 °C. A silent idle is
     /// therefore allowed, which is most of why anyone wants this feature.
     pub fn floor_duty(&self, celsius: f64) -> u8 {
-        let rpm = self.floor_rpm(celsius);
+        // Catch an unreadable temperature before the bucket lookup silently drops it.
+        if !celsius.is_finite() {
+            return u8::MAX;
+        }
+        // A direct observation of firmware wins outright, including an observation of
+        // duty 0. Firmware running the fan off at 60 °C while heating is not a gap in
+        // our knowledge — it is the answer.
+        if let Some(duty) = self.observed_duty(celsius) {
+            if duty == 0 {
+                return 0;
+            }
+            return duty.saturating_add(FLOOR_MARGIN_DUTY).max(STICTION_DUTY);
+        }
+        let rpm = self.modelled_rpm(celsius);
         if rpm == 0 {
             return 0;
         }
@@ -343,19 +428,80 @@ mod tests {
     }
 
     #[test]
-    fn observation_raises_the_floor_but_never_lowers_it() {
+    fn a_direct_observation_beats_the_model() {
         let mut f = FirmwareFloor::new();
         let modelled = f.floor_duty(48.0);
 
-        // The knee is the big gap in the static table. Seeing the EC at 2500 rpm at
-        // 48 C is proof it does that, whatever the model interpolated.
-        f.observe(48.0, 2500);
-        let learned = f.floor_duty(48.0);
-        assert!(learned > modelled, "{learned} should exceed {modelled}");
+        // Firmware seen running duty 90 at 48 C is proof it does that, whatever the
+        // model interpolated from two tables.
+        f.observe(48.0, 90, true);
+        assert!(f.floor_duty(48.0) > modelled);
+        assert_eq!(f.observed_duty(48.0), Some(90));
+    }
 
-        // A later quiet sample proves nothing: the EC may simply not have spun up.
-        f.observe(48.0, 0);
+    #[test]
+    fn within_a_bucket_a_quiet_sample_does_not_undo_a_loud_one() {
+        // Firmware may simply not have spun up yet, so quiet is weak evidence while
+        // loud is proof.
+        let mut f = FirmwareFloor::new();
+        f.observe(48.0, 90, true);
+        let learned = f.floor_duty(48.0);
+        f.observe(48.0, 0, true);
         assert_eq!(f.floor_duty(48.0), learned);
+    }
+
+    #[test]
+    fn firmware_running_the_fan_off_is_an_answer_not_a_gap() {
+        // The heart of the redesign. Measured while heating, firmware runs duty 0 at
+        // 60 C. The model, built from descending-branch measurements, demands ~70
+        // there. Observation must win, or the quiet this feature exists for is
+        // unreachable.
+        let mut f = FirmwareFloor::new();
+        assert!(
+            f.floor_duty(60.0) > 0,
+            "model should demand airflow at 60 C"
+        );
+
+        f.observe(60.0, 0, true);
+        assert_eq!(f.floor_duty(60.0), 0, "observed silence must be honoured");
+    }
+
+    #[test]
+    fn a_fast_ramp_fills_every_bucket_it_crossed() {
+        // The machine climbs ~4 C/s under load, so 1 Hz sampling skips buckets. What
+        // firmware was doing across the whole jump is known, and recording only the
+        // endpoint would leave the floor learning almost nothing per heating event.
+        let mut f = FirmwareFloor::new();
+        f.observe_span(42.9, 64.8, 0, true);
+
+        for c in [44.0, 48.0, 52.0, 56.0, 60.0, 64.0] {
+            assert_eq!(f.observed_duty(c), Some(0), "bucket at {c} C not filled");
+            assert_eq!(f.floor_duty(c), 0, "floor at {c} C should permit silence");
+        }
+        // Outside the span is untouched.
+        assert_eq!(f.observed_duty(70.0), None);
+    }
+
+    #[test]
+    fn a_span_never_lowers_a_louder_observation() {
+        let mut f = FirmwareFloor::new();
+        f.observe(50.0, 120, true);
+        f.observe_span(42.0, 60.0, 0, true);
+        assert_eq!(f.observed_duty(50.0), Some(120), "quiet must not undo loud");
+        assert_eq!(f.observed_duty(58.0), Some(0));
+    }
+
+    #[test]
+    fn cooling_observations_are_discarded() {
+        // At 61.9 C firmware runs duty 0 heating and 92 cooling. Recording the
+        // descending branch would ratchet the floor to a duty firmware only uses while
+        // shedding heat, and would cost a silent idle for ten minutes after any load.
+        let mut f = FirmwareFloor::new();
+        f.observe(61.9, 92, false);
+        assert_eq!(f.observed_duty(61.9), None, "cooling must not be recorded");
+
+        f.observe(61.9, 0, true);
+        assert_eq!(f.floor_duty(61.9), 0);
     }
 
     #[test]
@@ -392,9 +538,16 @@ mod tests {
     #[test]
     fn observations_outside_the_bucket_range_are_ignored_not_panicking() {
         let mut f = FirmwareFloor::new();
-        f.observe(-40.0, 5000);
-        f.observe(500.0, 5000);
-        f.observe(f64::NAN, 5000);
+        f.observe(-40.0, 200, true);
+        f.observe(500.0, 200, true);
+        f.observe(f64::NAN, 200, true);
         assert_eq!(f.floor_duty(40.0), 0);
+    }
+
+    #[test]
+    fn the_ceiling_no_longer_fires_where_the_machine_actually_operates() {
+        // 92.8 C measured under ordinary multi-core load. Full duty must not be
+        // demanded there: firmware itself chose 94/255.
+        const { assert!(FULL_DUTY_ABOVE_C > 92.8) };
     }
 }

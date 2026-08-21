@@ -23,21 +23,34 @@
 /// critical. This buys the EC time to react to a fan it has just been handed.
 pub const CEILING_MARGIN_C: f64 = 15.0;
 
+/// The CPU's own throttle point, measured from `coretemp`'s `temp*_crit`: **100 °C**
+/// on every core and on the package.
+///
+/// This is the number that matters, and it is not the one `peci-temp` reports.
+/// `peci-temp` gives crit as 119.85 °C — *above* Tjmax — so deriving a ceiling from it
+/// alone describes a limit the CPU never reaches. Past Tjmax the CPU throttles itself;
+/// it does not need us.
+pub const TJMAX_C: f64 = 100.0;
+
 /// Hard cap on the derived ceiling, however high the sensor's critical point is.
 ///
-/// `peci-temp` reports crit at 119.85 °C on the reference board, which would put the
-/// ceiling near 105 °C. That is a defensible number for the *sensor*, but this is a
-/// laptop that runs at 76.8 °C under full load with the stock curve — anything above
-/// about 100 °C means something has already gone badly wrong, and there is no reason
-/// to let a user's configuration keep control that far out.
-pub const MAX_CEILING_C: f64 = 100.0;
+/// Tjmax, because there is nothing useful above it: the CPU is already throttling, and
+/// releasing the fan to firmware at that point protects nothing that is not already
+/// protected.
+pub const MAX_CEILING_C: f64 = TJMAX_C;
 
 /// Used when no sensor offers a usable critical point.
 ///
-/// Deliberately below [`MAX_CEILING_C`]: not knowing the limit is a reason to be more
-/// cautious, not less. Still well above the 76.8 °C measured under sustained full
-/// load, so it does not fire in normal operation.
-pub const FALLBACK_CEILING_C: f64 = 90.0;
+/// **Was 90 °C, which was wrong.** That number came from a comment claiming this
+/// machine "runs at 76.8 °C under sustained full load" — a figure from the M0 PL1 test
+/// that turns out not to be the hottest it gets. Measured 2026-08-21 under ordinary
+/// multi-core load with firmware driving the fan, `peci-temp` reached **92.8 °C**. A
+/// 90 °C fallback therefore sat *below* normal operation and would have fired during
+/// an ordinary long compile, taking manual fan control away repeatedly for no reason.
+///
+/// 97 °C keeps it below [`MAX_CEILING_C`] — not knowing the limit is still a reason to
+/// be more cautious — while staying clear of temperatures the machine genuinely uses.
+pub const FALLBACK_CEILING_C: f64 = 97.0;
 
 /// Plausible range for a critical threshold, in Celsius.
 const PLAUSIBLE: std::ops::RangeInclusive<f64> = 0.0..=150.0;
@@ -157,12 +170,27 @@ mod tests {
 
     #[test]
     fn does_not_fire_at_temperatures_this_machine_actually_reaches() {
-        // 76.8 C is the measured steady state under sustained full load with the
-        // stock curve. If the ceiling ever trips there, manual control becomes
-        // useless exactly when it is wanted.
-        let c = Ceiling::from_crit(Some(119.85));
-        assert!(!c.exceeded_by(76.8));
-        assert!(!c.exceeded_by(85.0));
+        // 92.8 C was measured under ordinary multi-core load with firmware driving the
+        // fan. An earlier version of this test asserted only up to 85 C, on the belief
+        // that full load meant 76.8 C, and the fallback ceiling was set to 90 C on the
+        // same belief. Both were wrong. If the ceiling trips at temperatures the
+        // machine reaches in normal use, manual control becomes useless exactly when
+        // it is wanted.
+        for ceiling in [Ceiling::from_crit(Some(119.85)), Ceiling::from_crit(None)] {
+            assert!(!ceiling.exceeded_by(76.8), "{ceiling}");
+            assert!(
+                !ceiling.exceeded_by(92.8),
+                "{ceiling} fires in normal operation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cap_is_the_cpus_own_throttle_point() {
+        // Above Tjmax the CPU throttles itself. There is nothing for us to add, so
+        // there is no reason for a ceiling above it.
+        assert_eq!(MAX_CEILING_C, TJMAX_C);
+        assert!(Ceiling::from_crit(Some(119.85)).exceeded_by(TJMAX_C));
     }
 
     #[test]

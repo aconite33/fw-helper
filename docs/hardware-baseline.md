@@ -83,6 +83,55 @@ these were assumptions before this run, and two of them were wrong.
 - **The EC reclaims cleanly and promptly**, confirming Q4 on a second occasion: fan went
   to 0 rpm within 4 s of release, at 41 °C.
 
+#### The EC's own curve: measured, and hysteretic
+
+Read directly from `pwm1` while `pwm1_enable=2` (see above). Measured 2026-08-21.
+
+| Temp | EC duty, **heating** | EC duty, **cooling** |
+|---|---|---|
+| 44.9 °C | — | 51 |
+| 48.9 °C | — | 66 |
+| 54.9 °C | **0** | **82** |
+| 58.9 °C | **0** | **87** |
+| 61.9 °C | **0** | **92** |
+| 64.8 °C | **0** | — |
+| 66.8 °C | 59 | — |
+
+**The hysteresis is enormous.** At 61.9 °C firmware runs the fan off or at duty 92
+depending only on which way the temperature is going, and it does not stop the fan until
+below 44.9 °C. Climbing from cold it kept the fan entirely off past 64.8 °C.
+
+The fan-start point is **not a fixed temperature**: 66.8 °C on a 16-core step, 72.8 °C on
+a gentler 2-core climb. Note the direction — the *slower* ramp started *later*, which is
+the opposite of what response lag predicts, so firmware is likely triggering on something
+other than instantaneous `peci-temp`.
+
+Consequences, both acted on in [ADR 0011](adr/0011-quiet-is-a-legitimate-choice.md):
+
+- The `EC_CURVE` points recorded earlier in this document (2020 rpm at 53.9 °C, 2925 at
+  64.8 °C) are **descending-branch** measurements, taken under sustained load. They are
+  not what firmware does at those temperatures while heating, which is nothing at all.
+- "Never quieter than firmware" needs a branch named, or it means nothing.
+
+#### Thermal limits, and what protects what
+
+| Sensor | crit | Self-protecting? |
+|---|---|---|
+| `coretemp` package + every core | **100.0 °C** (Tjmax) | **Yes** — the CPU throttles |
+| `peci-temp` | 119.8 °C | Reports *above* Tjmax; not a usable limit |
+| `local_f75397@4c`, `cpu_f75303@4d` | 87.8 °C | No |
+| `ddr_f75303@4d` | 86.8 °C | No |
+| `battery_temp@b` | **49.9 °C** | **No** — and it is the lowest on the board |
+
+**The CPU protects itself at 100 °C.** Constraining the fan costs performance, not
+hardware. The components with no protection of their own are the battery above all, then
+the board and DDR sensors — nothing currently watches any of them.
+
+**Peak temperature in ordinary use is higher than M0 suggested.** M0's PL1 test recorded
+76.8 °C under sustained full load. Measured under ordinary multi-core load with firmware
+driving the fan, `peci-temp` reached **92.8 °C**, firmware choosing duty 94/255. Any
+threshold set from the 76.8 °C figure is set below normal operation.
+
 #### Duty → RPM, measured
 
 Full sweep 2026-08-21 at ~39 °C, descending from 180 so the fan never had to start
