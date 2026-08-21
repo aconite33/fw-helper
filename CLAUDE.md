@@ -19,7 +19,8 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M1a — hardware layer | complete, verified on hardware |
 | M1b — daemon + D-Bus | complete, verified unprivileged against a root daemon |
 | M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
-| M3–M5, M7 | planned; every mechanism pre-verified |
+| M3 — fan control | in progress: lease mechanism + restore binary land and are hardware-verified; daemon side not started |
+| M4–M5, M7 | planned; every mechanism pre-verified |
 | M6 — GUI | read-only telemetry view landed early; controls pending M2–M5 |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
@@ -64,8 +65,18 @@ by hand. `data/` carries the unit; `install-dev.sh` does not install it yet.
 sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 ```
 
-Next: **M3 — fan control.** Read its section in `docs/plan.md` first, and ADR 0006 before
-touching `pwm1_enable`; the hard rule below is not negotiable.
+### M3 — in progress
+
+Two of ADR 0006's safety layers are built and hardware-verified: the lease itself
+(`fw-helper-core/src/fan.rs`) and `fw-helper-restore-fan`, the crash-path binary. A root
+run on 2026-08-21 took control at 180/255 (fan 0 → 5041 rpm), ramped to 120/255 (3795 rpm),
+released, and the EC was back to 0 rpm within 4 s. It also corrected two assumptions — see
+the two new fan rows in the traps table, and `docs/hardware-baseline.md` for the round-trip
+measurements.
+
+**Nothing drives the fan yet.** No control loop, no D-Bus method, no CLI verb. Next, in
+this order: restore on exit/signal/panic in the daemon, `ExecStopPost` wiring, then the
+watchdog — all of it before the curve becomes user-editable. ADR 0006 is not negotiable.
 
 ## Layout
 
@@ -150,6 +161,8 @@ All of these cost real time once. Do not rediscover them.
 | Charge control absent by default | Driver refuses to bind on Framework by design. Needs `probe_with_fwk_charge_control=1` (ADR 0008) |
 | Undervolting | **Impossible.** Plundervolt mitigation locks the MSR. Do not add a disabled control (ADR 0007) |
 | **polkit `AllowUserInteraction` hangs forever** | When no authentication agent can service the caller — any process without `XDG_SESSION_ID`. Check without interaction first, then bound the interactive call |
+| `pwm1` write while `pwm1_enable=2` | **`EOPNOTSUPP`**, not silently ignored. The duty cannot be pre-loaded before taking control, so the takeover window is real — keep the mode switch and first duty write adjacent |
+| Fan duty read-back ≠ what you wrote | The EC stores whole percent: write 180, read 181. Verify with `DUTY_TOLERANCE`, not equality. `pwm1` is also zeroed a few seconds *after* release, so it never tells you who owns the fan — read `pwm1_enable` |
 | **Stale binary on PATH** | Bit us twice, both times looking like a broken daemon. `install-dev.sh` now installs a shim resolving the newest build per invocation. Still: build release *and* debug |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |

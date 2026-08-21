@@ -6,8 +6,8 @@ members = [
     "crates/fw-helperctl",
     "crates/fw-helperd",
     "crates/fw-helper-gui",
+    "crates/fw-helper-restore-fan",
 ]
-# fw-helper-restore-fan joins at M3.
 
 [workspace.package]
 version = "0.0.1"

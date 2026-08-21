@@ -214,9 +214,25 @@ The highest-value and highest-risk feature. Do not shortcut
   band — which is exactly where a 15 W profile parks the machine. Fan and power profiles
   compose; design them together, not separately
 - Safety, in this order — **build these before the curve is user-editable**:
-  - restore `pwm1_enable=2` on exit, signal, and panic
-  - `ExecStopPost` restore binary for the crash path
-  - watchdog thread with independent timer
+  - [x] **the lease mechanism itself** (`fw-helper-core/src/fan.rs`, 2026-08-21).
+        `take_manual` / `set_duty` / `release`, every write verified by read-back, and
+        **any failure after the mode switch releases before returning** — an error raised
+        while still holding the fan at an unverified duty is the exact state ADR 0006
+        exists to prevent. `set_duty` refuses while the EC owns the fan rather than
+        issuing a write the firmware rejects. 14 tests, no hardware
+  - [x] **Verified on hardware as root** (2026-08-21): took control at 180/255, fan 0 →
+        5041 rpm, ramped to 120/255 → 3795 rpm, released, EC back to 0 rpm within 4 s.
+        Both refusal paths fired without touching hardware. The run corrected two
+        assumptions baked into the first draft, now recorded in the baseline:
+        **`pwm1` is refused with `EOPNOTSUPP` while the EC owns the fan** (so the takeover
+        window cannot be closed by pre-writing the duty, only kept short), and
+        **duty round-trips through whole percent** (write 180, read 181), so verification
+        needs a tolerance where M2's charge limit needed exact equality
+  - [x] **`fw-helper-restore-fan`** (2026-08-21) — its own crate, depending on nothing but
+        the dependency-free core: no async runtime, no D-Bus, 478 KB. Not yet wired to
+        `ExecStopPost`; there is still no installed unit
+  - [ ] restore `pwm1_enable=2` on exit, signal, and panic — the daemon side, not started
+  - [ ] watchdog thread with independent timer
   - firmware-floor clamp (never quieter than the EC would be)
   - `temp*_crit`-derived ceiling override, with sanity validation
   - refuse manual control if the sensor is unreadable

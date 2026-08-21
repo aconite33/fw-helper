@@ -4,7 +4,8 @@
 //! telemetry are exercised with no hardware, no root, and no network — so they run
 //! in CI. The fixture mirrors the real values captured in docs/hardware-baseline.md.
 
-use fw_helper_core::{Capabilities, Monitor, Sysfs};
+use fw_helper_core::fan::MIN_TAKEOVER_DUTY;
+use fw_helper_core::{Capabilities, FanControl, FanError, FanMode, Monitor, Sysfs};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -150,4 +151,100 @@ fn samples_telemetry_and_picks_the_control_sensor() {
 
     // First sample has no prior reference, so power is not yet derivable.
     assert_eq!(t.package_watts, None);
+}
+
+/// Read a fixture file back as a trimmed string — asserts on what actually reached
+/// "hardware", rather than on what the API claims it did.
+fn raw(f: &Fixture, rel: &str) -> String {
+    fs::read_to_string(f.root.join(rel))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+const EC: &str = "sys/class/hwmon/hwmon7";
+
+#[test]
+fn takes_manual_control_and_hands_it_back() {
+    let f = Fixture::framework_13("fan-lease");
+    let fs = f.sysfs();
+    let fan = FanControl::probe(&fs).expect("fixture has a cros_ec hwmon");
+
+    assert_eq!(fan.mode().unwrap(), FanMode::Auto);
+
+    fan.take_manual(200).unwrap();
+    assert_eq!(fan.mode().unwrap(), FanMode::Manual);
+    assert_eq!(fan.duty().unwrap(), 200);
+    // The mode switch and the duty both landed in sysfs, not just in our own state.
+    assert_eq!(raw(&f, &format!("{EC}/pwm1_enable")), "1");
+    assert_eq!(raw(&f, &format!("{EC}/pwm1")), "200");
+
+    fan.set_duty(120).unwrap();
+    assert_eq!(fan.duty().unwrap(), 120);
+
+    fan.release().unwrap();
+    assert_eq!(fan.mode().unwrap(), FanMode::Auto);
+    assert_eq!(raw(&f, &format!("{EC}/pwm1_enable")), "2");
+}
+
+#[test]
+fn duty_is_attempted_before_the_mode_switch() {
+    // Real hardware refuses this pre-write with EOPNOTSUPP (measured 2026-08-21), so
+    // on the reference machine it changes nothing and the takeover window stays open.
+    // The fixture is writable in either mode, so what this pins down is that we still
+    // *try* — the ordering is a genuine safety gain on any EC that permits it, and a
+    // later refactor must not quietly drop it.
+    let f = Fixture::framework_13("fan-order");
+    let fs = f.sysfs();
+    let fan = FanControl::new(&fs, EC);
+
+    assert_eq!(raw(&f, &format!("{EC}/pwm1")), "0");
+    fan.take_manual(180).unwrap();
+    assert_eq!(raw(&f, &format!("{EC}/pwm1")), "180");
+}
+
+#[test]
+fn refuses_to_set_duty_while_the_ec_owns_the_fan() {
+    let f = Fixture::framework_13("fan-auto");
+    let fs = f.sysfs();
+    let fan = FanControl::new(&fs, EC);
+
+    // Would be silently ignored by real hardware, so it must be an error here.
+    assert!(matches!(
+        fan.set_duty(200),
+        Err(FanError::NotUnderManualControl(FanMode::Auto))
+    ));
+    assert_eq!(
+        raw(&f, &format!("{EC}/pwm1")),
+        "0",
+        "nothing should be written"
+    );
+}
+
+#[test]
+fn release_is_idempotent() {
+    // Every exit path calls this, including ones that run after another already did.
+    let f = Fixture::framework_13("fan-idempotent");
+    let fs = f.sysfs();
+    let fan = FanControl::new(&fs, EC);
+
+    fan.release().unwrap();
+    fan.release().unwrap();
+    assert!(fan.release_best_effort());
+    assert_eq!(fan.mode().unwrap(), FanMode::Auto);
+}
+
+#[test]
+fn a_dangerous_takeover_duty_never_reaches_hardware() {
+    let f = Fixture::framework_13("fan-unsafe");
+    let fs = f.sysfs();
+    let fan = FanControl::new(&fs, EC);
+
+    assert!(matches!(
+        fan.take_manual(MIN_TAKEOVER_DUTY - 1),
+        Err(FanError::UnsafeTakeoverDuty(_))
+    ));
+    // The refusal must happen before any write: the fan is still the EC's.
+    assert_eq!(raw(&f, &format!("{EC}/pwm1_enable")), "2");
+    assert_eq!(raw(&f, &format!("{EC}/pwm1")), "0");
 }

@@ -1,0 +1,13 @@
+[package]
+name = "fw-helper-restore-fan"
+description = "Returns the fan to EC control; the crash path for ADR 0006"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Deliberately depends on nothing but the (itself dependency-free) hardware layer.
+# This binary runs when the daemon is broken, so its own failure modes must be
+# boring: no async runtime, no D-Bus, no config, no allocation it can avoid.
+[dependencies]
+fw-helper-core = { path = "../fw-helper-core" }

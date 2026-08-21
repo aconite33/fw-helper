@@ -26,6 +26,10 @@ Nuvoton `npcx9m3f`. Loaded modules:
 ### Fan + EC thermal — `hwmon11` (`cros_ec`)
 Standard hwmon interface, **no `ectool` required**:
 
+> **The index moved.** On 2026-08-21 the same node came up as `hwmon9`, not `hwmon11`.
+> This was the predicted instability, now observed rather than assumed — always resolve
+> `cros_ec` by its `name` file, never by index.
+
 | Attribute | Value at capture | Notes |
 |---|---|---|
 | `pwm1_enable` | `2` | 2 = EC automatic, 1 = manual |
@@ -42,6 +46,37 @@ EC temperature sensors:
 | `temp3` | `battery_temp@b` | 30.85 °C |
 | `temp4` | `ddr_f75303@4d` | 36.85 °C |
 | `temp5` | `peci-temp` | 43.85 °C — CPU package, primary curve input |
+
+#### How manual control actually behaves
+
+Measured 2026-08-21 driving `FanControl` (M3) as root, spinning up and releasing. Three of
+these were assumptions before this run, and two of them were wrong.
+
+- **`pwm1` is not writable while the EC owns the fan.** Writing it with `pwm1_enable=2`
+  fails with `EOPNOTSUPP` (errno 95) — it is not silently ignored, it is refused. So the
+  duty *cannot* be pre-loaded before taking control, and the window between
+  `pwm1_enable=1` and the first duty write cannot be closed from userspace. Keep that
+  window to adjacent statements.
+- **Duty round-trips through whole percent.** The EC stores a percentage, so an 8-bit
+  count comes back up to one count away. Verification must use a tolerance, not equality
+  — unlike the charge limit, where exact read-back is correct:
+
+  | Requested | 77 | 90 | 100 | 128 | 150 | 180 | 200 | 230 | 255 |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Observed | 77 | 89 | 99 | 128 | 150 | 181 | 199 | 230 | 255 |
+
+  Every point matches `round(round(d / 2.55) × 2.55)`. Max observed error ±1 count.
+- **The EC zeroes `pwm1` a few seconds *after* reclaiming.** Immediately after writing
+  `pwm1_enable=2` the duty still read `120`; four seconds later it read `0`. `pwm1` is
+  therefore not a reliable signal of who owns the fan — read `pwm1_enable` for that.
+- **The EC reclaims cleanly and promptly**, confirming Q4 on a second occasion: fan went
+  to 0 rpm within 4 s of release, at 41 °C.
+
+Duty→RPM scale points, useful for curve design (all under manual control):
+
+| Duty | 120/255 (47%) | 160/255 (63%) | 181/255 (71%) |
+|---|---|---|---|
+| RPM | 3795 | 4681 | 5041 |
 
 Also `hwmon1` (`acpi_fan`) exposes `fan1_input` / `fan1_target` / `power1_input` (read-only view).
 `hwmon10` is `coretemp` (per-core die temps).
