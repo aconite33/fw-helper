@@ -245,7 +245,24 @@ The highest-value and highest-risk feature. Do not shortcut
         `install-dev.sh --systemd` now installs `fw-helper-restore-fan` and refuses to
         install a unit without it. **Not yet demonstrated**: that needs the unit
         installed and a `kill -9`, which is the M3 exit gate
-  - [ ] watchdog thread with independent timer
+  - [x] **watchdog thread with independent timer** (`fw-helperd/src/watchdog.rs`,
+        2026-08-21). A real OS thread, not a `tokio` task — the failure being guarded
+        against includes the runtime not scheduling anything, and a task waiting on that
+        same runtime would be wedged alongside everything else, which is worse than no
+        watchdog because it looks like protection. The trip condition is read from
+        `pwm1_enable`, not from our own flag, so a failed release is retried on the next
+        tick rather than forgotten. The heartbeat is the telemetry poll loop, because
+        that is what proves the runtime is still turning.
+        **Verified on hardware** with fault injection (`FW_HELPERD_DEBUG_WEDGE_AFTER`,
+        which blocks every tokio worker): fan pinned at 181/255, heartbeat stopped, and
+        6.0 s later `WATCHDOG: fan returned to EC control` with the process still alive.
+  - [x] **Manual fan control is refused on a stale heartbeat.** Fell out of the test
+        rather than the design. `zbus` serves the interface from its **own executor, not
+        the tokio runtime**, so blocking all 32 tokio worker slots left D-Bus answering
+        normally. The poll loop can therefore be dead while `SetFanDuty` still runs, and
+        without a guard the fan would be handed to a daemon that is not minding it, taken
+        back by the watchdog 5 s later, and handed over again on the next call. Verified:
+        `refusing manual fan control: this daemon's telemetry loop has not run for 7s`
   - firmware-floor clamp (never quieter than the EC would be)
   - `temp*_crit`-derived ceiling override, with sanity validation
   - refuse manual control if the sensor is unreadable

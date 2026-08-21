@@ -7,13 +7,16 @@
 //! shutdown paths are not boilerplate: every route out of this process must return
 //! `pwm1_enable=2` (ADR 0006). Clean exit, `SIGTERM`, `SIGINT` and panic are covered
 //! below; `SIGKILL` and a hung process are not, and are covered by `ExecStopPost` and
-//! the watchdog respectively.
+//! the watchdog respectively. The watchdog's heartbeat is the telemetry poll loop, so
+//! the thing that proves this daemon is alive is the same thing that proves it is
+//! doing its job.
 
 mod fan;
 mod iface;
 mod logind;
 mod polkit;
 mod state;
+mod watchdog;
 mod wire;
 
 use fw_helper_core::{Capabilities, Monitor, Sysfs};
@@ -53,7 +56,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(limit) = state.charge_limit {
         eprintln!("persisted charge limit: {limit}%");
     }
-    let daemon = iface::Daemon::new(fs.clone(), caps, state, Arc::clone(&lease));
+    // Started before the bus name is claimed: from the moment a client can ask for
+    // manual fan control, the thing that takes it back must already be running.
+    let watchdog = watchdog::Watchdog::new(Arc::clone(&lease));
+    watchdog.spawn();
+
+    // Beat once before serving: the interface refuses fan control on a stale
+    // heartbeat, and at startup the poll loop has not ticked yet.
+    watchdog.beat();
+    let daemon = iface::Daemon::new(
+        fs.clone(),
+        caps,
+        state,
+        Arc::clone(&lease),
+        Arc::clone(&watchdog),
+    );
     daemon.reapply_charge_limit();
 
     // The session bus is a development affordance: claiming a name on the system bus
@@ -77,7 +94,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resumed = Arc::new(AtomicBool::new(false));
     logind::watch_resume(&conn, Arc::clone(&resumed)).await;
 
-    let poll = tokio::spawn(poll_loop(conn.clone(), Monitor::new(fs), resumed));
+    let poll = tokio::spawn(poll_loop(
+        conn.clone(),
+        Monitor::new(fs),
+        resumed,
+        Arc::clone(&watchdog),
+    ));
 
     // Shut down cleanly on either signal, and hand the fan back before doing anything
     // else — the poll task is irrelevant if the fan is stuck (ADR 0006).
@@ -86,9 +108,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => eprintln!("SIGINT, shutting down"),
         _ = sigterm.recv()          => eprintln!("SIGTERM, shutting down"),
     }
-    shut_down_fan(&lease);
+    shut_down_fan(&lease, &watchdog);
     poll.abort();
     Ok(())
+}
+
+/// Fault injection for the watchdog, off unless `FW_HELPERD_DEBUG_WEDGE_AFTER` is set
+/// to a number of seconds.
+///
+/// This exists because the watchdog's entire claim is about a failure that cannot be
+/// produced on demand: a daemon that is alive, holding the fan, and no longer doing
+/// any work. Unit tests with a 50 ms timeout show the logic is right; they cannot show
+/// that a real wedged runtime on real hardware ends with the fan back under EC
+/// control. Blocking a runtime worker thread forever reproduces exactly that, and
+/// `SIGSTOP` cannot substitute — it freezes the watchdog thread too, which is a
+/// failure nothing in this process could cover anyway.
+///
+/// Never set in production. The variable is read every tick rather than cached so the
+/// cost when unset is one `getenv`, and so it cannot be armed after start.
+fn maybe_wedge(started: &std::time::Instant) {
+    let Some(after) = std::env::var_os("FW_HELPERD_DEBUG_WEDGE_AFTER") else {
+        return;
+    };
+    let Some(secs) = after.to_str().and_then(|s| s.parse::<u64>().ok()) else {
+        return;
+    };
+    if started.elapsed() < Duration::from_secs(secs) {
+        return;
+    }
+    // Block *every* worker, not just this one. Blocking a single thread of a
+    // multi-threaded runtime leaves D-Bus answering normally, which is a much weaker
+    // fault than the one the watchdog claims to cover — measured on 2026-08-21, where
+    // the first version of this injection left the daemon perfectly responsive.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    eprintln!(
+        "DEBUG: wedging the runtime deliberately (FW_HELPERD_DEBUG_WEDGE_AFTER={secs}), \
+         blocking {} worker slots. The watchdog should take the fan back.",
+        workers * 2
+    );
+    for _ in 0..workers * 2 {
+        tokio::spawn(async {
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        });
+    }
+    // And this one last, so the queued blockers get picked up first.
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 /// Release manual fan control on the way out, saying which case it was.
@@ -96,7 +166,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Reads before writing for the same reason M2's charge re-apply does: "we were not
 /// holding it" and "we were, and gave it back" are different facts, and a log line
 /// that cannot tell them apart cannot show that the restore paths work.
-fn shut_down_fan(lease: &fan::FanLease) {
+fn shut_down_fan(lease: &fan::FanLease, watchdog: &watchdog::Watchdog) {
+    // A trip means this daemon stopped working while holding the fan. The machine was
+    // protected, but that is a bug and it should not vanish quietly at shutdown.
+    if watchdog.tripped() {
+        eprintln!("note: the fan watchdog intervened at least once during this run");
+    }
     let held = lease.held();
     if lease.release_now() {
         if held {
@@ -132,7 +207,12 @@ fn install_panic_hook(lease: Arc<fan::FanLease>) {
     }));
 }
 
-async fn poll_loop(conn: zbus::Connection, mut mon: Monitor, resumed: Arc<AtomicBool>) {
+async fn poll_loop(
+    conn: zbus::Connection,
+    mut mon: Monitor,
+    resumed: Arc<AtomicBool>,
+    watchdog: Arc<watchdog::Watchdog>,
+) {
     let iface_ref = match conn
         .object_server()
         .interface::<_, iface::Daemon>(OBJECT_PATH)
@@ -145,9 +225,17 @@ async fn poll_loop(conn: zbus::Connection, mut mon: Monitor, resumed: Arc<Atomic
         }
     };
 
+    let started = std::time::Instant::now();
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
+
+        // The heartbeat. Deliberately the first thing after the tick and before any
+        // work that could block: it must mean "the runtime is turning", not "the last
+        // iteration happened to finish".
+        watchdog.beat();
+
+        maybe_wedge(&started);
 
         // swap(false) so the resume is consumed exactly once.
         if resumed.swap(false, Ordering::SeqCst) {

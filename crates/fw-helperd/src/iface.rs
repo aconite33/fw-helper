@@ -5,6 +5,7 @@
 
 use crate::fan::FanLease;
 use crate::state::State;
+use crate::watchdog::Watchdog;
 use crate::{polkit, wire};
 use fw_helper_core::{Capabilities, ChargeControl, Sysfs, Telemetry};
 use std::collections::HashMap;
@@ -40,16 +41,26 @@ pub struct Daemon {
     /// Shared with `main`, which releases it on every shutdown path. Lock-free by
     /// design so the panic hook can use it (ADR 0006).
     fan: Arc<FanLease>,
+    /// Consulted before granting manual fan control, so the fan is never handed to a
+    /// daemon that has stopped minding it.
+    watchdog: Arc<Watchdog>,
 }
 
 impl Daemon {
-    pub fn new(fs: Sysfs, caps: Capabilities, state: State, fan: Arc<FanLease>) -> Self {
+    pub fn new(
+        fs: Sysfs,
+        caps: Capabilities,
+        state: State,
+        fan: Arc<FanLease>,
+        watchdog: Arc<Watchdog>,
+    ) -> Self {
         Self {
             fs,
             caps,
             latest: Telemetry::default(),
             state: Mutex::new(state),
             fan,
+            watchdog,
         }
     }
 
@@ -233,6 +244,23 @@ impl Daemon {
         if let fw_helper_core::Cap::No(reason) = &self.caps.fan_control {
             return Err(zbus::fdo::Error::NotSupported(reason.clone()));
         }
+        // Refuse if our own heartbeat is stale.
+        //
+        // This is not hypothetical: zbus serves this interface from its own executor,
+        // not from the tokio runtime (measured 2026-08-21 — blocking every tokio
+        // worker left D-Bus answering normally). So the poll loop can be dead while
+        // this method still runs, and without this check the fan would be handed to a
+        // daemon that is not minding it, taken back by the watchdog five seconds
+        // later, and handed over again on the next call.
+        let stale = self.watchdog.since_beat();
+        if stale > crate::watchdog::TIMEOUT {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "refusing manual fan control: this daemon's telemetry loop has not run \
+                 for {:.0}s, so nothing would be watching the fan. Restart fw-helperd",
+                stale.as_secs_f64()
+            )));
+        }
+
         let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
 
         let settled = self
@@ -300,7 +328,9 @@ mod tests {
             charge_limit: persisted,
         };
         let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));
-        Daemon::new(fs_, caps, state, lease)
+        let wd = crate::watchdog::Watchdog::new(Arc::clone(&lease));
+        wd.beat();
+        Daemon::new(fs_, caps, state, lease, wd)
     }
 
     fn write_attr(root: &Path, value: &str) {

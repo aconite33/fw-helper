@@ -88,9 +88,20 @@ touching hardware.
 live) and `ExecStopPost` (wired into the unit and installer, but needs the unit installed
 plus a `kill -9` — that is the M3 exit gate).
 
-Next: the **watchdog** with an independent timer, then the firmware-floor clamp and the
-`temp*_crit` ceiling. Only then does a curve become user-editable. ADR 0006 is not
-negotiable.
+**The watchdog is done and hardware-verified** (`fw-helperd/src/watchdog.rs`). A real OS
+thread, not a tokio task — the failure it guards against includes the runtime not
+scheduling anything. It reads `pwm1_enable` rather than trusting our own flag, so a failed
+release retries. Heartbeat is the telemetry poll loop. Test it with
+`FW_HELPERD_DEBUG_WEDGE_AFTER=<secs>`, which blocks every tokio worker; the fan came back
+6.0 s after the heartbeat stopped, with the process still alive.
+
+That test also produced the zbus row in the traps table, and with it a guard: manual fan
+control is **refused on a stale heartbeat**, because D-Bus survives a wedged runtime and
+would otherwise hand the fan to a daemon that is not minding it.
+
+Next: the **firmware-floor clamp** (ADR 0006 point 4) and the `temp*_crit` ceiling
+(point 5), which are what let `MIN_DUTY` go away. Only then does a curve become
+user-editable. ADR 0006 is not negotiable.
 
 **`fw-helperctl fan` is not a curve.** It pins one duty with no temperature feedback.
 The flat 77/255 floor is a placeholder for the firmware-floor clamp — replace it with
@@ -182,6 +193,7 @@ All of these cost real time once. Do not rediscover them.
 | **polkit `AllowUserInteraction` hangs forever** | When no authentication agent can service the caller — any process without `XDG_SESSION_ID`. Check without interaction first, then bound the interactive call |
 | `pwm1` write while `pwm1_enable=2` | **`EOPNOTSUPP`**, not silently ignored. The duty cannot be pre-loaded before taking control, so the takeover window is real — keep the mode switch and first duty write adjacent |
 | Fan duty read-back ≠ what you wrote | The EC stores whole percent: write 180, read 181. Verify with `DUTY_TOLERANCE`, not equality. `pwm1` is also zeroed a few seconds *after* release, so it never tells you who owns the fan — read `pwm1_enable` |
+| **zbus does not run on the tokio runtime** | With default features zbus 5 uses its own `async-io` executor. Blocking every tokio worker leaves D-Bus answering normally with stale telemetry, so "the daemon is wedged" is not all-or-nothing. Never infer daemon health from the interface responding |
 | **Stale binary on PATH** | Bit us twice, both times looking like a broken daemon. `install-dev.sh` now installs a shim resolving the newest build per invocation. Still: build release *and* debug |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |
