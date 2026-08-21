@@ -51,6 +51,18 @@ pub trait Daemon {
     /// Hand the fan back to the EC. May prompt via polkit.
     fn set_fan_auto(&self) -> zbus::Result<()>;
 
+    /// Sustained CPU power limit in watts, 0 when unsupported.
+    #[zbus(property)]
+    fn power_limit(&self) -> zbus::Result<u32>;
+
+    /// Highest power limit this machine admits to. Bound sliders to this, never to the
+    /// MSR zone's fictional 200 W.
+    #[zbus(property)]
+    fn power_limit_max(&self) -> zbus::Result<u32>;
+
+    /// Set the sustained CPU power limit. May prompt via polkit.
+    fn set_power_limit(&self, watts: u32) -> zbus::Result<()>;
+
     /// The active curve as (temperature, duty) pairs; empty when none is running.
     #[zbus(property)]
     fn fan_curve(&self) -> zbus::Result<Vec<(f64, u8)>>;
@@ -114,6 +126,9 @@ pub struct Snapshot {
     pub fan_floor: Option<u8>,
     /// The active curve, empty when the fan is pinned or firmware owns it.
     pub fan_curve: Vec<(f64, u8)>,
+    /// Sustained CPU power limit in watts, and the ceiling for it.
+    pub power_limit: Option<u32>,
+    pub power_limit_max: Option<u32>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -154,6 +169,8 @@ impl Snapshot {
             fan_duty: d.fan_duty().ok(),
             fan_floor: d.fan_floor().ok(),
             fan_curve: d.fan_curve().unwrap_or_default(),
+            power_limit: d.power_limit().ok().filter(|v| *v > 0),
+            power_limit_max: d.power_limit_max().ok().filter(|v| *v > 0),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

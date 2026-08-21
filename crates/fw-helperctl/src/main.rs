@@ -21,6 +21,7 @@ USAGE:
     fw-helperctl fan auto        hand the fan back to the EC
     fw-helperctl fan curve        follow the built-in quiet curve
     fw-helperctl fan curve T:D,.. follow a custom curve, e.g. 55:0,70:65,85:120
+    fw-helperctl power-limit N   set the sustained CPU power limit, in watts
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -33,6 +34,7 @@ fn main() {
         Some("watch") => watch(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10)),
         Some("charge-limit") => charge_limit(args.get(1).map(String::as_str)),
         Some("fan") => fan(args.get(1).map(String::as_str)),
+        Some("power-limit") => power_limit(args.get(1).map(String::as_str)),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -82,6 +84,10 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
     match s.package_watts {
         Some(w) => println!("  package power      {w:.1} W"),
         None => println!("  package power      <unavailable>"),
+    }
+    if let (Some(pl), Some(max)) = (s.power_limit, s.power_limit_max) {
+        let note = if pl >= max { " (stock)" } else { "" };
+        println!("  power limit        {pl} W of {max} W max{note}");
     }
     if let Some(r) = s.fan_rpm {
         // Say who is driving. Under manual control the EC's curve is not running, and
@@ -348,6 +354,38 @@ fn parse_curve(spec: &str) -> Result<Vec<(f64, u8)>, String> {
             Ok((celsius, duty))
         })
         .collect()
+}
+
+/// Set the sustained CPU power limit. Requires the daemon, like every hardware write.
+fn power_limit(arg: Option<&str>) {
+    let Some(arg) = arg else {
+        eprintln!("usage: fw-helperctl power-limit <watts>");
+        std::process::exit(2);
+    };
+    let Ok(watts) = arg.parse::<u32>() else {
+        eprintln!("not a number: {arg}");
+        std::process::exit(2);
+    };
+    let (d, _) = match connect() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fw-helperd unavailable ({e}); setting a power limit requires it");
+            std::process::exit(1);
+        }
+    };
+    match d.set_power_limit(watts) {
+        Ok(()) => {
+            println!("power limit set to {watts} W");
+            // Measured, and the reason a user who checks immediately will think it did
+            // not work: the limit averages over ~32 s.
+            println!("  the limit averages over ~32 s, so power readings take that long to settle");
+            println!("  roughly 10 W is worth 12 C of sustained CPU temperature");
+        }
+        Err(e) => {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn watch(secs: u64) {

@@ -20,7 +20,8 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M1b — daemon + D-Bus | complete, verified unprivileged against a root daemon |
 | M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
 | M3 — fan control | in progress: lease mechanism + restore binary land and are hardware-verified; daemon side not started |
-| M4–M5, M7 | planned; every mechanism pre-verified |
+| M4 — power limits | PL1 control complete and verified (15 W → 15.02 W); profiles pending M5 |
+| M5, M7 | planned; every mechanism pre-verified |
 | M6 — GUI | read-only telemetry view landed early; controls pending M2–M5 |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
@@ -220,6 +221,7 @@ sudo pkill -x fw-helperd
 fw-helperctl status | watch [secs] | charge-limit N
 fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the firmware floor
 fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
+fw-helperctl power-limit 15               # sustained CPU watts; ~32s to take effect
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey
@@ -264,6 +266,8 @@ All of these cost real time once. Do not rediscover them.
 
 | Trap | Reality |
 |---|---|
+| `constraint_1_max_power_uw` = **0** | Unset, not "no power allowed" — same trap as `temp*_max` = -273150. Clamping a slider to `max_power_uw` is right for PL1 (25 W) and silently zeroes PL2. Validate first |
+| **Root cannot overwrite your file in `/tmp`** | `fs.protected_regular=2` blocks root `O_CREAT`ing a file owned by another user in a sticky world-writable dir. Test scripts run as both users across a session; put their data outside `/tmp` |
 | `intel-rapl:0` `long_term` = **200 W** | Meaningless; its own `max_power_uw` is 25 W. Use **`intel-rapl-mmio:0`**. Clamp any UI to `max_power_uw` |
 | `peak_power` = 175 W | PL4, a microsecond current ceiling. Not a thermal budget |
 | `temp*_max` = **-273150** | Unset (0 K). Only `temp*_crit` is usable, validated to 0–150 °C first |

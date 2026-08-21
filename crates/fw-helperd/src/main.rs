@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook(Arc::clone(&lease));
 
     let state = state::State::load();
+    let state_power_limit = state.power_limit;
     if let Some(limit) = state.charge_limit {
         eprintln!("persisted charge limit: {limit}%");
     }
@@ -76,6 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&watchdog),
     );
     daemon.reapply_charge_limit();
+    if let Some(watts) = state_power_limit {
+        eprintln!("persisted power limit: {watts} W");
+    }
+    daemon.reapply_power_limit();
 
     // The session bus is a development affordance: claiming a name on the system bus
     // needs both root and an installed policy file, which makes iterating painful.
@@ -434,7 +439,11 @@ async fn poll_loop(
                 .interface::<_, iface::Daemon>(OBJECT_PATH)
                 .await
             {
-                guard.get().await.reapply_charge_limit();
+                let d = guard.get().await;
+                d.reapply_charge_limit();
+                // Firmware commonly resets RAPL across sleep. Same read-before-write, so
+                // the log says whether it actually did.
+                d.reapply_power_limit();
             }
         }
 

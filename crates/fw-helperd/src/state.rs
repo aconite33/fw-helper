@@ -22,6 +22,9 @@ const STATE_FILE: &str = "state";
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct State {
     pub charge_limit: Option<u8>,
+    /// Sustained CPU power limit in watts. Firmware commonly resets these across
+    /// suspend and they do not survive a reboot, so the desired value lives here.
+    pub power_limit: Option<u32>,
     /// Observed firmware fan duty by temperature, as `(celsius, duty)`.
     pub floor: Vec<(f64, u8)>,
 }
@@ -59,6 +62,7 @@ impl State {
             };
             match key.trim() {
                 "charge_limit" => s.charge_limit = value.trim().parse().ok(),
+                "power_limit" => s.power_limit = value.trim().parse().ok(),
                 "fan_floor" => s.floor = parse_floor(value),
                 _ => {}
             }
@@ -76,6 +80,9 @@ impl State {
         let mut out = String::from("# written by fw-helperd\n");
         if let Some(v) = self.charge_limit {
             out.push_str(&format!("charge_limit={v}\n"));
+        }
+        if let Some(v) = self.power_limit {
+            out.push_str(&format!("power_limit={v}\n"));
         }
         if !self.floor.is_empty() {
             let pairs: Vec<String> = self

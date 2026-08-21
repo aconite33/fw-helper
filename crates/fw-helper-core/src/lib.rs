@@ -12,6 +12,7 @@ pub mod curve;
 pub mod energy;
 pub mod fan;
 pub mod floor;
+pub mod power;
 pub mod sysfs;
 pub mod telemetry;
 
@@ -23,6 +24,7 @@ pub use curve::{Curve, CurveEngine, CurveError, Point};
 pub use energy::EnergySampler;
 pub use fan::{FanControl, FanError, FanMode};
 pub use floor::{FirmwareFloor, STICTION_DUTY};
+pub use power::{PowerError, PowerLimit};
 pub use sysfs::Sysfs;
 pub use telemetry::{Monitor, Telemetry};
 

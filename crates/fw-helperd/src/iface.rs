@@ -7,7 +7,7 @@ use crate::fan::FanLease;
 use crate::state::State;
 use crate::watchdog::Watchdog;
 use crate::{polkit, wire};
-use fw_helper_core::{Capabilities, ChargeControl, Sysfs, Telemetry};
+use fw_helper_core::{Capabilities, ChargeControl, PowerLimit, Sysfs, Telemetry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zbus::zvariant::OwnedValue;
@@ -157,6 +157,39 @@ impl Daemon {
         }
     }
 
+    /// Re-apply the persisted power limit.
+    ///
+    /// Same shape as [`Self::reapply_charge_limit`], and for the same reason: read
+    /// before writing, so the log distinguishes "firmware left it alone" from "firmware
+    /// reset it and we corrected it". Whether RAPL survives suspend on this hardware is
+    /// not yet known, and this is how it gets answered rather than assumed.
+    pub fn reapply_power_limit(&self) -> Reapply {
+        let Some(watts) = self.state.lock().ok().and_then(|s| s.power_limit) else {
+            return Reapply::NothingPersisted;
+        };
+        let pl = PowerLimit::new(&self.fs);
+        match pl.read() {
+            Ok(observed) if observed == watts => {
+                eprintln!("power limit still {watts} W; nothing to re-apply");
+                return Reapply::AlreadyCorrect;
+            }
+            Ok(observed) => {
+                eprintln!("power limit is {observed} W, expected {watts} W; re-applying")
+            }
+            Err(e) => eprintln!("cannot read power limit ({e}); re-applying {watts} W anyway"),
+        }
+        match pl.set(watts) {
+            Ok(()) => {
+                eprintln!("re-applied power limit {watts} W");
+                Reapply::Corrected
+            }
+            Err(e) => {
+                eprintln!("could not re-apply power limit {watts} W: {e}");
+                Reapply::Failed
+            }
+        }
+    }
+
     /// Called by the poll task. Returns true when the published view actually changed,
     /// so we only emit a PropertiesChanged signal when there is something to say.
     pub fn update(&mut self, t: Telemetry) -> bool {
@@ -195,6 +228,49 @@ impl Daemon {
     #[zbus(property)]
     async fn version(&self) -> u32 {
         1
+    }
+
+    /// Sustained CPU power limit in watts, or 0 when unsupported.
+    #[zbus(property)]
+    async fn power_limit(&self) -> u32 {
+        PowerLimit::new(&self.fs).read().unwrap_or(0)
+    }
+
+    /// The highest power limit this machine admits to, in watts.
+    ///
+    /// Published so a client can bound a slider to something real. **Never derive this
+    /// from the MSR RAPL zone**, which reports 200 W while its own maximum says 25.
+    #[zbus(property)]
+    async fn power_limit_max(&self) -> u32 {
+        PowerLimit::new(&self.fs).max_watts()
+    }
+
+    /// Set the sustained CPU power limit.
+    ///
+    /// The most effective thermal control here: measured, 10 W is worth about 12 °C.
+    /// Note the effect is not immediate — the averaging window is ~32 s, so a power
+    /// reading taken sooner shows turbo rather than the new steady state.
+    async fn set_power_limit(
+        &self,
+        watts: u32,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        if let fw_helper_core::Cap::No(reason) = &self.caps.power_limit {
+            return Err(zbus::fdo::Error::NotSupported(reason.clone()));
+        }
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+
+        PowerLimit::new(&self.fs)
+            .set(watts)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        if let Ok(mut state) = self.state.lock() {
+            state.power_limit = Some(watts);
+            state.save();
+        }
+        eprintln!("power limit set to {watts} W by {sender}");
+        Ok(())
     }
 
     /// Current charge limit as the EC reports it, or 0 when unsupported.
@@ -441,6 +517,7 @@ mod tests {
         let caps = Capabilities::probe(&fs_);
         let state = State {
             charge_limit: persisted,
+            power_limit: None,
             floor: Vec::new(),
         };
         let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));

@@ -398,8 +398,20 @@ Suspend/resume leaves the fan in a correct state. Curve holds a target temperatu
 
 ---
 
-### M4 — Power limits
+### M4 — Power limits  ✅ core control complete, verified on hardware
 
+- [x] **PL1 write path** (`fw-helper-core/src/power.rs`, 2026-08-21) via
+  `intel-rapl-mmio:0`, reached as `SetPowerLimit` behind polkit action
+  `org.fwhelper.set-power-limit`, and from `fw-helperctl power-limit N`. Same pattern as
+  every write since M2: validate range before support, write, read back, persist,
+  re-apply at startup and on resume.
+  **Verified**: 15 W setpoint held **15.02 W (+0.1%)** at 62.2 °C under 16-core load,
+  against Q6's 14.68 W / 64.8 °C written directly. The 25 W case measured 23.57 W at
+  84.8 °C, ~8 °C above Q6, almost certainly heat soak from a long session — so the
+  10 W ≈ 12 °C figure still rests on Q6's controlled run, not on this one.
+  **RAPL survives suspend**: `power limit still 15 W; nothing to re-apply`.
+  PL2 is deliberately untouched: it governs burst responsiveness, not sustained thermals,
+  and its `max_power_uw` reads 0 (unset), which would clamp any naive UI to zero
 - Write PL1/PL2 via `intel-rapl-mmio:0` — confirmed as the authoritative zone (Q2)
 - Envelope is **25 W PL1 / 60 W PL2** (Q5), and PL1 regulates to ±2% of setpoint (Q6)
 - Profile values, grounded in the Q6 measurements (10 W ≈ 12 °C):

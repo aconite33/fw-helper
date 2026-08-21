@@ -113,6 +113,41 @@ Consequences, both acted on in [ADR 0011](adr/0011-quiet-is-a-legitimate-choice.
   not what firmware does at those temperatures while heating, which is nothing at all.
 - "Never quieter than firmware" needs a branch named, or it means nothing.
 
+#### RAPL, driven by the daemon (M4)
+
+Measured 2026-08-21 through `fw-helperctl power-limit`, confirming the daemon reproduces
+what Q6 achieved by writing RAPL directly.
+
+| PL1 setpoint | Sustained | Error | CPU |
+|---|---|---|---|
+| 15 W | **15.02 W** | **+0.1%** | 62.2 °C |
+| 25 W | 23.57 W | −5.7% | 84.8 °C |
+
+The 15 W case matches Q6 (14.68 W, 64.8 °C) closely. The 25 W temperature is ~8 °C above
+Q6's 76.8 °C, almost certainly heat soak — it was measured after a long session of
+repeated load runs — so **the "10 W ≈ 12 °C" figure still rests on Q6's controlled run**,
+not on this comparison.
+
+The ramp is a textbook demonstration of why the averaging window matters. Under a **15 W**
+limit:
+
+```
+t+10s  25.2 W     t+30s  13.7 W
+t+20s  24.5 W     t+100..150s  15.02 W steady
+```
+
+`constraint_0_time_window_us` is ~32 s. A reading at t+20 shows 24.5 W under a 15 W limit
+and looks like the control does nothing.
+
+Two more facts worth having:
+
+- **`constraint_1_max_power_uw` reads `0`.** That is "unset", not "no power permitted" —
+  the same trap shape as `temp*_max` reporting -273150. Clamping a UI to `max_power_uw`
+  is right for PL1 (25 W) and would silently zero PL2. Validate before trusting it.
+- **RAPL survives suspend.** After a 30 s s2idle cycle the daemon logged `power limit
+  still 15 W; nothing to re-apply`. Established by reading before writing, the same way
+  the charge limit question was settled. One cycle, so the re-apply hook stays.
+
 #### Thermal limits, and what protects what
 
 | Sensor | crit | Self-protecting? |
