@@ -126,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///   is chosen and becomes stuck-low as soon as the machine is loaded.
 fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
     let celsius = sample.control_temp().map(|t| t.celsius);
+    let ceiling = fan::ceiling_for(sample.control_temp().and_then(|t| t.critical));
 
     if !lease.held() {
         if let (Some(c), Some(rpm)) = (celsius, sample.fan_rpm) {
@@ -134,7 +135,7 @@ fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
         return;
     }
 
-    match lease.enforce_floor(celsius) {
+    match lease.enforce_floor(celsius, ceiling) {
         None => {}
         // Re-asserting the same duty is a real write but not news. It happens because
         // the EC quantizes: a target of 88 settles at 89, so next tick's target of 89
@@ -147,6 +148,14 @@ fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
             celsius,
         }) => eprintln!(
             "fan: {celsius:.1} C puts the firmware floor at {floor}/255; moved {from} -> {to}"
+        ),
+        Some(fan::Enforced::ReleasedTooHot {
+            celsius,
+            ceiling,
+            released,
+        }) => eprintln!(
+            "fan: {celsius:.1} C reached the {ceiling} ceiling; the fan belongs to \
+             firmware from here (ADR 0006 point 5). Returned to EC control: {released}"
         ),
         Some(fan::Enforced::ReleasedNoSensor { released }) => eprintln!(
             "fan: temperature became unreadable while under manual control; \

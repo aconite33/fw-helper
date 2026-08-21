@@ -285,7 +285,23 @@ The highest-value and highest-risk feature. Do not shortcut
         inside a tolerance meant for verifying writes. Decisions are now compared
         exactly, and drift against hardware separately. Unit tests did not catch this;
         comparing against measured firmware behaviour did
-  - [ ] `temp*_crit`-derived ceiling override, with sanity validation
+  - [x] **`temp*_crit`-derived ceiling override, with sanity validation**
+        (`fw-helper-core/src/ceiling.rs`, 2026-08-21). Derived from the control
+        sensor's critical point minus a 15 °C margin — intervening *at* crit would be
+        intervening after firmware already considers things critical — capped at 100 °C
+        and falling back to 90 °C when no plausible value is available. Not knowing the
+        limit is a reason to be more cautious, so the fallback is below the cap. Every
+        value is validated: the -273150 case is not hypothetical, and trusting it would
+        put the ceiling at absolute zero and disable manual fan control permanently.
+        **The ordering with the floor is a compile-time assertion**, not a convention:
+        full duty is demanded several degrees before any ceiling can fire. That matters
+        because of a measured fact that runs against intuition — the EC's curve tops out
+        near 3100 rpm while full duty reaches ~5200, so releasing to firmware *reduces*
+        airflow. It is the last resort, not the next step up.
+        **Verified on hardware** with `FW_HELPERD_DEBUG_CEILING_C=55` (the override can
+        only ever lower the ceiling): took the fan at 39.9 °C, released it at 55.9 °C,
+        refused to give it back at 57.9 °C with a message naming the fix, and allowed it
+        again at 44.9 °C
   - [x] **refuse manual control if the sensor is unreadable** (point 6). No temperature
         means no floor, and no floor means an unbounded duty. Losing the sensor *while*
         holding the fan hands it back to firmware, which has its own sensors

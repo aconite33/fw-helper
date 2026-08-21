@@ -118,8 +118,23 @@ real deficit inside a tolerance meant for verifying writes. Decisions are compar
 now; drift against hardware separately. Unit tests were happy throughout — only comparing
 against measured firmware behaviour caught it.
 
-Next: the **`temp*_crit` ceiling override** (ADR 0006 point 5), then the curve engine.
-ADR 0006 is not negotiable.
+**The ceiling override is done and hardware-verified** (`fw-helper-core/src/ceiling.rs`).
+Derived from the control sensor's crit minus 15 °C, capped at 100 °C, falling back to
+90 °C when nothing plausible is readable — every value validated, because the -273150
+case would otherwise put the ceiling at absolute zero and kill manual fan control
+permanently. Its ordering against the floor's full-duty point is a **`const` assertion**,
+so getting it wrong fails the build.
+
+Verified with `FW_HELPERD_DEBUG_CEILING_C=55` (it can only ever *lower* the ceiling): took
+the fan at 39.9 °C, released at 55.9 °C, refused at 57.9 °C, allowed again at 44.9 °C.
+
+**All six of ADR 0006's safety points are now built and verified on hardware**, except
+`ExecStopPost`, which is wired but needs the systemd unit installed plus a `kill -9` —
+the M3 exit gate.
+
+Next: `PrepareForSleep` handling, then the **curve engine** — which is now the only part
+left that a user would recognise as the feature, because everything underneath it is
+what makes exposing it defensible.
 
 **`fw-helperctl fan` is not a curve.** It pins one duty with no temperature feedback.
 The flat 77/255 floor is a placeholder for the firmware-floor clamp — replace it with
@@ -211,6 +226,7 @@ All of these cost real time once. Do not rediscover them.
 | **polkit `AllowUserInteraction` hangs forever** | When no authentication agent can service the caller — any process without `XDG_SESSION_ID`. Check without interaction first, then bound the interactive call |
 | `pwm1` write while `pwm1_enable=2` | **`EOPNOTSUPP`**, not silently ignored. The duty cannot be pre-loaded before taking control, so the takeover window is real — keep the mode switch and first duty write adjacent |
 | Fan duty read-back ≠ what you wrote | The EC stores whole percent: write 180, read 181. Verify with `DUTY_TOLERANCE`, not equality. `pwm1` is also zeroed a few seconds *after* release, so it never tells you who owns the fan — read `pwm1_enable` |
+| Handing the fan back to the EC **reduces** airflow | Firmware's curve tops out near 3100 rpm; manual reaches ~5200. Releasing is a last resort that defers to firmware's *whole* thermal protection, not a cooling escalation. Demand full duty first |
 | Fan duty→RPM is **concave** | A line through the high points (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty 77; the measured answer is ~85. Fitting a line would set the firmware floor *below* firmware. Interpolate the measured table |
 | Fan stiction is between duty 20 and 30 | Duty 20 = 0 rpm, duty 30 = 1107 rpm. A duty of 1–29 is a stopped fan, not a slow one. Refuse it; do not accept and ignore it |
 | **zbus does not run on the tokio runtime** | With default features zbus 5 uses its own `async-io` executor. Blocking every tokio worker leaves D-Bus answering normally with stale telemetry, so "the daemon is wedged" is not all-or-nothing. Never infer daemon health from the interface responding |

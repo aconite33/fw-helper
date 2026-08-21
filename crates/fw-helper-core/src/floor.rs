@@ -48,9 +48,14 @@ const FLOOR_MARGIN_DUTY: u8 = 2;
 /// Above this temperature the floor is full duty.
 ///
 /// Beyond the hottest EC observation (76.8 °C) there is no data, and the safe
-/// direction in unmeasured territory is loud. ADR 0006 point 5's ceiling override
-/// takes over entirely above its own threshold; this only has to be sane until then.
-const FULL_DUTY_ABOVE_C: f64 = 90.0;
+/// direction in unmeasured territory is loud.
+///
+/// **Deliberately below every ceiling** in [`crate::ceiling`], so there is always a
+/// band where we hold maximum airflow before giving the fan back. That ordering
+/// matters because of a measured fact: the EC's curve tops out near 3100 rpm while
+/// full duty reaches ~5200, so releasing to firmware *reduces* airflow. Maximum
+/// cooling has to be tried first; releasing is the last resort, not the escalation.
+const FULL_DUTY_ABOVE_C: f64 = crate::ceiling::FALLBACK_CEILING_C - 5.0;
 
 /// What the EC does, unloaded and loaded, as measured. Temperature ascending.
 const EC_CURVE: [(f64, u16); 5] = [
@@ -320,6 +325,21 @@ mod tests {
         assert_eq!(f.floor_duty(110.0), 255);
         // And the unmeasured band above the last EC point ramps rather than flattening.
         assert!(f.floor_duty(85.0) > f.floor_duty(76.8));
+    }
+
+    #[test]
+    fn full_duty_is_reached_before_any_ceiling_releases_the_fan() {
+        // The ordering invariant. If a ceiling were ever to sit below this, the fan
+        // would be handed back to firmware - at a lower RPM than we were capable of -
+        // without ever having run flat out.
+        // const blocks: this ordering is a compile-time fact about the constants, so
+        // getting it wrong should fail the build, not wait for someone to run tests.
+        use crate::ceiling::{FALLBACK_CEILING_C, MAX_CEILING_C};
+        const { assert!(FULL_DUTY_ABOVE_C < FALLBACK_CEILING_C) };
+        const { assert!(FULL_DUTY_ABOVE_C < MAX_CEILING_C) };
+
+        let f = FirmwareFloor::new();
+        assert_eq!(f.floor_duty(FALLBACK_CEILING_C), 255);
     }
 
     #[test]

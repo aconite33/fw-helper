@@ -24,7 +24,7 @@
 //!   not.
 
 use fw_helper_core::fan::DUTY_TOLERANCE;
-use fw_helper_core::{FanControl, FanError, FanMode, FirmwareFloor, Sysfs};
+use fw_helper_core::{Ceiling, FanControl, FanError, FanMode, FirmwareFloor, Sysfs};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -33,6 +33,11 @@ use std::sync::Mutex;
 pub enum LeaseError {
     /// No usable temperature. ADR 0006 point 6: no sensor, no manual fan.
     NoTemperature,
+    /// Too hot for user configuration to have a say. ADR 0006 point 5.
+    AboveCeiling {
+        celsius: f64,
+        ceiling: Ceiling,
+    },
     Fan(FanError),
 }
 
@@ -45,8 +50,35 @@ impl fmt::Display for LeaseError {
                  computed and manual fan control would be unbounded; leaving the fan \
                  to the EC (ADR 0006 point 6)"
             ),
+            Self::AboveCeiling { celsius, ceiling } => write!(
+                f,
+                "{celsius:.1} C is at or above the {ceiling} ceiling, where the fan \
+                 belongs to firmware and configuration does not get a vote \
+                 (ADR 0006 point 5). Let the machine cool, then ask again"
+            ),
             Self::Fan(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// Build the ceiling from a sensor's critical point.
+///
+/// `FW_HELPERD_DEBUG_CEILING_C` overrides it, and exists for the same reason the
+/// watchdog's wedge injection does: the real ceiling sits near 100 °C, which this
+/// machine does not reach under any load it is safe to apply deliberately. Without an
+/// override the release path could only ever be argued for, not demonstrated. Never
+/// set in production; it can only ever *lower* the ceiling, so a stray value makes the
+/// daemon more cautious rather than less.
+pub fn ceiling_for(crit: Option<f64>) -> Ceiling {
+    let real = Ceiling::from_crit(crit);
+    let Some(raw) = std::env::var_os("FW_HELPERD_DEBUG_CEILING_C") else {
+        return real;
+    };
+    match raw.to_str().and_then(|s| s.parse::<f64>().ok()) {
+        Some(c) if c < real.celsius() => {
+            Ceiling::from_crit(Some(c + fw_helper_core::ceiling::CEILING_MARGIN_C))
+        }
+        _ => real,
     }
 }
 
@@ -177,10 +209,20 @@ impl FanLease {
     ///
     /// Returns the duty the EC actually settled on, which is not necessarily what was
     /// asked for — the EC quantizes to whole percent.
-    pub fn set_duty(&self, duty: u8, celsius: Option<f64>) -> Result<Applied, LeaseError> {
+    pub fn set_duty(
+        &self,
+        duty: u8,
+        celsius: Option<f64>,
+        ceiling: Ceiling,
+    ) -> Result<Applied, LeaseError> {
         let Some(celsius) = celsius.filter(|c| c.is_finite()) else {
             return Err(LeaseError::NoTemperature);
         };
+        // Checked before anything else touches hardware: above the ceiling the answer
+        // is no, whatever the duty and whoever is asking.
+        if ceiling.exceeded_by(celsius) {
+            return Err(LeaseError::AboveCeiling { celsius, ceiling });
+        }
         let floor = self.floor_duty(celsius);
         let target = duty.max(floor);
 
@@ -206,7 +248,7 @@ impl FanLease {
     ///
     /// Corrects downward too. When the machine cools the floor drops, and the fan is
     /// allowed back to what was actually asked for.
-    pub fn enforce_floor(&self, celsius: Option<f64>) -> Option<Enforced> {
+    pub fn enforce_floor(&self, celsius: Option<f64>, ceiling: Ceiling) -> Option<Enforced> {
         if !self.held() {
             return None;
         }
@@ -216,6 +258,19 @@ impl FanLease {
             let released = self.release_now();
             return Some(Enforced::ReleasedNoSensor { released });
         };
+
+        // ADR 0006 point 5. Note this is reached only after the floor has already been
+        // demanding full duty for several degrees: releasing hands the fan to a curve
+        // that tops out slower than we can drive it, so it is the last resort rather
+        // than the next step up.
+        if ceiling.exceeded_by(celsius) {
+            let released = self.release_now();
+            return Some(Enforced::ReleasedTooHot {
+                celsius,
+                ceiling,
+                released,
+            });
+        }
 
         let requested = self.requested.load(Ordering::SeqCst);
         let floor = self.floor_duty(celsius);
@@ -301,6 +356,12 @@ pub enum Enforced {
     ReleasedNoSensor {
         released: bool,
     },
+    /// Too hot for us to be holding the fan at all (ADR 0006 point 5).
+    ReleasedTooHot {
+        celsius: f64,
+        ceiling: Ceiling,
+        released: bool,
+    },
     Failed(LeaseError),
 }
 
@@ -328,6 +389,10 @@ mod tests {
     const IDLE_C: f64 = 40.0;
     /// Loaded. Measured EC behaviour is 2925 rpm, which needs duty ~85.
     const HOT_C: f64 = 64.8;
+    /// The ceiling this machine actually derives, from peci-temp's 119.85 C crit.
+    fn real_ceiling() -> Ceiling {
+        Ceiling::from_crit(Some(119.85))
+    }
 
     fn fixture(tag: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -366,11 +431,11 @@ mod tests {
         let l = lease(&root);
 
         assert!(matches!(
-            l.set_duty(200, None),
+            l.set_duty(200, None, real_ceiling()),
             Err(LeaseError::NoTemperature)
         ));
         assert!(matches!(
-            l.set_duty(200, Some(f64::NAN)),
+            l.set_duty(200, Some(f64::NAN), real_ceiling()),
             Err(LeaseError::NoTemperature)
         ));
         assert_eq!(enable(&root), "2", "the EC must still own the fan");
@@ -384,7 +449,7 @@ mod tests {
         let root = fixture("silent");
         let l = lease(&root);
 
-        let applied = l.set_duty(0, Some(IDLE_C)).unwrap();
+        let applied = l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
         assert_eq!(applied.floor, 0);
         assert_eq!(applied.target, 0);
         assert!(!applied.clamped());
@@ -395,7 +460,7 @@ mod tests {
         let root = fixture("clamp");
         let l = lease(&root);
 
-        let applied = l.set_duty(0, Some(HOT_C)).unwrap();
+        let applied = l.set_duty(0, Some(HOT_C), real_ceiling()).unwrap();
         assert!(applied.clamped(), "{applied:?}");
         assert!(applied.target >= 78, "{applied:?}");
         assert_eq!(applied.requested, 0, "the request itself is remembered");
@@ -409,10 +474,10 @@ mod tests {
         let root = fixture("heats-up");
         let l = lease(&root);
 
-        l.set_duty(0, Some(IDLE_C)).unwrap();
+        l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
         assert_eq!(l.duty().unwrap(), 0);
 
-        let outcome = l.enforce_floor(Some(HOT_C));
+        let outcome = l.enforce_floor(Some(HOT_C), real_ceiling());
         match outcome {
             Some(Enforced::Corrected { from, to, .. }) => {
                 assert_eq!(from, 0);
@@ -429,11 +494,11 @@ mod tests {
         let root = fixture("cools");
         let l = lease(&root);
 
-        l.set_duty(0, Some(HOT_C)).unwrap();
+        l.set_duty(0, Some(HOT_C), real_ceiling()).unwrap();
         let hot_duty = l.duty().unwrap();
         assert!(hot_duty >= 78);
 
-        match l.enforce_floor(Some(IDLE_C)) {
+        match l.enforce_floor(Some(IDLE_C), real_ceiling()) {
             Some(Enforced::Corrected { to, .. }) => {
                 assert_eq!(to, 0, "should return to the duty actually requested")
             }
@@ -445,10 +510,10 @@ mod tests {
     fn a_steady_temperature_provokes_no_writes() {
         let root = fixture("steady");
         let l = lease(&root);
-        l.set_duty(120, Some(IDLE_C)).unwrap();
+        l.set_duty(120, Some(IDLE_C), real_ceiling()).unwrap();
 
         assert!(
-            l.enforce_floor(Some(IDLE_C)).is_none(),
+            l.enforce_floor(Some(IDLE_C), real_ceiling()).is_none(),
             "nothing changed, so nothing should be written"
         );
     }
@@ -458,9 +523,9 @@ mod tests {
         // Firmware has its own sensors. Holding the fan blind is the worst option.
         let root = fixture("blind");
         let l = lease(&root);
-        l.set_duty(200, Some(IDLE_C)).unwrap();
+        l.set_duty(200, Some(IDLE_C), real_ceiling()).unwrap();
 
-        match l.enforce_floor(None) {
+        match l.enforce_floor(None, real_ceiling()) {
             Some(Enforced::ReleasedNoSensor { released }) => assert!(released),
             other => panic!("expected a release, got {other:?}"),
         }
@@ -472,7 +537,7 @@ mod tests {
     fn enforcement_does_nothing_when_the_ec_owns_the_fan() {
         let root = fixture("not-held");
         let l = lease(&root);
-        assert!(l.enforce_floor(Some(HOT_C)).is_none());
+        assert!(l.enforce_floor(Some(HOT_C), real_ceiling()).is_none());
         assert_eq!(enable(&root), "2");
     }
 
@@ -489,11 +554,67 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_take_the_fan_above_the_ceiling() {
+        // ADR 0006 point 5: user configuration does not get a vote up here.
+        let root = fixture("ceiling-refuse");
+        let l = lease(&root);
+        let ceiling = real_ceiling();
+
+        let too_hot = ceiling.celsius() + 1.0;
+        assert!(matches!(
+            l.set_duty(255, Some(too_hot), ceiling),
+            Err(LeaseError::AboveCeiling { .. })
+        ));
+        assert_eq!(enable(&root), "2", "the fan must stay with firmware");
+        assert!(!l.held());
+    }
+
+    #[test]
+    fn gives_the_fan_back_when_the_ceiling_is_reached() {
+        let root = fixture("ceiling-release");
+        let l = lease(&root);
+        let ceiling = real_ceiling();
+        l.set_duty(255, Some(IDLE_C), ceiling).unwrap();
+        assert_eq!(enable(&root), "1");
+
+        match l.enforce_floor(Some(ceiling.celsius() + 5.0), ceiling) {
+            Some(Enforced::ReleasedTooHot { released, .. }) => assert!(released),
+            other => panic!("expected a ceiling release, got {other:?}"),
+        }
+        assert_eq!(enable(&root), "2");
+        assert!(!l.held());
+    }
+
+    #[test]
+    fn the_ceiling_error_tells_the_user_what_to_do() {
+        let msg = LeaseError::AboveCeiling {
+            celsius: 105.0,
+            ceiling: real_ceiling(),
+        }
+        .to_string();
+        assert!(msg.contains("cool"), "got: {msg}");
+    }
+
+    #[test]
+    fn full_load_temperatures_do_not_trip_the_ceiling() {
+        // 76.8 C is the measured steady state under sustained full load. If the
+        // ceiling fires there, manual fan control is useless exactly when wanted.
+        let root = fixture("ceiling-load");
+        let l = lease(&root);
+        assert!(l.set_duty(200, Some(76.8), real_ceiling()).is_ok());
+    }
+
+    #[test]
     fn takes_the_lease_then_gives_it_back() {
         let root = fixture("lease");
         let l = lease(&root);
 
-        assert_eq!(l.set_duty(200, Some(IDLE_C)).unwrap().settled, 200);
+        assert_eq!(
+            l.set_duty(200, Some(IDLE_C), real_ceiling())
+                .unwrap()
+                .settled,
+            200
+        );
         assert!(l.held());
         assert_eq!(enable(&root), "1");
 
@@ -506,7 +627,7 @@ mod tests {
     fn release_now_works_whatever_we_believed() {
         let root = fixture("unconditional");
         let l = lease(&root);
-        l.set_duty(200, Some(IDLE_C)).unwrap();
+        l.set_duty(200, Some(IDLE_C), real_ceiling()).unwrap();
 
         // Bookkeeping that has gone wrong: the flag says we hold nothing, the
         // hardware says otherwise. The hardware wins.
@@ -538,7 +659,7 @@ mod tests {
         let root = fixture("drop");
         {
             let l = lease(&root);
-            l.set_duty(200, Some(IDLE_C)).unwrap();
+            l.set_duty(200, Some(IDLE_C), real_ceiling()).unwrap();
             assert_eq!(enable(&root), "1");
         }
         assert_eq!(enable(&root), "2", "Drop must have handed the fan back");

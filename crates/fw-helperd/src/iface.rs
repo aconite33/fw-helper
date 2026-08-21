@@ -69,6 +69,12 @@ impl Daemon {
         self.latest.control_temp().map(|t| t.celsius)
     }
 
+    /// The temperature above which the fan belongs to firmware, derived from the
+    /// control sensor's own critical point (ADR 0006 point 5).
+    fn ceiling(&self) -> fw_helper_core::Ceiling {
+        crate::fan::ceiling_for(self.latest.control_temp().and_then(|t| t.critical))
+    }
+
     /// Authorize a caller for one action, or say why not.
     ///
     /// Every hardware-touching method starts here. Factored out because the sequence
@@ -288,7 +294,7 @@ impl Daemon {
         let celsius = self.control_celsius();
         let applied = self
             .fan
-            .set_duty(duty, celsius)
+            .set_duty(duty, celsius, self.ceiling())
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         if applied.clamped() {
