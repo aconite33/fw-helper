@@ -131,7 +131,7 @@ cannot, and the client renders it with no privileges of its own.
 
 ---
 
-### M2 — Battery charge limit  ✅ implemented, pending hardware verification
+### M2 — Battery charge limit  ✅ write path verified on hardware; suspend/reboot pending
 
 Smallest real feature, lowest risk, immediately useful.
 
@@ -152,8 +152,27 @@ Smallest real feature, lowest risk, immediately useful.
       because the threshold survives neither
 - [x] `fw-helperctl charge-limit N`, and `ChargeLimit` on the interface
 - [x] `--enable-charge-control` as an explicit opt-in, never a side effect of installing
-- [ ] **Verify on hardware**: enable the module parameter, set a limit, confirm it holds
-      across suspend and reboot
+- [x] **Write path verified on hardware** (2026-08-21). `sudo fw-helperctl charge-limit 80`
+      returned promptly — the polkit hang is fixed — and the daemon's own read-back
+      confirmed it. `charge_control_end_threshold` reads `80`, D-Bus `ChargeLimit` reports
+      `80%`, and `/var/lib/fw-helper/state` was created with `charge_limit=80`. No UEFI
+      override: `NotApplied` did not fire
+- [x] **Module parameter survives a cold boot** (2026-08-21). The drop-in had only ever been
+      proven after a live `modprobe -r`/`modprobe`. After a genuine reboot,
+      `charge_control_end_threshold` was present at `100` with
+      `probe_with_fwk_charge_control=Y`. See [ADR 0008](adr/0008-charge-limit-via-module-parameter.md)
+- [x] **Holds across suspend/resume** (2026-08-21). After `systemctl suspend` and wake,
+      `charge_control_end_threshold` reads `80`. The daemon logged both
+      `resumed from sleep` and `re-applied charge limit 80%`, so the logind signal is
+      received, consumed once, and the post-resume write succeeds
+- [ ] **Open question this test could not answer**: does firmware actually clear the
+      threshold on resume? `reapply_charge_limit` writes unconditionally, so the log line
+      fires either way and hides the answer. Settle it by stopping the daemon, suspending,
+      and reading sysfs on wake with nobody to correct it. Matters beyond M2 — if firmware
+      does not reset, the resume hook is insurance rather than a requirement, and M3–M5
+      inherit the same pattern
+- [ ] Confirm it is **re-applied after a reboot**. The sysfs value is expected to be lost;
+      what is under test is the daemon re-applying `80` from persisted state at startup
 
 **Exit:** `fw-helperctl charge-limit 80` holds across a reboot and a suspend/resume cycle.
 

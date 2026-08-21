@@ -94,6 +94,21 @@ BIOS setting we are asking the user not to use anyway.
 - Installer must not enable this without consent: it changes how the machine's charge limit
   is governed. Make it an explicit opt-in step, not a postinst side effect.
 
+## Verification (2026-08-21)
+
+Appended after the fact; the decision above is unchanged.
+
+- **The drop-in takes effect at boot.** Until now the module parameter had only ever been
+  proven to work after a live `modprobe -r cros_charge_control && modprobe cros_charge_control`.
+  Measured across a genuine reboot: `charge_control_end_threshold` present at `100`, and
+  `/sys/module/cros_charge_control/parameters/probe_with_fwk_charge_control` reads `Y`. The
+  drop-in needs no initramfs step and no note of caution.
+- **The write path works, and nothing overrode it.** `charge-limit 80` wrote and read back
+  `80`; `ChargeError::NotApplied` did not fire. This machine has no UEFI battery limit set,
+  so the override path this ADR anticipates remains *unexercised* — it is implemented and
+  unit-tested against a fixture, but has never been triggered by real firmware. Treat it as
+  designed-for, not demonstrated.
+
 ## Alternatives considered
 
 - **Implement Framework's custom EC command over `/dev/cros_ec`.** Rejected as the default:
