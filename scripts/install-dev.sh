@@ -80,11 +80,27 @@ fi
 # and then behaves like an older version of the program, which looks exactly like a
 # bug in the daemon rather than a stale binary. Resolving per-invocation removes the
 # failure mode instead of narrowing it. Packaging (M7) installs a real binary.
+# Remove first, ALWAYS. `cat >` follows symlinks, and older versions of this script
+# installed $CTL as a symlink to target/release/fw-helperctl. Writing through it
+# overwrote the real binary with this shim, which then exec'd itself forever at 100%
+# CPU. Worse, cargo hardlinks that path into target/release/deps, so the build
+# artifact was clobbered too and cargo considered it fresh and would not rebuild.
+# Measured 2026-08-21. Never write to a path in this script without unlinking it.
+rm -f "$CTL"
 cat > "$CTL" <<SHIM
 #!/bin/sh
 # fw-helper development shim, installed by scripts/install-dev.sh
 R="$REPO/target/release/fw-helperctl"
 D="$REPO/target/debug/fw-helperctl"
+# Belt and braces against the failure above: if a build path is somehow this shim,
+# exec'ing it would loop forever. Say so instead of spinning.
+for c in "\$R" "\$D"; do
+    if [ -f "\$c" ] && head -c 2 "\$c" 2>/dev/null | grep -q '^#!'; then
+        echo "fw-helperctl: \$c is a script, not a build. Rebuild:" >&2
+        echo "  rm -f \$c && cargo build --release --all" >&2
+        exit 1
+    fi
+done
 if [ -x "\$R" ] && { [ ! -x "\$D" ] || [ "\$R" -nt "\$D" ]; }; then
     exec "\$R" "\$@"
 fi

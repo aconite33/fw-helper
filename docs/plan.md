@@ -241,10 +241,13 @@ The highest-value and highest-risk feature. Do not shortcut
         **SIGTERM verified on hardware**: fan pinned at 181/255 and 5093 rpm, `pkill
         -TERM`, `pwm1_enable` back to `2` with `released manual fan control` in the log.
         The panic path is implemented and unit-tested but **has not been triggered live**
-  - [x] **`ExecStopPost` wired** — uncommented in `data/fw-helperd.service`, and
-        `install-dev.sh --systemd` now installs `fw-helper-restore-fan` and refuses to
-        install a unit without it. **Not yet demonstrated**: that needs the unit
-        installed and a `kill -9`, which is the M3 exit gate
+  - [x] **`ExecStopPost` verified** (2026-08-21). Unit installed via
+        `install-dev.sh --systemd`, fan taken at duty 120 under 16-core load, then
+        `kill -9` on the daemon. **EC control restored in 0.27 s**, against a 5 s gate.
+        The journal is decisive: `Main process exited, code=killed, status=9/KILL`
+        followed by `fw-helper-restore-fan: fan was manual, now EC automatic`. `SIGKILL`
+        runs no handler and the watchdog thread dies with the process, so this is the one
+        failure nothing in-process can cover
   - [x] **watchdog thread with independent timer** (`fw-helperd/src/watchdog.rs`,
         2026-08-21). A real OS thread, not a `tokio` task — the failure being guarded
         against includes the runtime not scheduling anything, and a task waiting on that

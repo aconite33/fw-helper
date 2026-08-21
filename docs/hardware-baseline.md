@@ -66,9 +66,20 @@ these were assumptions before this run, and two of them were wrong.
   | Observed | 77 | 89 | 99 | 128 | 150 | 181 | 199 | 230 | 255 |
 
   Every point matches `round(round(d / 2.55) × 2.55)`. Max observed error ±1 count.
-- **The EC zeroes `pwm1` a few seconds *after* reclaiming.** Immediately after writing
-  `pwm1_enable=2` the duty still read `120`; four seconds later it read `0`. `pwm1` is
-  therefore not a reliable signal of who owns the fan — read `pwm1_enable` for that.
+- **Under EC control, `pwm1` reports firmware's own duty.** Corrected 2026-08-21: an
+  earlier note here said `pwm1` "goes to 0" a few seconds after firmware reclaims the
+  fan. It goes to *firmware's current duty*, which is 0 only because the machine was
+  idle. Measured under load at 68.8 °C with `pwm1_enable=2`: `pwm1` read **64** and the
+  fan turned at 2302 rpm — against a table where duty 65 gives 2296 rpm. It does still
+  take a few seconds to stop reflecting the duty *we* last wrote, so it is not a signal
+  of *who owns* the fan; read `pwm1_enable` for that.
+
+  **This is worth acting on.** `FirmwareFloor` currently reconstructs firmware's duty by
+  inverting an RPM table, composing two measured tables and inheriting the interpolation
+  error of both. If `pwm1` can simply be read while the EC owns the fan, the floor can be
+  *measured* rather than modelled, and the knee gap closes without needing the learned
+  observation mechanism. Confirm across the temperature range before changing working
+  safety code.
 - **The EC reclaims cleanly and promptly**, confirming Q4 on a second occasion: fan went
   to 0 rpm within 4 s of release, at 41 °C.
 

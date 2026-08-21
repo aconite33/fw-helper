@@ -134,10 +134,18 @@ release merely races the suspend. The restore re-runs the full clamp rather than
 the raw duty, since the machine may wake warmer than it slept, and a pending restore of
 duty 0 uses a separate flag rather than a sentinel, because 0 is a legitimate setting.
 
-**All of ADR 0006 is now built and verified on hardware except `ExecStopPost`**, which is
-wired into the unit and installer but needs `install-dev.sh --systemd` plus a `kill -9` to
-demonstrate. That is the M3 exit gate, and it changes what starts at boot, so it wants an
-explicit decision.
+**Every safety point in ADR 0006 is now built and verified on hardware.** The last one,
+`ExecStopPost`, was measured on 2026-08-21: unit installed, fan taken at duty 120 under
+16-core load, `kill -9` on the daemon, **EC control restored in 0.27 s** against a 5 s
+gate. `SIGKILL` runs no handler and the watchdog thread dies with the process, so nothing
+in-process could have covered it.
+
+**The systemd unit is now installed and enabled**, so `fw-helperd` starts at boot.
+`sudo ./scripts/install-dev.sh --uninstall` reverses that.
+
+Two of M3's three exit criteria are met (`kill -9` recovery, suspend/resume). The third is
+the curve holding a target temperature under `stress-ng` without audible hunting, which
+needs the curve to exist.
 
 Next: the **curve engine** — interpolated temp→duty points, hysteresis, ramp limiting. It
 is the only part left that a user would recognise as the feature, because everything
@@ -246,6 +254,7 @@ All of these cost real time once. Do not rediscover them.
 | Fan duty→RPM is **concave** | A line through the high points (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty 77; the measured answer is ~85. Fitting a line would set the firmware floor *below* firmware. Interpolate the measured table |
 | Fan stiction is between duty 20 and 30 | Duty 20 = 0 rpm, duty 30 = 1107 rpm. A duty of 1–29 is a stopped fan, not a slow one. Refuse it; do not accept and ignore it |
 | **zbus does not run on the tokio runtime** | With default features zbus 5 uses its own `async-io` executor. Blocking every tokio worker leaves D-Bus answering normally with stale telemetry, so "the daemon is wedged" is not all-or-nothing. Never infer daemon health from the interface responding |
+| `cat > "$file"` **follows symlinks** | An older `install-dev.sh` left `/usr/local/bin/fw-helperctl` as a symlink into `target/release/`. The newer one wrote the shim through it, overwriting the real binary, which then exec'd itself forever at 100% CPU — and clobbered cargo's hardlinked artifact so it would not rebuild. `rm -f` before writing, always |
 | **Stale binary on PATH** | Bit us twice, both times looking like a broken daemon. `install-dev.sh` now installs a shim resolving the newest build per invocation. Still: build release *and* debug |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |
