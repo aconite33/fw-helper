@@ -131,7 +131,7 @@ cannot, and the client renders it with no privileges of its own.
 
 ---
 
-### M2 — Battery charge limit  ✅ write path verified on hardware; suspend/reboot pending
+### M2 — Battery charge limit  ✅ complete, verified on hardware
 
 Smallest real feature, lowest risk, immediately useful.
 
@@ -169,14 +169,34 @@ Smallest real feature, lowest risk, immediately useful.
       returns a `Reapply` outcome, so `still 80%; nothing to re-apply` and
       `is 100%, expected 80%; re-applying` are distinct log lines. Covered by the first
       four unit tests in the daemon crate, against a rooted fixture
-- [ ] **Open question**: does firmware actually clear the threshold on resume? The old
-      unconditional write hid the answer. The next suspend on the new build reports it
-      directly. Matters beyond M2 — if firmware does not reset, the resume hook is
-      insurance rather than a requirement, and M3–M5 inherit the same pattern
-- [ ] Confirm it is **re-applied after a reboot**. The sysfs value is expected to be lost;
-      what is under test is the daemon re-applying `80` from persisted state at startup
+- [x] **Firmware does not reset the threshold across suspend** (2026-08-21). First suspend
+      on the instrumented build logged `resumed from sleep` followed by
+      `charge limit still 80%; nothing to re-apply`, against a journal-confirmed
+      s2idle cycle 09:35:12–09:35:40. So the resume hook is **insurance, not a
+      requirement**, for the charge limit on this machine. One ~28 s s2idle cycle on
+      battery is one data point, not a law — but every future resume now adds to it for
+      free, and a contradicting line would be conspicuous. Do not assume this generalises
+      to M3–M5: the EC has far more reason to reset a fan or power limit than a charge
+      threshold, so each knob earns this verdict separately
+- [x] **Re-applied after a reboot** (2026-08-21). Confirmed across a journal-verified
+      reboot — boot `-1` ended 09:47:24, boot `0` began 09:47:37. The daemon was left down
+      for 27 minutes afterwards; `charge_control_end_threshold` read `100` throughout, so
+      the value is indeed lost at boot. Starting the daemon at 10:15:06 logged, before any
+      client command was issued:
 
-**Exit:** `fw-helperctl charge-limit 80` holds across a reboot and a suspend/resume cycle.
+      ```
+      persisted charge limit: 80%
+      charge limit is 100%, expected 80%; re-applying
+      re-applied charge limit 80%
+      ```
+
+      sysfs then read `80` and D-Bus reported `80%`. The instrumented read-before-write is
+      what makes this decisive: `charge limit still 80%` would have meant the threshold
+      survived and the persistence path was never exercised. It did not fire
+
+**Exit: met.** `fw-helperctl charge-limit 80` holds across both a reboot and a
+suspend/resume cycle — by re-application at startup in the first case, and, as it turns
+out, without needing any intervention in the second.
 
 ---
 

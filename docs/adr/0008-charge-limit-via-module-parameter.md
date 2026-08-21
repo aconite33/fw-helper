@@ -103,6 +103,17 @@ Appended after the fact; the decision above is unchanged.
   Measured across a genuine reboot: `charge_control_end_threshold` present at `100`, and
   `/sys/module/cros_charge_control/parameters/probe_with_fwk_charge_control` reads `Y`. The
   drop-in needs no initramfs step and no note of caution.
+- **Firmware does not reset the threshold across suspend.** Measured on an instrumented
+  build that reads before re-applying: after an s2idle cycle the daemon logged
+  `charge limit still 80%; nothing to re-apply`. The persist-and-re-apply machinery this
+  ADR calls for is therefore correct but, for suspend specifically, unnecessary on this
+  firmware. It remains necessary across a reboot, where the value is genuinely lost.
+- **Across a reboot the value is genuinely lost, and startup restores it.** Measured over a
+  journal-verified reboot with the daemon left down for 27 minutes:
+  `charge_control_end_threshold` read `100` the whole time. Starting the daemon logged
+  `persisted charge limit: 80%` / `charge limit is 100%, expected 80%; re-applying` /
+  `re-applied charge limit 80%`, before any client command was issued. This is the case
+  that makes the persistence path in this ADR load-bearing rather than defensive.
 - **The write path works, and nothing overrode it.** `charge-limit 80` wrote and read back
   `80`; `ChargeError::NotApplied` did not fire. This machine has no UEFI battery limit set,
   so the override path this ADR anticipates remains *unexercised* — it is implemented and

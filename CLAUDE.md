@@ -18,55 +18,54 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M0 — baseline & architecture | complete: 10 ADRs, all 6 hardware questions answered empirically |
 | M1a — hardware layer | complete, verified on hardware |
 | M1b — daemon + D-Bus | complete, verified unprivileged against a root daemon |
-| M2 — battery charge limit | write path **verified on hardware**; suspend + reboot re-apply still to confirm |
+| M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
 | M3–M5, M7 | planned; every mechanism pre-verified |
 | M6 — GUI | read-only telemetry view landed early; controls pending M2–M5 |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
-### Resume here — M2's last check
+### Resume here — M3
 
-**The write path is proven.** On 2026-08-21, `sudo fw-helperctl charge-limit 80` returned
-promptly (the polkit hang is fixed), the daemon's read-back confirmed it, sysfs reads `80`,
-D-Bus reports `80%`, and `/var/lib/fw-helper/state` now holds `charge_limit=80`. No UEFI
-override — `NotApplied` never fired. Also settled the same day: the modprobe drop-in **does**
-take effect across a cold boot, which had only ever been proven after a live
-`modprobe -r`/`modprobe`.
+**M2 is complete**, all three criteria measured on hardware on 2026-08-21.
 
-One criterion remains, plus one open question the suspend test surfaced. Both need the
-daemon running, and there is still no systemd unit installed, so start it by hand:
+The write path: `sudo fw-helperctl charge-limit 80` returned promptly (the polkit hang is
+fixed), the daemon's read-back confirmed it, sysfs read `80`, D-Bus reported `80%`, and
+`/var/lib/fw-helper/state` holds `charge_limit=80`. No UEFI override — `NotApplied` never
+fired, so that path stays implemented but unexercised. The modprobe drop-in also survives a
+cold boot, which had only ever been proven after a live `modprobe -r`/`modprobe`.
+
+**Reboot re-apply: passed.** Across a journal-verified reboot the daemon was left down for
+27 minutes with sysfs reading `100` — the value really is lost at boot. Starting it logged,
+before any client command was issued:
+
+```
+persisted charge limit: 80%
+charge limit is 100%, expected 80%; re-applying
+re-applied charge limit 80%
+```
+
+**Suspend/resume: passed, and firmware does *not* reset the threshold.** The instrumented
+build's first suspend logged `charge limit still 80%; nothing to re-apply`. So the resume
+hook (`main.rs:106`) is **insurance rather than a requirement** for the charge limit. Two
+caveats: that is one ~28 s s2idle cycle on battery, and it says nothing about the other
+knobs — the EC has far more reason to reset a fan or power limit than a charge threshold.
+**Each of M3–M5 earns this verdict separately.** Every resume adds a data point for free, so
+a contradicting line in the log would be conspicuous.
+
+Reading before writing is what made both results legible in one line each. **Keep that
+pattern for every knob M3–M5 adds** — an unconditional write hides exactly the question you
+are trying to answer.
+
+**Known gap, not blocking M3:** there is still no systemd unit installed, so the daemon runs
+by hand. `data/` carries the unit; `install-dev.sh` does not install it yet.
 
 ```bash
 sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 ```
 
-**Suspend/resume — passed 2026-08-21.** After `systemctl suspend` and wake, sysfs read `80`
-and the daemon logged both `resumed from sleep` and `re-applied charge limit 80%`. The
-logind hook (`main.rs:106`) works and the post-resume write succeeds.
-
-Note what this did *not* settle: at the time, `reapply_charge_limit` wrote unconditionally,
-so that log line appeared whether or not firmware cleared anything. **Whether firmware
-resets the threshold across suspend is still unknown.**
-
-That is now fixed — `reapply_charge_limit` reads before writing and returns a `Reapply`
-outcome, so the log distinguishes the cases:
-
-```
-charge limit still 80%; nothing to re-apply          → firmware left it alone
-charge limit is 100%, expected 80%; re-applying      → firmware reset it
-```
-
-So the next suspend answers the question for free, with the daemon running as normal. Just
-restart it on the new build first. The answer matters past M2: it decides whether the resume
-hook every future write path inherits is load-bearing or belt-and-braces.
-
-**Reboot.** The sysfs value is expected to be lost; what is under test is the daemon
-re-applying it from persisted state at startup. After rebooting, start the daemon and expect
-`persisted charge limit: 80%` in the log and `80` in sysfs — checked *before* touching
-`fw-helperctl`, since the point is that no one asked.
-
-Only then does M2 move to complete. Then M3.
+Next: **M3 — fan control.** Read its section in `docs/plan.md` first, and ADR 0006 before
+touching `pwm1_enable`; the hard rule below is not negotiable.
 
 ## Layout
 
