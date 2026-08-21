@@ -313,7 +313,25 @@ The highest-value and highest-risk feature. Do not shortcut
 - `status` names the fan's owner. An RPM shown without saying the EC curve is
   suspended is indistinguishable from a stuck fan, which is the failure ADR 0006 asks
   the UI to make visible
-- logind `PrepareForSleep` handling
+- [x] **logind `PrepareForSleep` handling** (2026-08-21). A suspended process is not
+      minding anything — the watchdog thread is frozen alongside everything else — so for
+      the whole sleep there would be nothing between the fan and whatever duty it was
+      left holding. The fan is released on the way down and taken back after the wake.
+      **The signal alone is not sufficient**: `PrepareForSleep(true)` is a notification,
+      not a request for permission, and logind does not wait for handlers. A **delay
+      inhibitor lock** is what actually buys the time to write `pwm1_enable=2`, and it is
+      dropped last, after the release, because it is what holds suspend open.
+      The restore re-runs the full clamp rather than replaying the raw duty: the machine
+      may wake warmer than it slept, so the floor is computed from telemetry read after
+      the wake. A pending restore of duty **0** is tracked with a separate flag rather
+      than a sentinel — 0 is a legitimate setting, and the one a quiet-machine user is
+      most likely to have chosen.
+      **Verified on hardware** via `systemctl suspend` (not `rtcwake`, which writes
+      `/sys/power/state` directly, skips logind, and would test nothing): the lock was
+      confirmed held in `systemd-inhibit --list`, the log shows the release before
+      suspend and the restore after resume, and the fan came back at duty 120.
+      Incidentally a second confirmation that firmware does not reset the charge limit
+      across suspend — `charge limit still 80%; nothing to re-apply`
 
 **Exit:** `kill -9` on the daemon under sustained load restores EC fan control within 5 s.
 Suspend/resume leaves the fan in a correct state. Curve holds a target temperature under

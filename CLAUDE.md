@@ -128,17 +128,32 @@ so getting it wrong fails the build.
 Verified with `FW_HELPERD_DEBUG_CEILING_C=55` (it can only ever *lower* the ceiling): took
 the fan at 39.9 °C, released at 55.9 °C, refused at 57.9 °C, allowed again at 44.9 °C.
 
-**All six of ADR 0006's safety points are now built and verified on hardware**, except
-`ExecStopPost`, which is wired but needs the systemd unit installed plus a `kill -9` —
-the M3 exit gate.
+**The sleep hook is done and hardware-verified.** The fan is released before suspend and
+taken back after the wake, held open by a logind **delay inhibitor lock** — without it the
+release merely races the suspend. The restore re-runs the full clamp rather than replaying
+the raw duty, since the machine may wake warmer than it slept, and a pending restore of
+duty 0 uses a separate flag rather than a sentinel, because 0 is a legitimate setting.
 
-Next: `PrepareForSleep` handling, then the **curve engine** — which is now the only part
-left that a user would recognise as the feature, because everything underneath it is
-what makes exposing it defensible.
+**All of ADR 0006 is now built and verified on hardware except `ExecStopPost`**, which is
+wired into the unit and installer but needs `install-dev.sh --systemd` plus a `kill -9` to
+demonstrate. That is the M3 exit gate, and it changes what starts at boot, so it wants an
+explicit decision.
 
-**`fw-helperctl fan` is not a curve.** It pins one duty with no temperature feedback.
-The flat 77/255 floor is a placeholder for the firmware-floor clamp — replace it with
-the real clamp, do not merely lower it.
+Next: the **curve engine** — interpolated temp→duty points, hysteresis, ramp limiting. It
+is the only part left that a user would recognise as the feature, because everything
+underneath it is what makes exposing it defensible. Design it alongside M4's power
+profiles rather than after: 10 W of power limit buys ~12 °C, so the two compose.
+
+**`fw-helperctl fan` is still not a curve.** It pins one duty rather than following
+temperature. What it is not, any more, is unbounded — the duty is clamped up to the
+firmware floor and re-enforced every tick, and `fan 0` at idle is legitimate because
+firmware is silent there too.
+
+**Testing note carried forward.** Three defects this session were invisible to unit tests
+and only appeared on hardware: the EC's quantized duty read-back, a floor deficit hiding
+inside `DUTY_TOLERANCE`, and a stale release binary. The curve engine needs the same
+treatment, and a longer loop — hysteresis and ramp limiting only misbehave over minutes of
+changing load.
 
 ## Layout
 
@@ -226,6 +241,7 @@ All of these cost real time once. Do not rediscover them.
 | **polkit `AllowUserInteraction` hangs forever** | When no authentication agent can service the caller — any process without `XDG_SESSION_ID`. Check without interaction first, then bound the interactive call |
 | `pwm1` write while `pwm1_enable=2` | **`EOPNOTSUPP`**, not silently ignored. The duty cannot be pre-loaded before taking control, so the takeover window is real — keep the mode switch and first duty write adjacent |
 | Fan duty read-back ≠ what you wrote | The EC stores whole percent: write 180, read 181. Verify with `DUTY_TOLERANCE`, not equality. `pwm1` is also zeroed a few seconds *after* release, so it never tells you who owns the fan — read `pwm1_enable` |
+| `PrepareForSleep` does **not** wait for you | It is a notification, not a request for permission. Without a logind **delay inhibitor lock**, a pre-suspend write races the suspend. Also: `rtcwake -m mem` writes `/sys/power/state` directly and never emits the signal at all, so it cannot test any of this |
 | Handing the fan back to the EC **reduces** airflow | Firmware's curve tops out near 3100 rpm; manual reaches ~5200. Releasing is a last resort that defers to firmware's *whole* thermal protection, not a cooling escalation. Demand full duty first |
 | Fan duty→RPM is **concave** | A line through the high points (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty 77; the measured answer is ~85. Fitting a line would set the firmware floor *below* firmware. Interpolate the measured table |
 | Fan stiction is between duty 20 and 30 | Duty 20 = 0 rpm, duty 30 = 1107 rpm. A duty of 1–29 is a stopped fan, not a slow one. Refuse it; do not accept and ignore it |

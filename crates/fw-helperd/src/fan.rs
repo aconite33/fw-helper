@@ -130,6 +130,14 @@ pub struct FanLease {
     /// counts below firmware. On 2026-08-21 that left the fan at duty 84 while the
     /// floor was 87, about 4% slower than the EC would have run, for 35 seconds.
     applied: AtomicU8,
+    /// Whether a duty is waiting to be restored after a resume, and which one.
+    ///
+    /// Two fields rather than a sentinel because **0 is a legitimate duty** — it is
+    /// what the fan runs at below ~45 °C, and the case the whole floor design exists
+    /// to permit. Using 0 to mean "nothing pending" would silently drop exactly the
+    /// setting a quiet-machine user cares about.
+    restore_pending: AtomicBool,
+    restore_duty: AtomicU8,
     /// The firmware floor, learned as it goes.
     ///
     /// **The release paths never lock this.** `release_now` runs from the panic hook,
@@ -145,6 +153,8 @@ impl FanLease {
             held: AtomicBool::new(false),
             requested: AtomicU8::new(0),
             applied: AtomicU8::new(0),
+            restore_pending: AtomicBool::new(false),
+            restore_duty: AtomicU8::new(0),
             floor: Mutex::new(FirmwareFloor::new()),
         }
     }
@@ -322,9 +332,46 @@ impl FanLease {
     pub fn release(&self) -> Result<(), LeaseError> {
         self.requested.store(0, Ordering::SeqCst);
         self.applied.store(0, Ordering::SeqCst);
+        // Asking for EC control means asking for it after the next resume too.
+        self.restore_pending.store(false, Ordering::SeqCst);
         let r = self.control()?.release();
         self.held.store(false, Ordering::SeqCst);
         Ok(r?)
+    }
+
+    /// Hand the fan back before the machine suspends, remembering what to restore.
+    ///
+    /// A suspended process is not minding anything — the watchdog thread is frozen
+    /// alongside everything else — so for the whole sleep there would be nothing
+    /// between the fan and whatever duty it was left holding (ADR 0006 point 2).
+    ///
+    /// Returns the duty that was held, or `None` if the EC already owned the fan.
+    pub fn release_for_sleep(&self) -> Option<u8> {
+        if !self.held() {
+            return None;
+        }
+        let duty = self.requested.load(Ordering::SeqCst);
+        self.restore_duty.store(duty, Ordering::SeqCst);
+        self.restore_pending.store(true, Ordering::SeqCst);
+        self.release_now();
+        Some(duty)
+    }
+
+    /// Take the fan back after a resume, if it was ours before the sleep.
+    ///
+    /// Deliberately re-runs the full clamp rather than restoring the raw duty: the
+    /// machine may have woken warmer than it slept, and the floor is computed from
+    /// telemetry read *after* the wake. Returns `None` when there is nothing pending.
+    pub fn restore_after_resume(
+        &self,
+        celsius: Option<f64>,
+        ceiling: Ceiling,
+    ) -> Option<Result<Applied, LeaseError>> {
+        if !self.restore_pending.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        let duty = self.restore_duty.load(Ordering::SeqCst);
+        Some(self.set_duty(duty, celsius, ceiling))
     }
 
     /// Release without the ability to fail, for panic hooks and signal handlers.
@@ -551,6 +598,81 @@ mod tests {
 
         l.observe(48.0, 2500);
         assert!(l.floor_duty(48.0) > before);
+    }
+
+    #[test]
+    fn suspend_releases_the_fan_and_resume_takes_it_back() {
+        let root = fixture("sleep");
+        let l = lease(&root);
+        l.set_duty(120, Some(IDLE_C), real_ceiling()).unwrap();
+
+        assert_eq!(l.release_for_sleep(), Some(120));
+        assert_eq!(
+            enable(&root),
+            "2",
+            "the fan must be firmware's during sleep"
+        );
+        assert!(!l.held());
+
+        let restored = l.restore_after_resume(Some(IDLE_C), real_ceiling());
+        assert_eq!(restored.unwrap().unwrap().requested, 120);
+        assert_eq!(enable(&root), "1");
+    }
+
+    #[test]
+    fn a_requested_duty_of_zero_survives_a_suspend() {
+        // 0 is a real setting, not an absent one. A sentinel-based implementation
+        // would quietly lose exactly the setting a quiet-machine user chose.
+        let root = fixture("sleep-zero");
+        let l = lease(&root);
+        l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
+
+        assert_eq!(l.release_for_sleep(), Some(0));
+        let restored = l.restore_after_resume(Some(IDLE_C), real_ceiling());
+        assert_eq!(restored.unwrap().unwrap().requested, 0);
+    }
+
+    #[test]
+    fn resume_restores_nothing_if_the_ec_already_had_the_fan() {
+        let root = fixture("sleep-unheld");
+        let l = lease(&root);
+
+        assert_eq!(l.release_for_sleep(), None);
+        assert!(l
+            .restore_after_resume(Some(IDLE_C), real_ceiling())
+            .is_none());
+        assert_eq!(enable(&root), "2");
+    }
+
+    #[test]
+    fn resume_re_clamps_rather_than_restoring_the_raw_duty() {
+        // Woken warmer than it slept: the restored duty must obey the floor at the
+        // temperature read *after* the wake, not the one from before the sleep.
+        let root = fixture("sleep-warm");
+        let l = lease(&root);
+        l.set_duty(0, Some(IDLE_C), real_ceiling()).unwrap();
+        l.release_for_sleep();
+
+        let applied = l
+            .restore_after_resume(Some(HOT_C), real_ceiling())
+            .unwrap()
+            .unwrap();
+        assert!(applied.clamped(), "{applied:?}");
+        assert!(applied.target >= 78, "{applied:?}");
+    }
+
+    #[test]
+    fn asking_for_ec_control_cancels_a_pending_restore() {
+        let root = fixture("sleep-cancel");
+        let l = lease(&root);
+        l.set_duty(120, Some(IDLE_C), real_ceiling()).unwrap();
+        l.release_for_sleep();
+        l.release().unwrap();
+
+        assert!(l
+            .restore_after_resume(Some(IDLE_C), real_ceiling())
+            .is_none());
+        assert_eq!(enable(&root), "2");
     }
 
     #[test]

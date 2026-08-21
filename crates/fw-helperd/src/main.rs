@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("listening on {BUS_NAME} at {OBJECT_PATH}");
 
     let resumed = Arc::new(AtomicBool::new(false));
-    logind::watch_resume(&conn, Arc::clone(&resumed)).await;
+    logind::watch_sleep(&conn, Arc::clone(&resumed), Arc::clone(&lease)).await;
 
     let poll = tokio::spawn(poll_loop(
         conn.clone(),
@@ -112,6 +112,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shut_down_fan(&lease, &watchdog);
     poll.abort();
     Ok(())
+}
+
+/// Take the fan back after a resume, if it was ours before the sleep.
+///
+/// Runs on the first tick after waking, with telemetry sampled *after* the wake, so
+/// the floor and ceiling reflect the machine as it is now rather than as it was when
+/// it went down.
+fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
+    let celsius = sample.control_temp().map(|t| t.celsius);
+    let ceiling = fan::ceiling_for(sample.control_temp().and_then(|t| t.critical));
+
+    match lease.restore_after_resume(celsius, ceiling) {
+        None => {}
+        Some(Ok(applied)) if applied.clamped() => eprintln!(
+            "fan: restored after resume at duty {}/255, raised from the requested {} \
+             by the firmware floor",
+            applied.settled, applied.requested
+        ),
+        Some(Ok(applied)) => eprintln!(
+            "fan: restored manual control after resume at duty {}/255",
+            applied.settled
+        ),
+        // Refusing to restore is a legitimate outcome, not a failure: waking too hot,
+        // or with no readable sensor, are both reasons the fan should stay firmware's.
+        Some(Err(e)) => eprintln!("fan: not restoring manual control after resume: {e}"),
+    }
 }
 
 /// One tick of fan governance: learn what firmware does, and hold ourselves to it.
@@ -281,6 +307,7 @@ async fn poll_loop(
     };
 
     let started = std::time::Instant::now();
+    let mut restore_fan_after_resume = false;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
@@ -296,6 +323,10 @@ async fn poll_loop(
         if resumed.swap(false, Ordering::SeqCst) {
             mon.on_resume();
             eprintln!("resumed from sleep; energy reference invalidated");
+            // The fan is restored below rather than here, on the freshly sampled
+            // telemetry: the machine may have woken warmer than it slept, and the
+            // floor must be computed from temperatures read after the wake.
+            restore_fan_after_resume = true;
             // Firmware commonly resets the charge threshold across suspend.
             if let Ok(guard) = conn
                 .object_server()
@@ -307,6 +338,9 @@ async fn poll_loop(
         }
 
         let sample = mon.sample();
+        if std::mem::take(&mut restore_fan_after_resume) {
+            restore_fan(&lease, &sample);
+        }
         govern_fan(&lease, &sample);
 
         let mut guard = iface_ref.get_mut().await;
