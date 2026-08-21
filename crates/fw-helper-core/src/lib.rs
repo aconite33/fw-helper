@@ -8,6 +8,7 @@ pub mod caps;
 pub mod charge;
 pub mod energy;
 pub mod fan;
+pub mod floor;
 pub mod sysfs;
 pub mod telemetry;
 
@@ -15,6 +16,7 @@ pub use caps::{Cap, Capabilities};
 pub use charge::{ChargeControl, ChargeError};
 pub use energy::EnergySampler;
 pub use fan::{FanControl, FanError, FanMode};
+pub use floor::{FirmwareFloor, STICTION_DUTY};
 pub use sysfs::Sysfs;
 pub use telemetry::{Monitor, Telemetry};
 

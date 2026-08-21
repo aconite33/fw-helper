@@ -235,14 +235,14 @@ fn release_is_idempotent() {
 }
 
 #[test]
-fn a_dangerous_takeover_duty_never_reaches_hardware() {
+fn a_duty_that_cannot_turn_the_fan_never_reaches_hardware() {
     let f = Fixture::framework_13("fan-unsafe");
     let fs = f.sysfs();
     let fan = FanControl::new(&fs, EC);
 
     assert!(matches!(
         fan.take_manual(MIN_TAKEOVER_DUTY - 1),
-        Err(FanError::UnsafeTakeoverDuty(_))
+        Err(FanError::DutyCannotTurnFan(_))
     ));
     // The refusal must happen before any write: the fan is still the EC's.
     assert_eq!(raw(&f, &format!("{EC}/pwm1_enable")), "2");

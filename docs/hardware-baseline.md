@@ -72,11 +72,31 @@ these were assumptions before this run, and two of them were wrong.
 - **The EC reclaims cleanly and promptly**, confirming Q4 on a second occasion: fan went
   to 0 rpm within 4 s of release, at 41 °C.
 
-Duty→RPM scale points, useful for curve design (all under manual control):
+#### Duty → RPM, measured
 
-| Duty | 120/255 (47%) | 160/255 (63%) | 181/255 (71%) |
-|---|---|---|---|
-| RPM | 3795 | 4681 | 5041 |
+Full sweep 2026-08-21 at ~39 °C, descending from 180 so the fan never had to start
+from rest at a duty below stiction, 8 s settling per point. This is the table the
+firmware-floor clamp inverts.
+
+| Duty | 0 | 20 | 30 | 40 | 50 | 65 | 77 | 90 | 100 | 120 | 150 | 180 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| RPM | 0 | **0** | 1107 | 1512 | 1879 | 2296 | 2693 | 3052 | 3355 | 3840 | 4551 | 5201 |
+
+Two things matter here and neither was guessable:
+
+- **Stiction sits between 20 and 30.** Duty 20 leaves the fan stopped; duty 30 turns it
+  at 1107 rpm. Any duty in 1–29 is a stopped fan wearing a costume, which is why
+  `STICTION_DUTY` exists and why a "quiet" setting of 25 must be refused rather than
+  accepted and ignored.
+- **The curve is concave, not affine.** A linear fit through the three high points
+  measured earlier (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty
+  77. The real answer is ~85. Extrapolating that fit would have set the floor *below*
+  firmware — the one direction that matters. Interpolate within the table; do not fit
+  a line to it.
+
+The table is also slightly **optimistic under load**: at 65.8 °C, duty 84 produced
+2808 rpm where the table predicts ~2886. Hence the small margin added to every
+non-zero floor duty.
 
 Also `hwmon1` (`acpi_fan`) exposes `fan1_input` / `fan1_target` / `power1_input` (read-only view).
 `hwmon10` is `coretemp` (per-core die temps).

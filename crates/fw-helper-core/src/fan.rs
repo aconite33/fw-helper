@@ -39,17 +39,19 @@ use std::fmt;
 pub const PWM_MANUAL: u64 = 1;
 pub const PWM_AUTO: u64 = 2;
 
-/// Lowest duty [`FanControl::take_manual`] accepts.
+/// Lowest duty [`FanControl::take_manual`] accepts, other than zero.
 ///
-/// Taking control is the one moment we are guaranteed to be writing a duty the EC
-/// did not choose, before any curve has had a chance to evaluate. Starting with
-/// airflow and letting the curve ramp *down* is safe in a way that the reverse is
-/// not — the same reasoning as the `fw-probe.sh` write test's "spin up, never down".
-/// ~30% of full scale; baseline Q4 measured 63% ≈ 4681 rpm.
+/// This is a **mechanical** limit, not a thermal one: measured on hardware, duty 20
+/// leaves the fan stopped and duty 30 turns it at 1107 rpm. Anything between is a
+/// stopped fan wearing a costume, and accepting it would mean reporting a running fan
+/// that is not running. Zero is allowed and means exactly what it says.
 ///
-/// This is a floor on *takeover*, not on running duty. Once the firmware-floor clamp
-/// lands, the curve may go below it — bounded by what the EC itself would do.
-pub const MIN_TAKEOVER_DUTY: u8 = 77;
+/// **It is not a safety floor.** Nothing here knows the temperature, so nothing here
+/// can decide what is safe. That is [`crate::FirmwareFloor`]'s job, and the caller is
+/// responsible for clamping before calling in. An earlier version of this module
+/// enforced a flat 77/255 here, which was both too loud to allow a silent idle and no
+/// guarantee at all under load.
+pub const MIN_TAKEOVER_DUTY: u8 = crate::floor::STICTION_DUTY;
 
 /// How far the EC's reported duty may sit from what we asked for before it counts
 /// as a rejected write.
@@ -104,8 +106,8 @@ impl fmt::Display for FanMode {
 pub enum FanError {
     /// No `cros_ec` hwmon node, or one without `pwm1_enable`.
     Unsupported,
-    /// A takeover duty low enough to be dangerous rather than merely quiet.
-    UnsafeTakeoverDuty(u8),
+    /// A duty that cannot turn the fan, and is not zero.
+    DutyCannotTurnFan(u8),
     /// Asked to set a duty while the EC still owns the fan. Writing `pwm1` here
     /// would be silently ignored, which would read as a working control that does
     /// nothing.
@@ -139,11 +141,11 @@ impl fmt::Display for FanError {
                 "fan control unavailable; no cros_ec hwmon node with pwm1_enable \
                  (is cros_ec_hwmon loaded?)"
             ),
-            Self::UnsafeTakeoverDuty(d) => write!(
+            Self::DutyCannotTurnFan(d) => write!(
                 f,
-                "refusing to take manual fan control at duty {d}/255; \
-                 {MIN_TAKEOVER_DUTY} is the minimum takeover duty, because the fan \
-                 must start with airflow and ramp down, never the reverse (ADR 0006)"
+                "duty {d}/255 cannot turn the fan: measured, duty 20 gives 0 rpm and \
+                 duty {MIN_TAKEOVER_DUTY} gives 1107 rpm. Use 0 for a stopped fan, or \
+                 at least {MIN_TAKEOVER_DUTY} for a turning one"
             ),
             Self::NotUnderManualControl(mode) => write!(
                 f,
@@ -260,8 +262,8 @@ impl<'a> FanControl<'a> {
     pub fn take_manual(&self, duty: u8) -> Result<u8, FanError> {
         // Range before support, so a bad duty reports as a bad duty even on a machine
         // that has no fan control at all.
-        if duty < MIN_TAKEOVER_DUTY {
-            return Err(FanError::UnsafeTakeoverDuty(duty));
+        if duty > 0 && duty < MIN_TAKEOVER_DUTY {
+            return Err(FanError::DutyCannotTurnFan(duty));
         }
         if !self.is_supported() {
             return Err(FanError::Unsupported);
@@ -372,18 +374,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refuses_a_dangerous_takeover_duty_before_checking_support() {
+    fn refuses_a_duty_that_cannot_turn_the_fan() {
         let fs = Sysfs::new("/nonexistent");
         let c = FanControl::new(&fs, "sys/class/hwmon/hwmon7");
-        // A low duty must report as a low duty, not as missing hardware.
-        assert!(matches!(
-            c.take_manual(0),
-            Err(FanError::UnsafeTakeoverDuty(0))
-        ));
+        // Reported as a bad duty, not as missing hardware: the check runs before the
+        // support probe so a typo reads as a typo.
         assert!(matches!(
             c.take_manual(MIN_TAKEOVER_DUTY - 1),
-            Err(FanError::UnsafeTakeoverDuty(_))
+            Err(FanError::DutyCannotTurnFan(_))
         ));
+        // Zero is a legitimate request: it is what the EC itself does below ~45 C.
+        assert!(matches!(c.take_manual(0), Err(FanError::Unsupported)));
     }
 
     #[test]
@@ -438,12 +439,11 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_duty_error_explains_the_asymmetry() {
-        // This message is the only place a user learns why a quiet setting was
-        // refused, so assert it says something useful.
-        let msg = FanError::UnsafeTakeoverDuty(10).to_string();
-        assert!(msg.contains("ramp down"), "got: {msg}");
-        assert!(msg.contains("ADR 0006"), "got: {msg}");
+    fn stiction_error_names_both_valid_choices() {
+        // A user told "no" must be told what "yes" looks like.
+        let msg = FanError::DutyCannotTurnFan(10).to_string();
+        assert!(msg.contains("Use 0"), "got: {msg}");
+        assert!(msg.contains("0 rpm"), "got: {msg}");
     }
 
     #[test]

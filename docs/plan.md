@@ -263,9 +263,32 @@ The highest-value and highest-risk feature. Do not shortcut
         without a guard the fan would be handed to a daemon that is not minding it, taken
         back by the watchdog 5 s later, and handed over again on the next call. Verified:
         `refusing manual fan control: this daemon's telemetry loop has not run for 7s`
-  - firmware-floor clamp (never quieter than the EC would be)
-  - `temp*_crit`-derived ceiling override, with sanity validation
-  - refuse manual control if the sensor is unreadable
+  - [x] **firmware-floor clamp** (`fw-helper-core/src/floor.rs`, 2026-08-21). The EC's
+        curve cannot be read, so it is reconstructed by composing two measured tables:
+        what firmware does at a temperature (RPM), and what a duty produces (RPM). The
+        duty→RPM sweep was run specifically for this — the three points known before
+        were all at the high end, and a line through them put 2925 rpm at duty 77 when
+        the real answer is ~85, which would have set the floor *below* firmware.
+        `observe()` raises the floor from live EC behaviour, which is what closes the
+        large gap the static table has across the knee (44.9 → 53.9 °C).
+        **Enforced every poll tick, not only when a duty is requested** — clamping at
+        request time protects nothing, since a duty chosen at idle becomes stuck-low the
+        moment the machine is loaded.
+        **Verified on hardware**: asked for a *stopped* fan at 36.9 °C (permitted, since
+        firmware is also silent there), then 16 cores of load. The daemon walked the duty
+        0 → 31 → … → 92 as the machine reached 74.8 °C, and back down to 0 at 44.9 °C.
+        Against firmware's own measured curve: 2280 rpm at 53.9 °C (EC: 2020), 3024 at
+        64.8 °C (EC: 2925), 3202 at ~75 °C (EC: 3100 at 76.8).
+        The first run **failed this comparison** at 2808 rpm vs the EC's 2925, because
+        enforcement judged "are we below the floor" against the hardware's quantized
+        read-back with `DUTY_TOLERANCE` of slack — so a real three-count deficit hid
+        inside a tolerance meant for verifying writes. Decisions are now compared
+        exactly, and drift against hardware separately. Unit tests did not catch this;
+        comparing against measured firmware behaviour did
+  - [ ] `temp*_crit`-derived ceiling override, with sanity validation
+  - [x] **refuse manual control if the sensor is unreadable** (point 6). No temperature
+        means no floor, and no floor means an unbounded duty. Losing the sensor *while*
+        holding the fan hands it back to firmware, which has its own sensors
 - Fan control reached over D-Bus (`SetFanDuty` / `SetFanAuto`, polkit action
   `org.fwhelper.set-fan`) and from `fw-helperctl fan <duty|auto>`. **This is not a
   curve** — it pins one duty with no temperature feedback. A flat `MIN_DUTY` floor of

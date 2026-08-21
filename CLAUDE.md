@@ -99,9 +99,27 @@ That test also produced the zbus row in the traps table, and with it a guard: ma
 control is **refused on a stale heartbeat**, because D-Bus survives a wedged runtime and
 would otherwise hand the fan to a daemon that is not minding it.
 
-Next: the **firmware-floor clamp** (ADR 0006 point 4) and the `temp*_crit` ceiling
-(point 5), which are what let `MIN_DUTY` go away. Only then does a curve become
-user-editable. ADR 0006 is not negotiable.
+**The firmware-floor clamp is done and hardware-verified** (`fw-helper-core/src/floor.rs`).
+The EC's curve cannot be read, so it is reconstructed by composing two measured tables —
+what firmware does at a temperature, and what a duty produces — and inverted to answer
+"what duty must we hold to be at least as fast as firmware right now". `observe()` raises
+it from live EC behaviour, closing the gap the static table has across the knee.
+
+**It is enforced every poll tick, not at request time.** Clamping only when a duty is
+requested protects nothing: a duty chosen at idle is safe when chosen and stuck-low a
+minute later. `fw-helperctl fan 0` at idle is now legitimate — firmware is silent below
+~45 °C too, and that silence is most of why anyone wants this.
+
+Verified under 16-core load: duty walked 0 → 92 as the machine reached 74.8 °C and back to
+0 at 44.9 °C, staying above firmware's own measured curve at every point. **The first run
+failed that comparison** (2808 rpm where the EC does 2925) because enforcement judged
+"below the floor?" against the quantized read-back with `DUTY_TOLERANCE` of slack, hiding a
+real deficit inside a tolerance meant for verifying writes. Decisions are compared exactly
+now; drift against hardware separately. Unit tests were happy throughout — only comparing
+against measured firmware behaviour caught it.
+
+Next: the **`temp*_crit` ceiling override** (ADR 0006 point 5), then the curve engine.
+ADR 0006 is not negotiable.
 
 **`fw-helperctl fan` is not a curve.** It pins one duty with no temperature feedback.
 The flat 77/255 floor is a placeholder for the firmware-floor clamp — replace it with
@@ -135,7 +153,7 @@ sudo ./scripts/install-dev.sh --uninstall
 sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 sudo pkill -x fw-helperd
 fw-helperctl status | watch [secs] | charge-limit N
-fw-helperctl fan 180 | fan auto            # manual duty 77-255; 'auto' returns it to the EC
+fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the firmware floor
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey
@@ -193,6 +211,8 @@ All of these cost real time once. Do not rediscover them.
 | **polkit `AllowUserInteraction` hangs forever** | When no authentication agent can service the caller — any process without `XDG_SESSION_ID`. Check without interaction first, then bound the interactive call |
 | `pwm1` write while `pwm1_enable=2` | **`EOPNOTSUPP`**, not silently ignored. The duty cannot be pre-loaded before taking control, so the takeover window is real — keep the mode switch and first duty write adjacent |
 | Fan duty read-back ≠ what you wrote | The EC stores whole percent: write 180, read 181. Verify with `DUTY_TOLERANCE`, not equality. `pwm1` is also zeroed a few seconds *after* release, so it never tells you who owns the fan — read `pwm1_enable` |
+| Fan duty→RPM is **concave** | A line through the high points (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty 77; the measured answer is ~85. Fitting a line would set the firmware floor *below* firmware. Interpolate the measured table |
+| Fan stiction is between duty 20 and 30 | Duty 20 = 0 rpm, duty 30 = 1107 rpm. A duty of 1–29 is a stopped fan, not a slow one. Refuse it; do not accept and ignore it |
 | **zbus does not run on the tokio runtime** | With default features zbus 5 uses its own `async-io` executor. Blocking every tokio worker leaves D-Bus answering normally with stale telemetry, so "the daemon is wedged" is not all-or-nothing. Never infer daemon health from the interface responding |
 | **Stale binary on PATH** | Bit us twice, both times looking like a broken daemon. `install-dev.sh` now installs a shim resolving the newest build per invocation. Still: build release *and* debug |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |

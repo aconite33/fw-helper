@@ -17,7 +17,7 @@ USAGE:
     fw-helperctl status          capabilities and one telemetry sample
     fw-helperctl watch [secs]    live telemetry, 1 Hz (default 10s)
     fw-helperctl charge-limit N  set the battery charge limit (20-100)
-    fw-helperctl fan N           pin the fan at duty N (77-255)
+    fw-helperctl fan N           pin the fan at duty N (0, or 30-255)
     fw-helperctl fan auto        hand the fan back to the EC
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
@@ -92,6 +92,16 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
                 println!("                     EC curve is not running; 'fw-helperctl fan auto' restores it");
             }
             _ => println!("  fan                {r} rpm  (EC automatic)"),
+        }
+        // The floor moves with temperature, so show it: it is the reason a request
+        // may be raised, and a number the user can act on.
+        match s.fan_floor {
+            Some(0) => println!("  fan floor          0/255 (firmware would have the fan off)"),
+            Some(255) => println!("  fan floor          255/255 (no temperature readable)"),
+            Some(f) => {
+                println!("  fan floor          {f}/255 (firmware would be at least this fast)")
+            }
+            None => {}
         }
     }
     if let Some(p) = &s.platform_profile {
@@ -236,7 +246,12 @@ fn fan(arg: Option<&str>) {
         Ok(settled) => {
             let percent = (f64::from(settled) * 100.0 / 255.0).round();
             println!("fan pinned at duty {settled}/255 ({percent:.0}%)");
-            if settled != duty {
+            // Two quite different reasons the number can come back changed, and the
+            // user needs to be able to tell them apart.
+            if settled > duty.saturating_add(3) {
+                println!("  raised from {duty}: the firmware floor at the current");
+                println!("  temperature is higher, and we never run slower than the EC would");
+            } else if settled != duty {
                 println!("  (asked for {duty}; the EC stores whole percent)");
             }
             println!("  'fw-helperctl fan auto' returns control to the EC");

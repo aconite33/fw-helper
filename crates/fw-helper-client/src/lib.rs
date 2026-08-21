@@ -39,8 +39,13 @@ pub trait Daemon {
     #[zbus(property)]
     fn fan_duty(&self) -> zbus::Result<u8>;
 
-    /// Pin the fan at `duty` (0-255), returning what the EC settled on. Not a curve:
-    /// there is no temperature feedback. May prompt via polkit.
+    /// Lowest duty permitted right now. 0 means the EC would have the fan off, so
+    /// silence is allowed; 255 means no temperature could be read.
+    #[zbus(property)]
+    fn fan_floor(&self) -> zbus::Result<u8>;
+
+    /// Pin the fan at `duty` (0-255), returning what the EC settled on after being
+    /// clamped up to the firmware floor. May prompt via polkit.
     fn set_fan_duty(&self, duty: u8) -> zbus::Result<u8>;
 
     /// Hand the fan back to the EC. May prompt via polkit.
@@ -97,6 +102,9 @@ pub struct Snapshot {
     pub fan_mode: Option<String>,
     /// Duty 0-255. Only meaningful when `fan_mode` is `manual`.
     pub fan_duty: Option<u8>,
+    /// Lowest duty permitted at the current temperature, so a client can explain a
+    /// slider that will not go lower instead of appearing to ignore the user.
+    pub fan_floor: Option<u8>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -135,6 +143,7 @@ impl Snapshot {
             charge_limit: d.charge_limit().ok().filter(|v| *v > 0),
             fan_mode: d.fan_mode().ok(),
             fan_duty: d.fan_duty().ok(),
+            fan_floor: d.fan_floor().ok(),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

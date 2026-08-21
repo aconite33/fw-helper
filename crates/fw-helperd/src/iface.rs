@@ -64,6 +64,11 @@ impl Daemon {
         }
     }
 
+    /// The temperature a fan decision should be based on, if any sensor is readable.
+    fn control_celsius(&self) -> Option<f64> {
+        self.latest.control_temp().map(|t| t.celsius)
+    }
+
     /// Authorize a caller for one action, or say why not.
     ///
     /// Every hardware-touching method starts here. Factored out because the sequence
@@ -222,16 +227,30 @@ impl Daemon {
         self.fan.duty().unwrap_or(0)
     }
 
+    /// The lowest duty permitted right now, given the temperature.
+    ///
+    /// Published so a client can show the user why a slider will not go lower, rather
+    /// than appearing to ignore them. 0 means the EC would have the fan off, so
+    /// silence is allowed.
+    #[zbus(property)]
+    async fn fan_floor(&self) -> u8 {
+        match self.control_celsius() {
+            Some(c) => self.fan.floor_duty(c),
+            None => u8::MAX,
+        }
+    }
+
     /// Take manual fan control and hold `duty` (0-255).
     ///
     /// Returns the duty the EC actually settled on, which may differ by a count or
     /// two: the EC stores whole percent, so 180 comes back as 181.
     ///
-    /// **This is not a fan curve.** It pins one duty until something changes it, with
-    /// no temperature feedback whatsoever, and the safety layers that make a curve
-    /// safe to expose (firmware-floor clamp, critical-temperature override, watchdog)
-    /// are not built yet. The flat `MIN_DUTY` floor is what stands in for them, and it
-    /// is a poor substitute - see `fan::MIN_DUTY`.
+    /// **This is not a fan curve.** It pins one duty rather than following
+    /// temperature. What it is not, any more, is unbounded: the duty is clamped up to
+    /// the firmware floor for the current temperature, and that floor is re-enforced
+    /// every poll tick, so a duty chosen at idle cannot stay put while the machine
+    /// heats up. A request below the floor is honoured as far as the floor allows and
+    /// the difference is logged rather than silently swallowed.
     async fn set_fan_duty(
         &self,
         duty: u8,
@@ -263,13 +282,28 @@ impl Daemon {
 
         let sender = Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
 
-        let settled = self
+        // The temperature the floor is computed against comes from the same telemetry
+        // the daemon publishes, and the staleness check above is what makes it
+        // trustworthy enough to base a safety decision on.
+        let celsius = self.control_celsius();
+        let applied = self
             .fan
-            .set_duty(duty)
+            .set_duty(duty, celsius)
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        eprintln!("fan set to duty {settled}/255 by {sender}");
-        Ok(settled)
+        if applied.clamped() {
+            eprintln!(
+                "fan: {sender} asked for duty {}/255; raised to {} to stay at or above \
+                 the firmware floor ({}/255 at {:.1} C)",
+                applied.requested,
+                applied.settled,
+                applied.floor,
+                celsius.unwrap_or(f64::NAN)
+            );
+        } else {
+            eprintln!("fan set to duty {}/255 by {sender}", applied.settled);
+        }
+        Ok(applied.settled)
     }
 
     /// Hand the fan back to the EC.

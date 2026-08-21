@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Monitor::new(fs),
         resumed,
         Arc::clone(&watchdog),
+        Arc::clone(&lease),
     ));
 
     // Shut down cleanly on either signal, and hand the fan back before doing anything
@@ -111,6 +112,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shut_down_fan(&lease, &watchdog);
     poll.abort();
     Ok(())
+}
+
+/// One tick of fan governance: learn what firmware does, and hold ourselves to it.
+///
+/// Two halves, and which one runs depends on who owns the fan:
+///
+/// - **EC owns it:** record what firmware is actually doing at this temperature. The
+///   static floor table has only four points and a large gap right across the knee,
+///   so this is what turns a model into a measurement.
+/// - **We own it:** re-enforce the floor. This is the half that matters. Clamping only
+///   when a duty is requested protects nothing — a duty chosen at idle is safe when it
+///   is chosen and becomes stuck-low as soon as the machine is loaded.
+fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
+    let celsius = sample.control_temp().map(|t| t.celsius);
+
+    if !lease.held() {
+        if let (Some(c), Some(rpm)) = (celsius, sample.fan_rpm) {
+            lease.observe(c, rpm);
+        }
+        return;
+    }
+
+    match lease.enforce_floor(celsius) {
+        None => {}
+        // Re-asserting the same duty is a real write but not news. It happens because
+        // the EC quantizes: a target of 88 settles at 89, so next tick's target of 89
+        // is a genuine change of decision that moves nothing.
+        Some(fan::Enforced::Corrected { from, to, .. }) if from == to => {}
+        Some(fan::Enforced::Corrected {
+            from,
+            to,
+            floor,
+            celsius,
+        }) => eprintln!(
+            "fan: {celsius:.1} C puts the firmware floor at {floor}/255; moved {from} -> {to}"
+        ),
+        Some(fan::Enforced::ReleasedNoSensor { released }) => eprintln!(
+            "fan: temperature became unreadable while under manual control; \
+             returned to EC control: {released}"
+        ),
+        Some(fan::Enforced::Failed(e)) => {
+            eprintln!("fan: could not enforce the firmware floor: {e}")
+        }
+    }
 }
 
 /// Fault injection for the watchdog, off unless `FW_HELPERD_DEBUG_WEDGE_AFTER` is set
@@ -212,6 +257,7 @@ async fn poll_loop(
     mut mon: Monitor,
     resumed: Arc<AtomicBool>,
     watchdog: Arc<watchdog::Watchdog>,
+    lease: Arc<fan::FanLease>,
 ) {
     let iface_ref = match conn
         .object_server()
@@ -252,6 +298,8 @@ async fn poll_loop(
         }
 
         let sample = mon.sample();
+        govern_fan(&lease, &sample);
+
         let mut guard = iface_ref.get_mut().await;
         if guard.update(sample) {
             let emitter = iface_ref.signal_emitter();
