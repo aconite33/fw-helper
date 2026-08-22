@@ -12,6 +12,9 @@ name = "fw-helper"
 path = "src/main.rs"
 
 [dependencies]
+# Depended on for the curve validator: the editor must reject exactly what the daemon
+# rejects, and a second implementation of "valid" would drift from the first.
+fw-helper-core = { path = "../fw-helper-core" }
 fw-helper-client = { path = "../fw-helper-client" }
 async-channel = "2"
 zbus = { version = "5.13.2", default-features = false }

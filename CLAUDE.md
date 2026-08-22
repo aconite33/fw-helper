@@ -22,17 +22,15 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M3 — fan control | **complete**: all six ADR 0006 safety points and the curve engine verified on hardware |
 | M4 — power limits | PL1 control complete and verified (15 W setpoint → 15.02 W sustained) |
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
-| M7 | planned; every mechanism pre-verified |
-| M6 — GUI | controls land: profile, save/delete, power limit, charge limit, fan release, auto-switching. Curve editing outstanding |
+| M6 — GUI | **complete**: profile, save/delete, power limit, charge limit, fan release, auto-switching, and the fan curve editor in a two-column adaptive window |
 | M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
-### Resume here — the curve editor
+### Resume here
 
-Last session ended 2026-08-22. M0–M5 and M7 are complete and hardware-verified. M6 has
-working controls; the curve editor is the last real feature.
+Last session ended 2026-08-22. **M0–M7 are complete and hardware-verified.**
 
 **The package is verified.** It installs, the daemon starts and serves all five
 capabilities, **fw-helper launches from the GNOME app grid**, and `apt remove` returns the
@@ -40,19 +38,24 @@ fan to the EC (`pwm1_enable=2`, checked directly). Two defects were found and fi
 it: the GUI left every control live-looking while disconnected, and the postinst inferred
 charge-control setup from a runtime sysfs node that can outlive its drop-in.
 
-**The machine is currently bare again** — the removal test left the package in `rc` state,
-so there is no daemon. Reinstall with `sudo dpkg -i fw-helper_0.0.1_amd64.deb`.
-`/var/lib/fw-helper/state` survives, so profiles and the learned fan floor are intact.
-The modprobe drop-in is **not** installed: charge control still works only because the
-module holds the parameter from a boot on 2026-08-21, and it dies at the next reboot until
-`sudo fw-helper-enable-charge-control` runs.
+**The machine has the package installed** and the daemon running the same binary as
+`target/release`. The modprobe drop-in is **not** installed, though: charge control works
+only because the module has held the parameter since a boot on 2026-08-21, and it dies at
+the next reboot until `sudo fw-helper-enable-charge-control` runs. Reinstalling after a
+rebuild needs `dpkg -i` — `apt install` no-ops on an unchanged version.
 
-**The fan curve editor**, the last real M6 feature. Everything under it exists — the
-curve engine validates, the daemon accepts a curve over D-Bus, and `fw-helperctl fan curve
-55:0,70:65` works. What is missing is a way to draw one. The measurements that should shape
-it are in `docs/hardware-baseline.md`: the useful range is duty 30 (stiction, 1107 rpm) to
-about 100, the interesting temperatures are 45–85 °C, and the win is on the way *down*
-rather than up.
+**The fan curve editor landed.** A read-only plot over a row per point, in the right-hand
+column of a two-column window that collapses to one below 800 px. The plot draws the
+learned firmware floor as a shaded band, which is the thing that decides whether a point
+has any effect: `FanFloorCurve` was added to D-Bus for it. Editing is by rows, not by
+dragging — they are keyboard-reachable and cannot express a curve the daemon would refuse,
+since the editor validates with `fw_helper_core::Curve` itself.
+
+What it has **not** had is a curve drawn in the GUI and then checked against the fan under
+load. Draw one, apply it, put the machine under load, and confirm `fw-helperctl status`
+and the fan agree with the plot — especially on the way *down*, which is where a custom
+curve wins (firmware holds duty 50–90 to 44.9 °C). The floor band will look empty until the
+daemon has watched the EC's ascending branch for a while; that is honest, not a drawing bug.
 
 **Testing discipline, which this project keeps proving the hard way.** Roughly a dozen
 defects across two sessions were invisible to unit tests and appeared only on hardware or in

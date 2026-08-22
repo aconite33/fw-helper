@@ -31,6 +31,7 @@ pub enum Command {
     PowerLimit(u32),
     ChargeLimit(u8),
     FanAuto,
+    FanCurve(Vec<(f64, u8)>),
     AutoProfiles(String, String),
     SaveProfile(String),
     DeleteProfile(String),
@@ -46,7 +47,7 @@ impl Command {
             Self::Profile(_) => "profile",
             Self::PowerLimit(_) => "power",
             Self::ChargeLimit(_) => "charge",
-            Self::FanAuto => "fan",
+            Self::FanAuto | Self::FanCurve(_) => "fan",
             Self::AutoProfiles(..) => "auto",
             // Saving and deleting change the profile *list* rather than a control's
             // value, so there is nothing to hold and confirm.
@@ -88,6 +89,16 @@ fn spawn_commands(tx: async_channel::Sender<Update>) -> std::sync::mpsc::Sender<
                         .set_fan_auto()
                         .map(|_| "fan returned to EC control".to_string())
                         .map_err(describe),
+                    Command::FanCurve(points) => {
+                        let n = points.len();
+                        d.set_fan_curve(points)
+                            // The daemon answers with the duty the curve asks for at
+                            // the current temperature, which is the useful thing to
+                            // report back: it says what the curve does *now* rather
+                            // than merely that it was accepted.
+                            .map(|duty| format!("curve of {n} points applied, duty {duty}/255 now"))
+                            .map_err(describe)
+                    }
                     Command::SaveProfile(name) => d
                         .save_profile(&name)
                         .map(|path| format!("saved {name} to {path}"))

@@ -109,6 +109,13 @@ pub trait Daemon {
     #[zbus(property(emits_changed_signal = "false"))]
     fn fan_curve(&self) -> zbus::Result<Vec<(f64, u8)>>;
 
+    /// The learned firmware floor across the temperature range, ascending.
+    ///
+    /// Grows as the machine is used, so it must not be cached for the life of the
+    /// proxy - hence `emits_changed_signal = "false"` like everything else here.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn fan_floor_curve(&self) -> zbus::Result<Vec<(f64, u8)>>;
+
     /// Follow a temperature → duty curve. May prompt via polkit.
     fn set_fan_curve(&self, points: Vec<(f64, u8)>) -> zbus::Result<u8>;
 }
@@ -168,6 +175,9 @@ pub struct Snapshot {
     pub fan_floor: Option<u8>,
     /// The active curve, empty when the fan is pinned or firmware owns it.
     pub fan_curve: Vec<(f64, u8)>,
+    /// The firmware floor across the range, so an editor can draw what a curve is
+    /// competing with rather than only what it asks for. Empty until observed.
+    pub fan_floor_curve: Vec<(f64, u8)>,
     /// Sustained CPU power limit in watts, and the ceiling for it.
     pub power_limit: Option<u32>,
     pub power_limit_max: Option<u32>,
@@ -226,6 +236,7 @@ impl Snapshot {
             fan_duty: d.fan_duty().ok(),
             fan_floor: d.fan_floor().ok(),
             fan_curve: d.fan_curve().unwrap_or_default(),
+            fan_floor_curve: d.fan_floor_curve().unwrap_or_default(),
             power_limit: d.power_limit().ok().filter(|v| *v > 0),
             power_limit_max: d.power_limit_max().ok().filter(|v| *v > 0),
             profile: d.active_profile().ok().filter(|v| !v.is_empty()),

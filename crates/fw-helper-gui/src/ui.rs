@@ -52,6 +52,7 @@ struct Widgets {
     system_group: adw::PreferencesGroup,
     save_group: adw::PreferencesGroup,
     auto_group: adw::PreferencesGroup,
+    curve: Rc<crate::curve::CurveEditor>,
     // Controls. Each is refreshed from telemetry, which means every update would
     // otherwise look like the user operating it — see `settling`.
     profile_row: adw::ComboRow,
@@ -185,25 +186,60 @@ pub fn build(app: &adw::Application) {
         .description("What this machine exposes. Unavailable items say why.")
         .build();
 
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
+    // Started before the window is assembled so the curve editor can be handed a
+    // command sender at construction. The update channel is depth 1 and its send
+    // blocks, so nothing piles up in the moments before the receiver loop runs.
+    let (rx, commands) = worker::spawn();
+
+    let curve_editor = {
+        let tx = commands.clone();
+        crate::curve::CurveEditor::new(move |points| {
+            let _ = tx.send(worker::Command::FanCurve(points));
+        })
+    };
+
+    // Two columns split by role rather than by size: the left is what you set, the
+    // right is the fan and the readings it reacts to. The curve editor is the tallest
+    // thing in the window and the only one worth looking at while it updates, so
+    // burying it under four groups of controls made it the one feature you had to go
+    // hunting for.
+    let column = || {
+        gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build()
+    };
+    let left = column();
+    left.append(&stats);
+    left.append(&system_group);
+    left.append(&save_group);
+    left.append(&auto_group);
+
+    let right = column();
+    right.append(&curve_editor.group);
+    right.append(&sensors_group);
+    right.append(&caps_group);
+
+    let columns = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
         .spacing(18)
+        .homogeneous(true)
         .margin_top(18)
         .margin_bottom(18)
         .margin_start(18)
         .margin_end(18)
         .build();
-    content.append(&stats);
-    content.append(&system_group);
-    content.append(&save_group);
-    content.append(&auto_group);
-    content.append(&sensors_group);
-    content.append(&caps_group);
+    columns.append(&left);
+    columns.append(&right);
 
+    // One scroller around both, not one each. Two independent scroll areas side by
+    // side put two scrollbars in the window and leave the user guessing which one
+    // moves; the columns are close enough in length that scrolling them together
+    // costs nothing.
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
-        .child(&content)
+        .child(&columns)
         .build();
 
     let outer = gtk::Box::builder()
@@ -218,10 +254,35 @@ pub fn build(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(460)
-        .default_height(680)
+        .default_width(960)
+        .default_height(700)
+        // A window with breakpoints must declare how small it is willing to get, or
+        // libadwaita cannot know when a condition can be met - and says so, once per
+        // layout pass. 360 is the usual adaptive floor and sits below the 800 the
+        // breakpoint watches for, so the single-column layout is genuinely reachable.
+        .width_request(360)
+        .height_request(480)
         .content(&toolbar)
         .build();
+
+    // Landscape is the default because the machine this runs on is a laptop, but it is
+    // a preference, not a requirement: below this width the columns stack and the
+    // window is exactly the single column it was before. Homogeneous has to come off
+    // with the orientation, or stacking would force the two columns to equal heights.
+    match adw::BreakpointCondition::parse("max-width: 800px") {
+        Ok(condition) => {
+            let breakpoint = adw::Breakpoint::new(condition);
+            breakpoint.add_setter(
+                &columns,
+                "orientation",
+                Some(&gtk::Orientation::Vertical.to_value()),
+            );
+            breakpoint.add_setter(&columns, "homogeneous", Some(&false.to_value()));
+            window.add_breakpoint(breakpoint);
+        }
+        // A window that cannot adapt is worth having; one that refuses to open is not.
+        Err(e) => eprintln!("fw-helper: no responsive breakpoint ({e})"),
+    }
 
     // Nothing is operable until a snapshot says so. Building these live means the
     // window is briefly - or, with no daemon installed, permanently - a set of
@@ -260,9 +321,8 @@ pub fn build(app: &adw::Application) {
         system_group,
         save_group,
         auto_group,
+        curve: Rc::clone(&curve_editor),
     }));
-
-    let (rx, commands) = worker::spawn();
 
     // Controls send commands; they never touch hardware from the main loop.
     {
@@ -386,6 +446,9 @@ pub fn build(app: &adw::Application) {
                     if result.is_err() {
                         w.in_flight.remove(key);
                     }
+                    if key == "fan" {
+                        w.curve.applied(&result);
+                    }
                     let msg = match result {
                         Ok(msg) => {
                             trace(&format!("command ok: {msg}"));
@@ -416,6 +479,7 @@ fn expected(cmd: &Command) -> String {
         Command::PowerLimit(w) => w.to_string(),
         Command::ChargeLimit(v) => v.to_string(),
         Command::FanAuto => "auto".to_string(),
+        Command::FanCurve(_) => "curve".to_string(),
         Command::AutoProfiles(ac, batt) => format!("{ac}/{batt}"),
         Command::SaveProfile(name) | Command::DeleteProfile(name) => name.clone(),
     }
@@ -741,6 +805,7 @@ fn set_controls_live(w: &Widgets, live: bool) {
     w.system_group.set_sensitive(live);
     w.save_group.set_sensitive(live);
     w.auto_group.set_sensitive(live);
+    w.curve.set_live(live);
 }
 
 fn apply(w: &mut Widgets, s: &Snapshot) {
@@ -750,6 +815,7 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
     set_controls_live(w, true);
     w.sensors_group.set_sensitive(true);
     w.caps_group.set_sensitive(true);
+    w.curve.update(s);
 
     // Refresh the controls from the daemon. The signals this fires are suppressed by
     // the mutable borrow we are already holding - see the handlers.

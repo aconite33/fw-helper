@@ -753,6 +753,27 @@ impl Daemon {
         self.fan.curve_points().unwrap_or_default()
     }
 
+    /// The learned firmware floor as (temperature, duty) pairs, ascending, empty until
+    /// something has been observed.
+    ///
+    /// `FanFloor` answers "how low may I go *now*"; this answers it across the range,
+    /// which is what an editor needs to show the shape of a curve against the shape of
+    /// the thing that overrides it. A point drawn under this band is not ignored — it
+    /// is clamped up, every tick — and a user who cannot see the band has no way to
+    /// tell that from a bug.
+    ///
+    /// These are observations of the EC's **ascending** branch only (ADR 0011); the
+    /// descending branch runs far higher and says nothing about what a temperature
+    /// needs. The list grows as the machine is used, so it is not stable for the life
+    /// of a proxy — see the property-caching note on the client trait.
+    #[zbus(property)]
+    async fn fan_floor_curve(&self) -> Vec<(f64, u8)> {
+        self.fan
+            .floor_snapshot()
+            .map(|(_revision, points)| points)
+            .unwrap_or_default()
+    }
+
     /// Follow a temperature → duty curve.
     ///
     /// Points must ascend in temperature and must not fall in duty; a duty between 1
