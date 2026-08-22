@@ -3,3 +3,6 @@ Cargo.lock
 *.swp
 .idea/
 .vscode/
+
+# Built packages (scripts/build-deb.sh)
+*.deb

@@ -23,70 +23,73 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M4 — power limits | PL1 control complete and verified (15 W setpoint → 15.02 W sustained) |
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
 | M7 | planned; every mechanism pre-verified |
-| M6 — GUI | controls land: profile, power limit, charge limit, fan release, auto-switching. Curve editing outstanding |
+| M6 — GUI | controls land: profile, save/delete, power limit, charge limit, fan release, auto-switching. Curve editing outstanding |
+| M7 — packaging | `.deb` builds with auto-computed deps, desktop entry, opt-in charge control. **Install not yet verified** |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
-### Resume here — M5, profiles
+### Resume here — verify the package, then the curve editor
 
-Last session ended 2026-08-21 with M2, M3 and M4's PL1 control all complete and verified
-on hardware. The systemd unit is **installed and enabled**, so `fw-helperd` starts at boot
-(`sudo ./scripts/install-dev.sh --uninstall` reverses that).
+Last session ended 2026-08-22. M0–M5 are complete and hardware-verified. M6 has working
+controls and M7 has a `.deb` that builds but **has not been installed even once**.
 
-**What exists now.** Battery charge limit (M2). Fan control (M3): manual duty, a curve
-engine, and every safety layer in ADR 0006 — lease with restore on exit/signal/panic, the
-`ExecStopPost` crash binary, an independent watchdog, the firmware floor, the `temp*_crit`
-ceiling, and refusal without a sensor. Plus a battery guard and floor persistence. Power
-limits (M4): PL1 only. Read `docs/plan.md` for the per-item detail and evidence; every
-claim there names the measurement behind it.
+**Do this first.** `./scripts/build-deb.sh` produces `fw-helper_<version>_amd64.deb`;
+install it with `sudo apt install ./fw-helper_*.deb` and check three things nobody has
+checked: that it installs and starts, that **fw-helper launches from the GNOME app grid**
+rather than a terminal, and that `sudo apt remove fw-helper` returns the fan to the EC.
+The prerm stops the unit so `ExecStopPost` runs, but that is reasoning, not evidence.
 
-**Next: M5 — profiles.** Bundling PL1 with a fan curve into Quiet / Balanced /
-Performance, which is where the two compose: 10 W of power limit is worth ~12 °C, so the
-profile picks a power budget and the curve only has to cover what is left. Two constraints
-that are not negotiable:
+**The machine is currently bare.** `install-dev.sh --uninstall` ran, so there is no daemon
+installed and the modprobe drop-in is gone — the charge limit is inactive until
+`sudo fw-helper-enable-charge-control` (packaged) or `install-dev.sh --enable-charge-control`
+(dev). `/var/lib/fw-helper/state` survives, so profiles and the learned fan floor are intact.
 
-- **ADR 0005**: `platform_profile` and EPP belong to power-profiles-daemon. Delegate over
-  D-Bus, never write those paths. Last-writer-wins against the GNOME power slider is the
-  worst bug class here.
-- Profiles must compose the existing controls, not bypass them. The firmware floor, the
-  ceiling and the battery guard apply to a profile's curve exactly as they do to a
-  hand-set duty.
+**Then: the fan curve editor**, the last real M6 feature. Everything under it exists — the
+curve engine validates, the daemon accepts a curve over D-Bus, and `fw-helperctl fan curve
+55:0,70:65` works. What is missing is a way to draw one. The measurements that should shape
+it are in `docs/hardware-baseline.md`: the useful range is duty 30 (stiction, 1107 rpm) to
+about 100, the interesting temperatures are 45–85 °C, and the win is on the way *down*
+rather than up.
 
-**How this project has actually gone wrong, every time.** Six defects last session were
-invisible to unit tests and only appeared on hardware, and all six were the same mistake:
-a constant or a model chosen by reasoning rather than measurement. The EC quantizes duty
-to whole percent; a floor deficit hid inside a tolerance meant for verifying writes;
-temperature direction derived per-sample read a quantized cooldown as "steady"; two
-thresholds were set from a 76.8 °C figure that was not the machine's real peak (92.8 °C
-is); a test measured the wrong power limit because a `trap` had reset it. **Measure the
-hardware before choosing a number, and make the test assert its own preconditions.**
+**Testing discipline, which this project keeps proving the hard way.** Roughly a dozen
+defects across two sessions were invisible to unit tests and appeared only on hardware or in
+the real UI. They fall into two families:
 
-**Fault injection, for things that cannot be produced on demand** — never set in production:
+- *A constant or model chosen by reasoning rather than measurement* — the EC's percent
+  quantization, its 20 °C of curve hysteresis, thresholds set from a 76.8 °C peak when the
+  real one is 92.8 °C.
+- *Plumbing that only fails outside the happy path* — the interactive polkit branch had
+  never once executed because every earlier test ran as root; `systemctl enable --now` does
+  not restart, so a fix sat unused on disk through three test rounds; zbus caches properties,
+  which only a long-lived client can reveal.
+
+**Verify the thing you are testing is the thing you built.** The daemon logs its own binary
+age at startup for this reason. A GUI smoke test also passed while never building a window,
+because an instance was already running and GTK is single-instance — kill any instance first
+and treat "still alive when the timeout fires" as the pass.
+
+**Fault injection**, never set in production:
 
 ```bash
 FW_HELPERD_DEBUG_WEDGE_AFTER=15   # blocks every tokio worker; proves the watchdog
 FW_HELPERD_DEBUG_CEILING_C=55     # lowers the ceiling into reach; can only ever lower it
+FW_HELPER_DEBUG_WIDGETS=1         # GUI: traces control signals and command results
 ```
 
 **Open, and deliberately not done:**
 
 - The **panic path** is implemented and unit-tested but has never been triggered live.
-  Doing so honestly needs a panic injection in the daemon.
-- Floor observations only ever **rise** within a bucket and now survive restarts, so a
-  one-off anomaly is sticky. Errs loud, so it costs quiet rather than safety, but a
-  machine that cools better later keeps the old floor until the state file is removed.
-- The **battery guard has never fired** and is sized so it should not: measured, the
-  battery rises 2 °C under five minutes of full load. It is a backstop for the unmeasured
-  case — a fan held low for far longer — not a response to observed risk (ADR 0011).
-- **PL2 is untouched** and its `max_power_uw` reads 0. See the traps table.
-- The curve's **sensor is not configurable** (`control_temp()` picks `peci-temp`), and
-  curve *editing* belongs to the GUI in M6. The CLI spec exists to make the engine
-  testable, not to be the editing surface.
+- Floor observations only ever **rise** within a bucket and now persist, so a one-off
+  anomaly is sticky. Errs loud, costing quiet rather than safety.
+- The **battery guard has never fired** and is sized so it should not (ADR 0011).
+- **PL2 is untouched**; its `max_power_uw` reads 0.
+- The curve's **sensor is not configurable** — `control_temp()` picks `peci-temp`.
+- `/etc/sudoers.d/fw-helper-dev` grants passwordless `install-dev.sh`. It is scoped to a
+  script in a writable directory, so treat it as standing root and remove it when done.
 
-**Running hardware tests:** `sudo` cannot be run from the assistant side here — hand the
-user the command prefixed with `!` so it runs in-session, and `tee` the output to a file,
-because terminal output does not always reach the transcript.
+**Running hardware tests:** hand the user the command prefixed with `!` and `tee` the output
+to a file — terminal output does not always reach the transcript.
 
 ## Layout
 

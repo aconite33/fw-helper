@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=fw-helper
+GenericName=Firmware Control
+Comment=Fan curves, power limits and battery charge limit for Framework laptops
+Exec=fw-helper
+Icon=preferences-system-power
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=fan;power;thermal;battery;profile;framework;
+StartupNotify=true

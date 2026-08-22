@@ -528,10 +528,22 @@ Still to do below. Controls arrive as M2–M5 land.
 
 ---
 
-### M7 — Packaging
+### M7 — Packaging  🟡 builds; not yet installed even once
 
-- `.deb` for daemon + GUI, with polkit policy, D-Bus conf, systemd unit
-- Postinst that does **not** enable manual fan control by default — opt-in
+- [x] **`.deb` for daemon + GUI** (`scripts/build-deb.sh`, 2026-08-22), with polkit policy,
+  D-Bus conf, systemd unit, desktop entry and the example profile. Built with `dpkg-deb`
+  from a staging tree rather than cargo-deb: no extra tooling, and the layout is visible in
+  one place. Library dependencies come from `dpkg-shlibdeps` rather than being guessed,
+  because the GUI links GTK4 and libadwaita and their sonames move
+- [x] **Postinst does not enable charge control** — that changes which mechanism governs
+  charging (ADR 0008), so it is `fw-helper-enable-charge-control`, run deliberately. The
+  postinst says so when the interface is absent. Manual fan control is never taken unasked
+- [x] **prerm stops the unit before the binaries go**, so `ExecStopPost` runs and the fan
+  returns to the EC. Reasoned, **not yet demonstrated** — removing the package while it
+  holds the fan is the test
+- [ ] **Install it once.** Nobody has: dependency resolution, the service starting, and
+  launching from the GNOME app grid are all unverified
+- [x] README rewritten: it still claimed nothing wrote to hardware
 - README documenting exactly which knobs work on which boards, and the honest limitations
   (no undervolting, and why)
 - Consider a PPA

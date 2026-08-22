@@ -9,10 +9,10 @@ Inspired by [G-Helper](https://github.com/seerge/g-helper), which does this for 
 on Windows. This shares no code with it — see
 [ADR 0001](docs/adr/0001-separate-repository.md).
 
-> **Status: early.** The read-only hardware layer works — capability detection and live
-> telemetry, verified on real hardware. **Nothing writes to hardware yet.** Fan, power, and
-> charge control are designed and their mechanisms proven, but not implemented.
-> See [docs/plan.md](docs/plan.md).
+> **Status: usable, not yet released.** Fan control, power limits, the battery charge limit
+> and profiles all work and are verified on real hardware, driven from a GTK4 window or the
+> command line. Fan *curve editing* is still command-line only, and there is no released
+> package yet. See [docs/plan.md](docs/plan.md) for what is measured and what is assumed.
 
 ## Why
 
@@ -25,16 +25,22 @@ once, switchable from a tray icon or a hotkey.
 
 | Feature | Status |
 |---|---|
-| Live telemetry | **Working** — temps, fan RPM, package power, battery |
+| Live telemetry | **Working** — temps, fan RPM, CPU and whole-machine power, battery life |
 | Capability detection | **Working** — every knob reports available, or why not |
-| Fan curves | Planned — mechanism verified (0 → 4681 rpm, EC reclaims cleanly) |
-| Performance profiles | Planned — layered over power-profiles-daemon |
-| Power limits (PL1/PL2) | Planned — mechanism verified, regulates to ±2% of setpoint |
-| Battery charge limit | Planned — needs a module parameter ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)) |
-
-Every mechanism above has been exercised on real hardware before any application code was
-written — see [docs/hardware-baseline.md](docs/hardware-baseline.md).
+| Battery charge limit | **Working** — survives suspend and reboot. Needs a module parameter ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)) |
+| Fan control | **Working** — manual duty or a curve, with every ADR 0006 safety layer verified on hardware |
+| Power limits (PL1) | **Working** — a 15 W setpoint held 15.02 W sustained, +0.1% |
+| Performance profiles | **Working** — layered over power-profiles-daemon; the GNOME slider stays in sync |
+| Custom profiles | **Working** — saved from the app, or written by hand in `/etc/fw-helper/profiles.d/` |
+| Fan curve editing | Command line only; no graphical editor yet |
+| PL2 (short-term limit) | Not touched — it governs burst response, not sustained thermals |
 | **Undervolting** | **Not possible.** See below |
+
+Every mechanism above was exercised on real hardware before any application code was written,
+and the measurements are recorded in [docs/hardware-baseline.md](docs/hardware-baseline.md).
+Several of them contradicted what the design assumed — the EC's fan curve has ~20 °C of
+hysteresis, its duty read-back is quantized to whole percent, and this machine reaches
+92.8 °C in ordinary use rather than the 76.8 °C an early test suggested.
 
 ### Undervolting is not available
 
@@ -75,9 +81,34 @@ load. [ADR 0006](docs/adr/0006-fail-safe-fan-control.md) specifies the mitigatio
 (restore-on-exit, crash-path binary, watchdog, a floor that is never quieter than firmware,
 and a critical-temperature override that hands control back unconditionally).
 
-`kill -9` recovery is a release gate, not a nice-to-have.
+`kill -9` recovery is a release gate, not a nice-to-have. It is measured: EC control was
+restored **0.27 s** after the daemon was killed under load.
 
-## Try it
+What the fan floor protects is worth stating precisely, because it changed once the hardware
+was measured. The CPU throttles itself at 100 °C, so a fan held too low costs performance
+rather than hardware. The component with no protection of its own is the **battery**, whose
+sensor reports a 49.9 °C limit — by far the lowest on the board
+([ADR 0011](docs/adr/0011-quiet-is-a-legitimate-choice.md)).
+
+## Install
+
+```bash
+./scripts/build-deb.sh                   # builds fw-helper_<version>_amd64.deb
+sudo apt install ./fw-helper_*.deb
+```
+
+That installs the daemon, the GTK window (`fw-helper`, also in your app grid) and the CLI,
+enables the service, and creates `/etc/fw-helper/profiles.d/` for your own profiles. The
+battery charge limit needs one extra opt-in step, because it changes which mechanism governs
+charging ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)):
+
+```bash
+sudo fw-helper-enable-charge-control
+```
+
+Nothing takes manual control of the fan until you ask it to.
+
+## Or run it from source
 
 ```bash
 cargo build --all
@@ -87,11 +118,10 @@ cargo run -p fw-helperctl -- status      # reads sysfs directly; no daemon neede
 For the full picture, run the daemon. It needs the D-Bus policy installed first:
 
 ```bash
-sudo ./scripts/install-dev.sh            # D-Bus policy + fw-helperctl on PATH
-sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
+sudo ./scripts/install-dev.sh --systemd  # policy, polkit, unit, and start it
 fw-helperctl status                      # unprivileged, via D-Bus
+fw-helperctl profile                     # quiet | balanced | performance
 fw-helperctl watch 10                    # live power, fan, CPU temp at 1 Hz
-sudo pkill -x fw-helperd                 # stop it
 ```
 
 Package power needs a **root daemon** — `energy_uj` is `0400`, the PLATYPUS mitigation. The
