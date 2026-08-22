@@ -15,11 +15,12 @@ mod fan;
 mod iface;
 mod logind;
 mod polkit;
+mod ppd;
 mod state;
 mod watchdog;
 mod wire;
 
-use fw_helper_core::{Capabilities, Monitor, Sysfs};
+use fw_helper_core::{Capabilities, Monitor, Ppd, Profile, Sysfs};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = state::State::load();
     let state_power_limit = state.power_limit;
+    let persisted_profile = state.profile.clone();
     if let Some(limit) = state.charge_limit {
         eprintln!("persisted charge limit: {limit}%");
     }
@@ -69,12 +71,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Beat once before serving: the interface refuses fan control on a stale
     // heartbeat, and at startup the poll loop has not ticked yet.
     watchdog.beat();
+    // ADR 0005: delegate the profile axis to PPD. On its own system-bus connection,
+    // deliberately: PPD is always on the system bus, including when this daemon is run
+    // on the session bus for development, and it must not depend on the connection we
+    // are about to claim a name on.
+    let axis = Arc::new(match zbus::Connection::system().await {
+        Ok(c) => ppd::ProfileAxis::connect(&c, fs.clone()).await,
+        Err(e) => {
+            eprintln!("no system bus for PPD ({e}); profile axis falls back to sysfs");
+            ppd::ProfileAxis::disconnected(fs.clone())
+        }
+    });
+    let pending_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let applied_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
+
     let daemon = iface::Daemon::new(
         fs.clone(),
         caps,
         state,
         Arc::clone(&lease),
         Arc::clone(&watchdog),
+        Arc::clone(&axis),
+        Arc::clone(&applied_ppd),
     );
     daemon.reapply_charge_limit();
     if let Some(watts) = state_power_limit {
@@ -100,16 +118,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     eprintln!("listening on {BUS_NAME} at {OBJECT_PATH}");
 
+    // Follow the desktop's slider. The watcher signals the poll loop through an atomic
+    // rather than sharing the daemon, the same shape the resume hook already uses.
+    {
+        let pending = Arc::clone(&pending_ppd);
+        axis.watch(move |p| {
+            pending.store(ppd_code(p), Ordering::SeqCst);
+        })
+        .await;
+    }
+
     let resumed = Arc::new(AtomicBool::new(false));
     logind::watch_sleep(&conn, Arc::clone(&resumed), Arc::clone(&lease)).await;
 
-    let poll = tokio::spawn(poll_loop(
-        conn.clone(),
-        Monitor::new(fs),
+    let poll = tokio::spawn(poll_loop(Poll {
+        conn: conn.clone(),
+        mon: Monitor::new(fs.clone()),
         resumed,
-        Arc::clone(&watchdog),
-        Arc::clone(&lease),
-    ));
+        watchdog: Arc::clone(&watchdog),
+        lease: Arc::clone(&lease),
+        axis: Arc::clone(&axis),
+        pending_ppd: Arc::clone(&pending_ppd),
+        applied_ppd: Arc::clone(&applied_ppd),
+        fs: fs.clone(),
+        persisted_profile,
+    }));
 
     // Shut down cleanly on either signal, and hand the fan back before doing anything
     // else — the poll task is irrelevant if the fan is stuck (ADR 0006).
@@ -165,6 +198,93 @@ fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
 /// Not only at shutdown either, because `SIGKILL` is a supported way for this daemon to
 /// end and everything learned since the last write would go with it.
 const FLOOR_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many times we will re-assert a power limit before concluding firmware owns it.
+///
+/// Correcting forever would be an invisible fight burning a sysfs write every second.
+/// Five rides out the asynchronous re-derive seen after a `platform_profile` switch, and
+/// is few enough that a real conflict surfaces as a log line rather than as silence.
+const MAX_POWER_CORRECTIONS: u32 = 5;
+
+/// PPD profiles as a number, so the watcher can hand one to the poll loop through an
+/// atomic. 0 means "nothing pending".
+pub fn ppd_code(p: Ppd) -> u8 {
+    match p {
+        Ppd::PowerSaver => 1,
+        Ppd::Balanced => 2,
+        Ppd::Performance => 3,
+    }
+}
+
+fn ppd_from_code(c: u8) -> Option<Ppd> {
+    match c {
+        1 => Some(Ppd::PowerSaver),
+        2 => Some(Ppd::Balanced),
+        3 => Some(Ppd::Performance),
+        _ => None,
+    }
+}
+
+/// Tell the daemon which profile is now active, so the power-limit enforcement
+/// re-asserts the right budget rather than the previous one.
+async fn record_profile(conn: &zbus::Connection, name: &str, watts: u32) {
+    if let Ok(guard) = conn
+        .object_server()
+        .interface::<_, iface::Daemon>(OBJECT_PATH)
+        .await
+    {
+        guard.get().await.record_profile(name, watts);
+    }
+}
+
+/// Apply a profile: PPD axis, power budget, fan curve.
+///
+/// `set_ppd` is false when we are *reacting* to PPD rather than driving it. Asking PPD
+/// for the profile it just told us about would be harmless but would echo: PPD emits a
+/// change, we set it back, PPD emits again. The guard is here rather than in the watcher
+/// because this is the function that knows the difference.
+///
+/// Order matters. The power budget goes first because it does most of the thermal work —
+/// 10 W is worth about 12 °C — so the curve is applied to a machine already heading for
+/// the right temperature rather than chasing one that is not.
+async fn apply_profile(
+    profile: &Profile,
+    set_ppd: bool,
+    axis: &ppd::ProfileAxis,
+    lease: &fan::FanLease,
+    fs: &Sysfs,
+    thermal: fan::Thermal,
+) -> Result<(), String> {
+    if set_ppd {
+        axis.set(profile.ppd).await?;
+    }
+    fw_helper_core::PowerLimit::new(fs)
+        .set(profile.pl1_watts)
+        .map_err(|e| format!("power limit: {e}"))?;
+
+    // The curve is a request; the firmware floor, the ceiling and the battery guard are
+    // applied on top of it every tick, exactly as for a hand-set duty. A profile cannot
+    // reach past them.
+    lease
+        .set_curve(profile.curve.clone(), thermal)
+        .map_err(|e| format!("fan curve: {e}"))?;
+
+    if let Some(limit) = profile.charge_limit {
+        if let Err(e) = fw_helper_core::ChargeControl::new(fs).set(limit) {
+            eprintln!(
+                "profile {}: charge limit {limit}% failed: {e}",
+                profile.name
+            );
+        }
+    }
+    eprintln!(
+        "profile {} applied: ppd={} pl1={} W",
+        profile.name,
+        profile.ppd.as_str(),
+        profile.pl1_watts
+    );
+    Ok(())
+}
 
 /// Is the machine heating? Carries the previous answer through unchanged readings.
 ///
@@ -390,13 +510,36 @@ fn install_panic_hook(lease: Arc<fan::FanLease>) {
     }));
 }
 
-async fn poll_loop(
+/// Everything the poll loop needs. A struct rather than nine arguments, because the
+/// order of nine `Arc`s of similar shape is exactly the kind of thing that gets
+/// transposed silently.
+struct Poll {
     conn: zbus::Connection,
-    mut mon: Monitor,
+    mon: Monitor,
     resumed: Arc<AtomicBool>,
     watchdog: Arc<watchdog::Watchdog>,
     lease: Arc<fan::FanLease>,
-) {
+    axis: Arc<ppd::ProfileAxis>,
+    pending_ppd: Arc<std::sync::atomic::AtomicU8>,
+    /// The PPD profile we set ourselves, so its echo can be told from a real slider move.
+    applied_ppd: Arc<std::sync::atomic::AtomicU8>,
+    fs: Sysfs,
+    persisted_profile: Option<String>,
+}
+
+async fn poll_loop(ctx: Poll) {
+    let Poll {
+        conn,
+        mut mon,
+        resumed,
+        watchdog,
+        lease,
+        axis,
+        pending_ppd,
+        applied_ppd,
+        fs,
+        persisted_profile,
+    } = ctx;
     let iface_ref = match conn
         .object_server()
         .interface::<_, iface::Daemon>(OBJECT_PATH)
@@ -412,6 +555,8 @@ async fn poll_loop(
     let started = std::time::Instant::now();
     let mut restore_fan_after_resume = false;
     let mut govern = Govern::default();
+    let mut startup_profile = persisted_profile;
+    let mut power_corrections = 0u32;
     let mut last_floor_save = std::time::Instant::now();
     let mut saved_floor_revision = 0u64;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
@@ -448,6 +593,74 @@ async fn poll_loop(
         }
 
         let sample = mon.sample();
+
+        // Apply the persisted profile on the first tick that has real telemetry: the
+        // fan curve needs a temperature, and at startup there is not one yet.
+        if let Some(name) = startup_profile.take() {
+            match Profile::by_name(&name) {
+                Some(p) => {
+                    eprintln!("re-applying persisted profile {name}");
+                    power_corrections = 0;
+                    applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
+                    let thermal = fan::Thermal::from_telemetry(&sample);
+                    if let Err(e) = apply_profile(&p, true, &axis, &lease, &fs, thermal).await {
+                        eprintln!("could not re-apply profile {name}: {e}");
+                    } else {
+                        record_profile(&conn, p.name, p.pl1_watts).await;
+                    }
+                }
+                None => eprintln!("persisted profile {name:?} is not one we know; ignoring"),
+            }
+        }
+
+        // The GNOME power slider moved. Follow it, but do not tell PPD what it just told
+        // us, and do not re-apply a profile we have only just applied ourselves: setting
+        // PPD makes PPD emit a change, which arrives here as an event indistinguishable
+        // from a user moving the slider.
+        let code = pending_ppd.swap(0, Ordering::SeqCst);
+        if let Some(target) = ppd_from_code(code) {
+            if applied_ppd.swap(0, Ordering::SeqCst) != code {
+                let p = Profile::for_ppd(target);
+                eprintln!(
+                    "PPD switched to {}; following with profile {}",
+                    target.as_str(),
+                    p.name
+                );
+                power_corrections = 0;
+                let thermal = fan::Thermal::from_telemetry(&sample);
+                if let Err(e) = apply_profile(&p, false, &axis, &lease, &fs, thermal).await {
+                    eprintln!("could not follow PPD to {}: {e}", p.name);
+                } else {
+                    // Before the enforcement below runs, or it would restore the
+                    // previous profile's budget over the one just applied.
+                    record_profile(&conn, p.name, p.pl1_watts).await;
+                }
+            }
+        }
+
+        // Re-assert the power limit. A verified write is not a durable one here: see
+        // Daemon::enforce_power_limit. Bounded, so we never fight firmware forever.
+        if power_corrections < MAX_POWER_CORRECTIONS {
+            if let Ok(guard) = conn
+                .object_server()
+                .interface::<_, iface::Daemon>(OBJECT_PATH)
+                .await
+            {
+                if let Some((desired, observed)) = guard.get().await.enforce_power_limit() {
+                    power_corrections += 1;
+                    eprintln!(
+                        "power limit was {observed} W, expected {desired} W; re-applied \
+                         (correction {power_corrections} of {MAX_POWER_CORRECTIONS})"
+                    );
+                    if power_corrections == MAX_POWER_CORRECTIONS {
+                        eprintln!(
+                            "power limit: firmware keeps overriding us; giving up until it is \
+                             set again. This machine may re-derive PL1 from platform_profile"
+                        );
+                    }
+                }
+            }
+        }
 
         // Persist anything newly learned about the firmware floor, at most once a
         // minute and only when the revision has actually moved.

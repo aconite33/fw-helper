@@ -21,7 +21,8 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
 | M3 — fan control | **complete**: all six ADR 0006 safety points and the curve engine verified on hardware |
 | M4 — power limits | PL1 control complete and verified (15 W setpoint → 15.02 W sustained) |
-| M5, M7 | planned; every mechanism pre-verified |
+| M5 — profiles | core complete: PPD delegation both directions, verified; user profiles and AC/battery switching pending |
+| M7 | planned; every mechanism pre-verified |
 | M6 — GUI | read-only telemetry view landed early; controls pending M2–M5 |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
@@ -118,6 +119,7 @@ fw-helperctl status | watch [secs] | charge-limit N
 fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the firmware floor
 fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
 fw-helperctl power-limit 15               # sustained CPU watts; ~32s to take effect
+fw-helperctl profile | profile quiet      # quiet | balanced | performance; moves the GNOME slider
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey
@@ -169,6 +171,8 @@ All of these cost real time once. Do not rediscover them.
 
 | Trap | Reality |
 |---|---|
+| A **verified** PL1 write still does not stick | Read back 25 W, was 33 W seconds later — above the advertised `max_power_uw`, so that field does not bind firmware either. Switching `platform_profile` makes firmware re-derive PL1 asynchronously. Re-assert on a timer; an immediate read-back cannot see it |
+| Setting PPD **echoes back** | Our own `ActiveProfile` write emits a change signal indistinguishable from the user moving the GNOME slider. Mark what you set, or you apply everything twice |
 | `constraint_1_max_power_uw` = **0** | Unset, not "no power allowed" — same trap as `temp*_max` = -273150. Clamping a slider to `max_power_uw` is right for PL1 (25 W) and silently zeroes PL2. Validate first |
 | **Root cannot overwrite your file in `/tmp`** | `fs.protected_regular=2` blocks root `O_CREAT`ing a file owned by another user in a sticky world-writable dir. Test scripts run as both users across a session; put their data outside `/tmp` |
 | `intel-rapl:0` `long_term` = **200 W** | Meaningless; its own `max_power_uw` is 25 W. Use **`intel-rapl-mmio:0`**. Clamp any UI to `max_power_uw` |

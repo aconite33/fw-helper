@@ -44,6 +44,12 @@ pub struct Daemon {
     /// Consulted before granting manual fan control, so the fan is never handed to a
     /// daemon that has stopped minding it.
     watchdog: Arc<Watchdog>,
+    /// The PPD axis (ADR 0005). Shared with the poll loop, which follows it.
+    axis: Arc<crate::ppd::ProfileAxis>,
+    /// The PPD profile we set ourselves. Shared with the poll loop so it can tell our
+    /// own echo from a genuine slider move — setting PPD makes PPD emit a change, and
+    /// the two are indistinguishable at the receiving end.
+    applied_ppd: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Daemon {
@@ -53,6 +59,8 @@ impl Daemon {
         state: State,
         fan: Arc<FanLease>,
         watchdog: Arc<Watchdog>,
+        axis: Arc<crate::ppd::ProfileAxis>,
+        applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     ) -> Self {
         Self {
             fs,
@@ -61,6 +69,8 @@ impl Daemon {
             state: Mutex::new(state),
             fan,
             watchdog,
+            axis,
+            applied_ppd,
         }
     }
 
@@ -190,6 +200,46 @@ impl Daemon {
         }
     }
 
+    /// Record which profile is active and what power budget it wants.
+    ///
+    /// **Must be called by every path that applies a profile**, not just the D-Bus one.
+    /// `enforce_power_limit` re-asserts whatever this says, so a path that changes the
+    /// hardware without recording it leaves a stale desired value that the enforcement
+    /// loop then dutifully restores — measured: following the GNOME slider to
+    /// performance applied 25 W, and the enforcement put it straight back to the 15 W a
+    /// previous profile had recorded.
+    pub fn record_profile(&self, name: &str, watts: u32) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.profile.as_deref() == Some(name) && state.power_limit == Some(watts) {
+                return;
+            }
+            state.profile = Some(name.to_string());
+            state.power_limit = Some(watts);
+            state.save();
+        }
+    }
+
+    /// Re-assert the power limit if something moved it.
+    ///
+    /// **Our write can be verified and still not stick.** Measured 2026-08-22: after a
+    /// profile set PL1 to 25 W and the read-back confirmed it, the zone read 33 W a few
+    /// seconds later — above its own advertised `max_power_uw` of 25 W, so firmware is
+    /// not bound by that field either. Switching `platform_profile` appears to make
+    /// firmware re-derive PL1 asynchronously, and an immediate read-back cannot see it.
+    ///
+    /// Returns `(desired, observed)` when it corrected something, so the caller can
+    /// decide how loudly to say so.
+    pub fn enforce_power_limit(&self) -> Option<(u32, u32)> {
+        let desired = self.state.lock().ok()?.power_limit?;
+        let pl = PowerLimit::new(&self.fs);
+        let observed = pl.read().ok()?;
+        if observed == desired {
+            return None;
+        }
+        pl.set(desired).ok()?;
+        Some((desired, observed))
+    }
+
     /// Called by the poll task. Returns true when the published view actually changed,
     /// so we only emit a PropertiesChanged signal when there is something to say.
     pub fn update(&mut self, t: Telemetry) -> bool {
@@ -228,6 +278,83 @@ impl Daemon {
     #[zbus(property)]
     async fn version(&self) -> u32 {
         1
+    }
+
+    /// Profiles this daemon knows, by name.
+    #[zbus(property)]
+    async fn profiles(&self) -> Vec<String> {
+        fw_helper_core::Profile::all()
+            .into_iter()
+            .map(|p| p.name.to_string())
+            .collect()
+    }
+
+    /// The profile matching whatever PPD currently has active, or empty if unknown.
+    ///
+    /// Derived from PPD rather than from our own record of what we last applied, so it
+    /// stays truthful when the user moves the GNOME slider (ADR 0005).
+    #[zbus(property)]
+    async fn active_profile(&self) -> String {
+        match self.axis.active().await {
+            Some(ppd) => fw_helper_core::Profile::for_ppd(ppd).name.to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// How the profile axis is driven: `ppd`, `platform_profile`, or `none`.
+    ///
+    /// Worth publishing because `platform_profile` means the GNOME slider is *not* in
+    /// the loop, and a user seeing the desktop disagree with us deserves to know why.
+    #[zbus(property)]
+    async fn profile_backend(&self) -> String {
+        match self.axis.backend() {
+            crate::ppd::Backend::Ppd => "ppd".into(),
+            crate::ppd::Backend::DirectSysfs => "platform_profile".into(),
+            crate::ppd::Backend::None => "none".into(),
+        }
+    }
+
+    /// Switch profile: PPD axis, power budget and fan curve together.
+    async fn set_profile(
+        &self,
+        name: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        let profile = fw_helper_core::Profile::by_name(name).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!(
+                "no profile {name:?}; known profiles are quiet, balanced, performance"
+            ))
+        })?;
+        // A profile sets a power limit and takes the fan, so it needs both rights.
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
+
+        // Mark before asking, so the change signal cannot arrive before the flag.
+        self.applied_ppd.store(
+            crate::ppd_code(profile.ppd),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.axis
+            .set(profile.ppd)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        fw_helper_core::PowerLimit::new(&self.fs)
+            .set(profile.pl1_watts)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("power limit: {e}")))?;
+
+        self.fan
+            .set_curve(profile.curve.clone(), self.thermal())
+            .map_err(|e| zbus::fdo::Error::Failed(format!("fan curve: {e}")))?;
+
+        if let Ok(mut state) = self.state.lock() {
+            state.profile = Some(profile.name.to_string());
+            state.power_limit = Some(profile.pl1_watts);
+            state.save();
+        }
+        eprintln!("profile {} applied by {sender}", profile.name);
+        Ok(())
     }
 
     /// Sustained CPU power limit in watts, or 0 when unsupported.
@@ -518,12 +645,15 @@ mod tests {
         let state = State {
             charge_limit: persisted,
             power_limit: None,
+            profile: None,
             floor: Vec::new(),
         };
         let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));
         let wd = crate::watchdog::Watchdog::new(Arc::clone(&lease));
         wd.beat();
-        Daemon::new(fs_, caps, state, lease, wd)
+        let axis = Arc::new(crate::ppd::ProfileAxis::disconnected(fs_.clone()));
+        let applied = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        Daemon::new(fs_, caps, state, lease, wd, axis, applied)
     }
 
     fn write_attr(root: &Path, value: &str) {

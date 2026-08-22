@@ -435,17 +435,44 @@ daemon do what that script proved possible, and to re-run the script as a regres
 
 ---
 
-### M5 — Profiles
+### M5 — Profiles  ✅ core complete, verified on hardware
 
 Ties M2–M4 together into the actual product.
 
-- Profile schema: PPD profile + fan curve + PL1/PL2 + charge limit
-- Delegate the PPD axis over D-Bus; **subscribe** to PPD's `ActiveProfile` so the GNOME
-  power slider stays authoritative and we follow it ([0005](adr/0005-delegate-to-power-profiles-daemon.md))
-- Fallback to direct `platform_profile`/EPP writes if PPD is absent
-- Ship three sane defaults (Quiet / Balanced / Performance); user profiles in
-  `/etc/fw-helper/profiles.d/`
-- AC/battery auto-switching
+- [x] **Profile schema** (`fw-helper-core/src/profile.rs`): PPD profile + fan curve + PL1.
+      **No built-in sets a charge limit**, though ADR 0005's sketch did: battery longevity
+      is a standing preference, not a performance choice, and someone capping at 80% to
+      preserve the pack should not have that undone by asking for speed for an hour. The
+      field exists so a user profile can opt in
+- [x] **Delegates the PPD axis and subscribes to `ActiveProfile`**
+      (`fw-helperd/src/ppd.rs`). Measured: PPD owns *both* bus names, and both serve the
+      interface under the newer name at `/org/freedesktop/UPower/PowerProfiles`.
+      `ActiveProfile` is a writable property that emits change signals, so switching is a
+      property write and following is a subscription, not a poll. PPD gets its own
+      system-bus connection, since it is always on the system bus even when this daemon
+      runs on the session bus for development
+- [x] **Fallback to direct `platform_profile`** when PPD is absent, reported as
+      `ProfileBackend` so a client can say why the GNOME slider is not in sync
+- [x] Three defaults: quiet 15 W, balanced 20 W, performance 25 W, each with its own curve
+- [ ] User profiles in `/etc/fw-helper/profiles.d/`
+- [ ] AC/battery auto-switching
+
+**Verified 2026-08-22**, both directions: `fw-helperctl profile quiet` set PPD to
+power-saver and PL1 to 15 W; driving PPD to performance and balanced (the same property
+the GNOME slider writes) made the daemon follow with 25 W and 20 W; a daemon restart
+re-applied the persisted profile exactly once.
+
+Two defects found by that run, both now fixed:
+
+- **A verified power-limit write does not stick.** PL1 read back as 25 W and was 33 W
+  seconds later — above the zone's own advertised 25 W maximum, so `max_power_uw` does not
+  bind firmware either. Switching `platform_profile` appears to make firmware re-derive
+  PL1 asynchronously. The limit is now re-asserted every tick, bounded at five corrections
+  so we never fight firmware invisibly. This was M4's unimplemented "read back after a
+  delay" bullet
+- **Our own PPD write echoes back** as a change signal indistinguishable from a user
+  moving the slider, so a restart applied its profile twice. The daemon marks the profile
+  it set before asking
 
 **Exit:** Moving the GNOME power slider applies the matching fan curve and power limits.
 `fw-helperctl profile quiet` does the same and GNOME reflects it.

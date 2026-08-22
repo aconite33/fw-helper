@@ -51,6 +51,21 @@ pub trait Daemon {
     /// Hand the fan back to the EC. May prompt via polkit.
     fn set_fan_auto(&self) -> zbus::Result<()>;
 
+    /// Profiles this daemon knows.
+    #[zbus(property)]
+    fn profiles(&self) -> zbus::Result<Vec<String>>;
+
+    /// The profile matching PPD's active profile, empty when unknown.
+    #[zbus(property)]
+    fn active_profile(&self) -> zbus::Result<String>;
+
+    /// How the profile axis is driven: `ppd`, `platform_profile`, or `none`.
+    #[zbus(property)]
+    fn profile_backend(&self) -> zbus::Result<String>;
+
+    /// Switch profile. May prompt via polkit.
+    fn set_profile(&self, name: &str) -> zbus::Result<()>;
+
     /// Sustained CPU power limit in watts, 0 when unsupported.
     #[zbus(property)]
     fn power_limit(&self) -> zbus::Result<u32>;
@@ -129,6 +144,9 @@ pub struct Snapshot {
     /// Sustained CPU power limit in watts, and the ceiling for it.
     pub power_limit: Option<u32>,
     pub power_limit_max: Option<u32>,
+    /// Active profile name, and how the axis is driven.
+    pub profile: Option<String>,
+    pub profile_backend: Option<String>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -171,6 +189,8 @@ impl Snapshot {
             fan_curve: d.fan_curve().unwrap_or_default(),
             power_limit: d.power_limit().ok().filter(|v| *v > 0),
             power_limit_max: d.power_limit_max().ok().filter(|v| *v > 0),
+            profile: d.active_profile().ok().filter(|v| !v.is_empty()),
+            profile_backend: d.profile_backend().ok(),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

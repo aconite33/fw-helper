@@ -22,6 +22,8 @@ USAGE:
     fw-helperctl fan curve        follow the built-in quiet curve
     fw-helperctl fan curve T:D,.. follow a custom curve, e.g. 55:0,70:65,85:120
     fw-helperctl power-limit N   set the sustained CPU power limit, in watts
+    fw-helperctl profile         show profiles
+    fw-helperctl profile NAME    apply quiet | balanced | performance
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -35,6 +37,7 @@ fn main() {
         Some("charge-limit") => charge_limit(args.get(1).map(String::as_str)),
         Some("fan") => fan(args.get(1).map(String::as_str)),
         Some("power-limit") => power_limit(args.get(1).map(String::as_str)),
+        Some("profile") => profile(args.get(1).map(String::as_str)),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -84,6 +87,13 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
     match s.package_watts {
         Some(w) => println!("  package power      {w:.1} W"),
         None => println!("  package power      <unavailable>"),
+    }
+    if let Some(p) = &s.profile {
+        let via = match s.profile_backend.as_deref() {
+            Some("platform_profile") => "  (platform_profile; GNOME slider not in sync)",
+            _ => "",
+        };
+        println!("  profile            {p}{via}");
     }
     if let (Some(pl), Some(max)) = (s.power_limit, s.power_limit_max) {
         let note = if pl >= max { " (stock)" } else { "" };
@@ -380,6 +390,46 @@ fn power_limit(arg: Option<&str>) {
             // not work: the limit averages over ~32 s.
             println!("  the limit averages over ~32 s, so power readings take that long to settle");
             println!("  roughly 10 W is worth 12 C of sustained CPU temperature");
+        }
+        Err(e) => {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Show or switch profile.
+///
+/// A profile is a PPD profile plus the knobs PPD does not manage (ADR 0005), so this
+/// also moves the GNOME power slider — that is the point, not a side effect.
+fn profile(arg: Option<&str>) {
+    let (d, _) = match connect() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fw-helperd unavailable ({e}); profiles require it");
+            std::process::exit(1);
+        }
+    };
+    let Some(name) = arg else {
+        let active = d.active_profile().unwrap_or_default();
+        for p in d.profiles().unwrap_or_default() {
+            let mark = if p == active { "*" } else { " " };
+            println!("{mark} {p}");
+        }
+        match d.profile_backend().unwrap_or_default().as_str() {
+            "ppd" => println!("\n  driven via power-profiles-daemon; the GNOME slider stays in sync"),
+            "platform_profile" => println!(
+                "\n  power-profiles-daemon is absent, so platform_profile is written directly.\n                   The GNOME power slider will NOT reflect changes made here"
+            ),
+            _ => println!("\n  no profile axis available on this machine"),
+        }
+        std::process::exit(0);
+    };
+    match d.set_profile(name) {
+        Ok(()) => {
+            println!("profile {name} applied");
+            println!("  power limit and fan curve set; the GNOME power slider follows");
+            println!("  the power limit takes ~32 s to show in readings");
         }
         Err(e) => {
             eprintln!("failed: {e}");
