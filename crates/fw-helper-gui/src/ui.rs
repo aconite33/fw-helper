@@ -33,6 +33,9 @@ struct Widgets {
     banner: adw::Banner,
     power: gtk::Label,
     fan: gtk::Label,
+    cpu_temp: gtk::Label,
+    system: gtk::Label,
+    system_caption: gtk::Label,
     profile: gtk::Label,
     battery: adw::ActionRow,
     sensors_group: adw::PreferencesGroup,
@@ -74,15 +77,25 @@ pub fn build(app: &adw::Application) {
 
     let banner = adw::Banner::builder().revealed(false).build();
 
+    // The four numbers worth seeing without scrolling: what the CPU is drawing, how
+    // hot it is, how hard the fan is working, and what the whole machine costs.
     let power = stat_label();
     let fan = stat_label();
-    let stats = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .homogeneous(true)
+    let cpu_temp = stat_label();
+    let system = stat_label();
+    let (system_card, system_caption) = stat_card_with_caption(&system, "system");
+
+    let stats = gtk::Grid::builder()
+        .row_spacing(12)
+        .column_spacing(12)
+        .column_homogeneous(true)
         .build();
-    stats.append(&stat_card(&power, "package power"));
-    stats.append(&stat_card(&fan, "fan"));
+    // Two by two rather than four across: four cards at this window width squeeze the
+    // values into something you have to read twice.
+    stats.attach(&stat_card(&power, "cpu package"), 0, 0, 1, 1);
+    stats.attach(&stat_card(&cpu_temp, "cpu temperature"), 1, 0, 1, 1);
+    stats.attach(&stat_card(&fan, "fan"), 0, 1, 1, 1);
+    stats.attach(&system_card, 1, 1, 1, 1);
 
     let profile = gtk::Label::builder().xalign(0.0).label("—").build();
     let profile_row = adw::ComboRow::builder()
@@ -207,6 +220,9 @@ pub fn build(app: &adw::Application) {
         banner,
         power,
         fan,
+        cpu_temp: cpu_temp.clone(),
+        system: system.clone(),
+        system_caption,
         profile,
         battery,
         profile_row: profile_row.clone(),
@@ -647,8 +663,22 @@ fn stat_label() -> gtk::Label {
     l
 }
 
-fn stat_card(value: &gtk::Label, caption: &str) -> gtk::Widget {
-    let label = gtk::Label::builder().label(caption).build();
+/// A stat card, handing back the caption label so it can be rewritten later.
+///
+/// Built explicitly rather than by walking the widget tree afterwards: an earlier
+/// version fished the caption out with `first_child().last_child()`, which is wrong
+/// here — the card *is* the box, so the first child is the value and it has no children
+/// of its own. That downcast failed inside GTK's activate callback, which cannot
+/// unwind, so it aborted the process rather than panicking.
+fn stat_card_with_caption(value: &gtk::Label, caption: &str) -> (gtk::Widget, gtk::Label) {
+    // Wrapping, because the system card's caption carries battery percentage and time
+    // remaining. Without it the label sets the column width and the grid goes lopsided.
+    let label = gtk::Label::builder()
+        .label(caption)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .max_width_chars(20)
+        .build();
     label.add_css_class("stat-label");
 
     let b = gtk::Box::builder()
@@ -659,7 +689,11 @@ fn stat_card(value: &gtk::Label, caption: &str) -> gtk::Widget {
     b.append(&label);
     b.add_css_class("stat-card");
     b.add_css_class("card");
-    b.upcast()
+    (b.upcast(), label)
+}
+
+fn stat_card(value: &gtk::Label, caption: &str) -> gtk::Widget {
+    stat_card_with_caption(value, caption).0
 }
 
 fn disconnected(w: &mut Widgets, why: &str) {
@@ -683,6 +717,40 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
             .map(|v| format!("{v:.1} W"))
             .unwrap_or_else(|| "—".into()),
     );
+    w.cpu_temp.set_label(
+        &s.temps
+            .iter()
+            .find(|t| Some(t.label.as_str()) == s.control_sensor.as_deref())
+            .or_else(|| s.temps.first())
+            .map(|t| format!("{:.0} °C", t.celsius))
+            .unwrap_or_else(|| "—".into()),
+    );
+
+    // Whole-machine draw exists only on battery: nothing reports it on mains, and the
+    // CPU package figure is a fraction of it, so showing that here would mislead.
+    // Caption assembled from whatever is actually known, so a missing reading drops a
+    // clause instead of printing a placeholder.
+    let mut caption = vec!["system".to_string()];
+    if let Some(pct) = s.battery_percent {
+        caption.push(format!("{pct}%"));
+    }
+    match (s.system_watts, s.on_ac) {
+        (Some(watts), _) => {
+            w.system.set_label(&format!("{watts:.1} W"));
+            if let Some(m) = s.battery_minutes {
+                caption.push(format!("{}h {:02}m left", m / 60, m % 60));
+            }
+        }
+        (None, Some(true)) => {
+            w.system.set_label("—");
+            // Nothing reports whole-machine draw on mains, so say why rather than
+            // leaving a dash with no explanation.
+            caption.push("on mains".into());
+        }
+        _ => w.system.set_label("—"),
+    }
+    w.system_caption.set_label(&caption.join(" · "));
+
     w.fan.set_label(&match s.fan_rpm {
         // The EC keeps the fan stopped below roughly 45 C, so zero is a state
         // worth naming rather than showing as "0 rpm".

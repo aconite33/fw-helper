@@ -182,6 +182,10 @@ pub struct Snapshot {
     pub auto_profiles: (String, String),
     /// True on mains, false on battery, `None` when unknown.
     pub on_ac: Option<bool>,
+    /// Whole-machine draw in watts, measurable only while on battery.
+    pub system_watts: Option<f64>,
+    /// Minutes until empty at the current rate.
+    pub battery_minutes: Option<u64>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -230,6 +234,8 @@ impl Snapshot {
             saved_profiles: d.saved_profiles().unwrap_or_default(),
             auto_profiles: d.auto_profiles().unwrap_or_default(),
             on_ac: t.get("on_ac").and_then(as_bool),
+            system_watts: t.get("system_watts").and_then(as_f64),
+            battery_minutes: t.get("battery_minutes").and_then(as_u64),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),

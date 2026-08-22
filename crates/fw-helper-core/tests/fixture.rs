@@ -72,6 +72,10 @@ impl Fixture {
         f.write("sys/class/power_supply/ACAD/type", "Mains\n");
         f.write("sys/class/power_supply/ACAD/online", "1\n");
         f.write("sys/class/power_supply/BAT1/status", "Not charging\n");
+        // Charge family, as this board reports: no power_now, no energy_now.
+        f.write("sys/class/power_supply/BAT1/current_now", "540000\n");
+        f.write("sys/class/power_supply/BAT1/voltage_now", "16436000\n");
+        f.write("sys/class/power_supply/BAT1/charge_now", "3464000\n");
         f.write(
             "sys/module/cros_charge_control/parameters/probe_with_fwk_charge_control",
             "N\n",
@@ -255,4 +259,33 @@ fn a_duty_that_cannot_turn_the_fan_never_reaches_hardware() {
     // The refusal must happen before any write: the fan is still the EC's.
     assert_eq!(raw(&f, &format!("{EC}/pwm1_enable")), "2");
     assert_eq!(raw(&f, &format!("{EC}/pwm1")), "0");
+}
+
+#[test]
+fn reads_the_charge_family_when_discharging() {
+    // The reference board reports current/voltage/charge and has no power_now at all,
+    // so a reader that only understands the energy family shows nothing.
+    let f = Fixture::framework_13("battery-rate");
+    f.write("sys/class/power_supply/BAT1/status", "Discharging\n");
+    let mut mon = Monitor::new(f.sysfs());
+    let t = mon.sample();
+
+    // 0.54 A x 16.436 V
+    let watts = t.system_watts.expect("a discharge rate");
+    assert!((watts - 8.875).abs() < 0.01, "got {watts} W");
+    // 3464 mAh at 540 mA is about 6 h 25 m.
+    assert_eq!(t.battery_minutes, Some(384));
+}
+
+#[test]
+fn prefers_the_energy_family_where_the_board_reports_it() {
+    let f = Fixture::framework_13("battery-energy");
+    f.write("sys/class/power_supply/BAT1/status", "Discharging\n");
+    f.write("sys/class/power_supply/BAT1/power_now", "9000000\n");
+    f.write("sys/class/power_supply/BAT1/energy_now", "45000000\n");
+    let mut mon = Monitor::new(f.sysfs());
+    let t = mon.sample();
+
+    assert_eq!(t.system_watts, Some(9.0));
+    assert_eq!(t.battery_minutes, Some(300), "45 Wh at 9 W is five hours");
 }

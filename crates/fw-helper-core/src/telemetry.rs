@@ -20,6 +20,15 @@ pub struct Telemetry {
     pub battery_percent: Option<u64>,
     pub battery_status: Option<String>,
     pub platform_profile: Option<String>,
+    /// What the whole machine is drawing, in watts.
+    ///
+    /// Only measurable **on battery**, where it is the battery's own discharge rate and
+    /// therefore genuinely everything: CPU, screen, USB, the lot. On mains nothing
+    /// reports total system draw, so this is `None` rather than a guess — the RAPL
+    /// figure is the CPU package alone and is typically a fraction of it.
+    pub system_watts: Option<f64>,
+    /// Minutes until the battery is empty at the current rate, when discharging.
+    pub battery_minutes: Option<u64>,
     /// True on mains, false on battery, `None` when no mains supply can be found.
     ///
     /// Resolved by the supply's `type` being `Mains`, never by its name: this board
@@ -104,6 +113,9 @@ impl Monitor {
         };
 
         t.on_ac = self.read_on_ac();
+        let (watts, minutes) = self.read_battery_rate();
+        t.system_watts = watts;
+        t.battery_minutes = minutes;
 
         if let Some(hwmon) = self.caps.ec_hwmon.clone() {
             // fan1_target stayed 0 under manual control during hardware validation
@@ -122,6 +134,60 @@ impl Monitor {
         }
 
         t
+    }
+
+    /// Discharge rate and time remaining, in whichever unit family the board uses.
+    ///
+    /// Two conventions exist and boards pick one: **energy** (`power_now` in µW,
+    /// `energy_now` in µWh) or **charge** (`current_now` in µA, `voltage_now` in µV,
+    /// `charge_now` in µAh). The reference machine reports the charge family and has no
+    /// `power_now` at all, so reading only the energy one would silently show nothing.
+    ///
+    /// Returns `(None, None)` while charging or on mains: the current then describes
+    /// what is going *into* the battery, which is not what the machine is using and
+    /// gives no time-to-empty at all.
+    fn read_battery_rate(&self) -> (Option<f64>, Option<u64>) {
+        let bat = paths::BATTERY;
+        if self
+            .fs
+            .read_string(&format!("{bat}/status"))
+            .ok()
+            .as_deref()
+            != Some("Discharging")
+        {
+            return (None, None);
+        }
+
+        // Energy family first: when present it is already in watts and needs no
+        // multiplication.
+        if let Ok(uw) = self.fs.read_u64(&format!("{bat}/power_now")) {
+            let watts = uw as f64 / 1_000_000.0;
+            let minutes = self
+                .fs
+                .read_u64(&format!("{bat}/energy_now"))
+                .ok()
+                .filter(|_| uw > 0)
+                .map(|uwh| (uwh as f64 * 60.0 / uw as f64) as u64);
+            return (Some(watts), minutes);
+        }
+
+        // Charge family: watts is V x I, and hours is charge over current.
+        let (Ok(ua), Ok(uv)) = (
+            self.fs.read_u64(&format!("{bat}/current_now")),
+            self.fs.read_u64(&format!("{bat}/voltage_now")),
+        ) else {
+            return (None, None);
+        };
+        if ua == 0 {
+            return (None, None);
+        }
+        let watts = (ua as f64 / 1_000_000.0) * (uv as f64 / 1_000_000.0);
+        let minutes = self
+            .fs
+            .read_u64(&format!("{bat}/charge_now"))
+            .ok()
+            .map(|uah| (uah as f64 * 60.0 / ua as f64) as u64);
+        (Some(watts), minutes)
     }
 
     /// Find the mains supply by type and read whether it is online.
