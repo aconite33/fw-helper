@@ -348,18 +348,36 @@ impl Daemon {
         self.known().iter().map(|p| p.name.clone()).collect()
     }
 
+    /// Profiles that exist as files, and so can be deleted. Built-ins have none.
+    #[zbus(property)]
+    async fn saved_profiles(&self) -> Vec<String> {
+        crate::profiles::saved_names()
+    }
+
     /// The profile matching whatever PPD currently has active, or empty if unknown.
     ///
     /// Derived from PPD rather than from our own record of what we last applied, so it
     /// stays truthful when the user moves the GNOME slider (ADR 0005).
     #[zbus(property)]
     async fn active_profile(&self) -> String {
-        match self.axis.active().await {
-            // By canonical name, looked up in the merged set, so a user profile that
-            // replaces a built-in is what gets reported.
-            Some(ppd) => fw_helper_core::Profile::canonical_name_for(ppd).to_string(),
-            None => String::new(),
+        let Some(ppd) = self.axis.active().await else {
+            return String::new();
+        };
+        // Prefer the profile we actually applied, but only while PPD still agrees with
+        // it. Deriving this from PPD alone cannot be right: PPD has three positions and
+        // any number of profiles can share one, so selecting a user profile reported
+        // back as whichever built-in shares its PPD axis - and a client that trusts the
+        // report, as ours does, snaps its selection there a moment later.
+        //
+        // When PPD no longer matches, the slider has been moved somewhere else and the
+        // canonical name for where it now is *is* the truth.
+        let applied = self.state.lock().ok().and_then(|s| s.profile.clone());
+        if let Some(name) = applied {
+            if self.known().iter().any(|p| p.name == name && p.ppd == ppd) {
+                return name;
+            }
         }
+        fw_helper_core::Profile::canonical_name_for(ppd).to_string()
     }
 
     /// How the profile axis is driven: `ppd`, `platform_profile`, or `none`.

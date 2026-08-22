@@ -14,34 +14,44 @@ use zbus::zvariant::OwnedValue;
     default_service = "org.fwhelper.Daemon1",
     default_path = "/org/fwhelper/Daemon1"
 )]
+// Every property here except `telemetry` and `critical_temperatures` is marked as not
+// emitting a change signal, which makes zbus fetch it each time instead of caching it.
+//
+// The daemon emits changes for those two and nothing else, so a cached proxy froze the
+// rest at their startup values: the profile list never gained a newly saved profile,
+// and the power limit row never moved. The CLI could not show this - it builds a fresh
+// proxy per invocation - so it only appeared once the GUI held one open.
+//
+// Refetching costs a round trip per property per second on a local bus, against
+// silently stale readings. The daemon already caps its own publication rate (ADR 0009).
 pub trait Daemon {
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn capabilities(&self) -> zbus::Result<HashMap<String, (bool, String)>>;
     #[zbus(property)]
     fn telemetry(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
     #[zbus(property)]
     fn critical_temperatures(&self) -> zbus::Result<HashMap<String, f64>>;
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn version(&self) -> zbus::Result<u32>;
 
     /// Current charge limit, or 0 when unsupported.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn charge_limit(&self) -> zbus::Result<u8>;
 
     /// Set the battery charge limit. May prompt via polkit.
     fn set_charge_limit(&self, percent: u8) -> zbus::Result<()>;
 
     /// How the fan is driven: `auto`, `manual`, or `unavailable`.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn fan_mode(&self) -> zbus::Result<String>;
 
     /// Duty 0-255 as the EC reports it. Meaningless unless `fan_mode` is `manual`.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn fan_duty(&self) -> zbus::Result<u8>;
 
     /// Lowest duty permitted right now. 0 means the EC would have the fan off, so
     /// silence is allowed; 255 means no temperature could be read.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn fan_floor(&self) -> zbus::Result<u8>;
 
     /// Pin the fan at `duty` (0-255), returning what the EC settled on after being
@@ -52,15 +62,19 @@ pub trait Daemon {
     fn set_fan_auto(&self) -> zbus::Result<()>;
 
     /// Profiles this daemon knows.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn profiles(&self) -> zbus::Result<Vec<String>>;
 
+    /// Profiles backed by a file, and so deletable.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn saved_profiles(&self) -> zbus::Result<Vec<String>>;
+
     /// The profile matching PPD's active profile, empty when unknown.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn active_profile(&self) -> zbus::Result<String>;
 
     /// How the profile axis is driven: `ppd`, `platform_profile`, or `none`.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn profile_backend(&self) -> zbus::Result<String>;
 
     /// Switch profile. May prompt via polkit.
@@ -73,26 +87,26 @@ pub trait Daemon {
     fn delete_profile(&self, name: &str) -> zbus::Result<()>;
 
     /// Profiles applied on each power source: `(on_ac, on_battery)`. Empty means off.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn auto_profiles(&self) -> zbus::Result<(String, String)>;
 
     /// Set them. Empty strings turn a side off. May prompt via polkit.
     fn set_auto_profiles(&self, on_ac: &str, on_battery: &str) -> zbus::Result<()>;
 
     /// Sustained CPU power limit in watts, 0 when unsupported.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn power_limit(&self) -> zbus::Result<u32>;
 
     /// Highest power limit this machine admits to. Bound sliders to this, never to the
     /// MSR zone's fictional 200 W.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn power_limit_max(&self) -> zbus::Result<u32>;
 
     /// Set the sustained CPU power limit. May prompt via polkit.
     fn set_power_limit(&self, watts: u32) -> zbus::Result<()>;
 
     /// The active curve as (temperature, duty) pairs; empty when none is running.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "false"))]
     fn fan_curve(&self) -> zbus::Result<Vec<(f64, u8)>>;
 
     /// Follow a temperature → duty curve. May prompt via polkit.
@@ -162,6 +176,8 @@ pub struct Snapshot {
     pub profile_backend: Option<String>,
     /// Every profile the daemon knows, built-in and user-defined.
     pub profiles: Vec<String>,
+    /// Those backed by a file, and so deletable.
+    pub saved_profiles: Vec<String>,
     /// Profiles applied on each power source, empty when off.
     pub auto_profiles: (String, String),
     /// True on mains, false on battery, `None` when unknown.
@@ -211,6 +227,7 @@ impl Snapshot {
             profile: d.active_profile().ok().filter(|v| !v.is_empty()),
             profile_backend: d.profile_backend().ok(),
             profiles: d.profiles().unwrap_or_default(),
+            saved_profiles: d.saved_profiles().unwrap_or_default(),
             auto_profiles: d.auto_profiles().unwrap_or_default(),
             on_ac: t.get("on_ac").and_then(as_bool),
             package_watts: t.get("package_watts").and_then(as_f64),

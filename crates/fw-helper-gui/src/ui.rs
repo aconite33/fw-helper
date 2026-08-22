@@ -51,6 +51,9 @@ struct Widgets {
     fan_auto: gtk::Button,
     auto_ac: adw::ComboRow,
     auto_batt: adw::ComboRow,
+    save_entry: adw::EntryRow,
+    delete_button: gtk::Button,
+    saved_profiles: Vec<String>,
     /// Pending debounced sends, so a control that is still being adjusted issues one
     /// command rather than one per step.
     pending: HashMap<&'static str, glib::SourceId>,
@@ -112,6 +115,33 @@ pub fn build(app: &adw::Application) {
     // each side rather than a disguised default.
     let auto_ac = adw::ComboRow::builder().title("On AC").build();
     let auto_batt = adw::ComboRow::builder().title("On battery").build();
+    // Save what is set now as a profile, and remove one that has a file.
+    let save_entry = adw::EntryRow::builder()
+        .title("Save current settings as")
+        .build();
+    let save_button = gtk::Button::builder()
+        .label("Save")
+        .valign(gtk::Align::Center)
+        .build();
+    save_entry.add_suffix(&save_button);
+
+    let delete_button = gtk::Button::builder()
+        .label("Delete")
+        .valign(gtk::Align::Center)
+        .css_classes(["destructive-action"])
+        .build();
+    let delete_row = adw::ActionRow::builder()
+        .title("Remove the selected profile")
+        .subtitle("only profiles you saved have a file to remove")
+        .build();
+    delete_row.add_suffix(&delete_button);
+
+    let save_group = adw::PreferencesGroup::builder()
+        .title("Your profiles")
+        .build();
+    save_group.add(&save_entry);
+    save_group.add(&delete_row);
+
     let auto_group = adw::PreferencesGroup::builder()
         .title("Switch automatically")
         .description("Applied when the cable changes, not immediately")
@@ -144,6 +174,7 @@ pub fn build(app: &adw::Application) {
         .build();
     content.append(&stats);
     content.append(&system_group);
+    content.append(&save_group);
     content.append(&auto_group);
     content.append(&sensors_group);
     content.append(&caps_group);
@@ -186,6 +217,9 @@ pub fn build(app: &adw::Application) {
         fan_auto: fan_auto.clone(),
         auto_ac: auto_ac.clone(),
         auto_batt: auto_batt.clone(),
+        save_entry: save_entry.clone(),
+        delete_button: delete_button.clone(),
+        saved_profiles: Vec::new(),
         pending: HashMap::new(),
         in_flight: HashMap::new(),
         sensors_group,
@@ -273,6 +307,38 @@ pub fn build(app: &adw::Application) {
         });
     }
 
+    {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        save_button.connect_clicked(move |_| {
+            // Immutable: every call below is a GTK setter, which takes &self.
+            let Ok(w) = w.try_borrow() else {
+                return;
+            };
+            let name = w.save_entry.text().trim().to_lowercase();
+            if name.is_empty() {
+                w.banner.set_title("give the profile a name first");
+                w.banner.set_revealed(true);
+                return;
+            }
+            // The daemon validates the name properly and its message says what is
+            // wrong, so do not duplicate the rules here.
+            w.save_entry.set_text("");
+            let _ = tx.send(Command::SaveProfile(name));
+        });
+    }
+    {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        delete_button.connect_clicked(move |_| {
+            let Ok(w) = w.try_borrow() else { return };
+            let selected = w.profile_row.selected() as usize;
+            if let Some(name) = w.profile_names.get(selected).cloned() {
+                let _ = tx.send(Command::DeleteProfile(name));
+            }
+        });
+    }
+
     glib::spawn_future_local(async move {
         while let Ok(update) = rx.recv().await {
             let mut w = widgets.borrow_mut();
@@ -317,6 +383,7 @@ fn expected(cmd: &Command) -> String {
         Command::ChargeLimit(v) => v.to_string(),
         Command::FanAuto => "auto".to_string(),
         Command::AutoProfiles(ac, batt) => format!("{ac}/{batt}"),
+        Command::SaveProfile(name) | Command::DeleteProfile(name) => name.clone(),
     }
 }
 
@@ -436,6 +503,27 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
     w.profile_row.set_sensitive(
         !w.profile_names.is_empty() && s.capability("power limit").is_some_and(|(ok, _)| ok),
     );
+    // Say what the machine is actually set to, not just which profile is named. A
+    // profile is a power budget plus a curve, and the budget is the part people change
+    // by hand afterwards - so it can differ from what the profile itself specifies.
+    let mut applied = Vec::new();
+    if let Some(w_) = s.power_limit {
+        applied.push(format!("{w_} W"));
+    }
+    match s.fan_mode.as_deref() {
+        Some("curve") => applied.push("fan on a curve".into()),
+        Some("manual") => applied.push("fan set by hand".into()),
+        Some("unavailable") | None => {}
+        Some(_) => applied.push("fan left to the EC".into()),
+    }
+    if matches!(s.profile_backend.as_deref(), Some("platform_profile")) {
+        applied.push("GNOME slider not in sync".into());
+    }
+    w.profile_row.set_subtitle(&if applied.is_empty() {
+        "power limit and fan curve".to_string()
+    } else {
+        applied.join(" · ")
+    });
 
     match s.charge_limit {
         Some(v) => {
@@ -498,6 +586,17 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
             .unwrap_or(0);
         row.set_selected(index);
     }
+
+    // Deleting is only meaningful for a profile that has a file. A user file may
+    // replace a built-in, so the daemon is asked which those are rather than guessing
+    // from the name.
+    w.saved_profiles = s.saved_profiles.clone();
+    let selected = w.profile_row.selected() as usize;
+    let deletable = w
+        .profile_names
+        .get(selected)
+        .is_some_and(|n| w.saved_profiles.contains(n));
+    w.delete_button.set_sensitive(deletable);
 
     // Handing the fan back is only meaningful while we hold it.
     let ours = matches!(s.fan_mode.as_deref(), Some("manual") | Some("curve"));

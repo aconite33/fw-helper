@@ -78,6 +78,25 @@ fn load_from(dir: &Path) -> Vec<Profile> {
     profiles
 }
 
+/// Names that have a file in the profile directory.
+///
+/// Read from disk rather than tracked in memory: a user file may *replace* a built-in,
+/// so the name alone does not say whether there is something to delete. Answering from
+/// the directory cannot drift.
+pub fn saved_names() -> Vec<String> {
+    let Ok(entries) = fs::read_dir(PROFILE_DIR) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "conf"))
+        .filter_map(|p| p.file_stem()?.to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Write a profile to `/etc/fw-helper/profiles.d/<name>.conf`.
 ///
 /// The filename comes from the profile's own validated name, which is restricted to

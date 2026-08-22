@@ -32,6 +32,8 @@ pub enum Command {
     ChargeLimit(u8),
     FanAuto,
     AutoProfiles(String, String),
+    SaveProfile(String),
+    DeleteProfile(String),
 }
 
 impl Command {
@@ -46,6 +48,9 @@ impl Command {
             Self::ChargeLimit(_) => "charge",
             Self::FanAuto => "fan",
             Self::AutoProfiles(..) => "auto",
+            // Saving and deleting change the profile *list* rather than a control's
+            // value, so there is nothing to hold and confirm.
+            Self::SaveProfile(_) | Self::DeleteProfile(_) => "profiles",
         }
     }
 }
@@ -82,6 +87,14 @@ fn spawn_commands(tx: async_channel::Sender<Update>) -> std::sync::mpsc::Sender<
                     Command::FanAuto => d
                         .set_fan_auto()
                         .map(|_| "fan returned to EC control".to_string())
+                        .map_err(describe),
+                    Command::SaveProfile(name) => d
+                        .save_profile(&name)
+                        .map(|path| format!("saved {name} to {path}"))
+                        .map_err(describe),
+                    Command::DeleteProfile(name) => d
+                        .delete_profile(&name)
+                        .map(|()| format!("deleted {name}"))
                         .map_err(describe),
                     Command::AutoProfiles(ac, batt) => d
                         .set_auto_profiles(&ac, &batt)
