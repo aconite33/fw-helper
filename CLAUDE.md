@@ -24,28 +24,30 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
 | M7 | planned; every mechanism pre-verified |
 | M6 — GUI | controls land: profile, save/delete, power limit, charge limit, fan release, auto-switching. Curve editing outstanding |
-| M7 — packaging | `.deb` builds with auto-computed deps, desktop entry, opt-in charge control. **Install not yet verified** |
+| M7 — packaging | **complete**: install, GNOME app-grid launch and `apt remove` (fan back to the EC, `pwm1_enable=2`) all verified on hardware |
 
 Read `docs/plan.md` for milestones and `docs/hardware-baseline.md` for what the board
 actually exposes. **Do not re-derive hardware facts — they are measured and recorded.**
 
-### Resume here — verify the package, then the curve editor
+### Resume here — the curve editor
 
-Last session ended 2026-08-22. M0–M5 are complete and hardware-verified. M6 has working
-controls and M7 has a `.deb` that builds but **has not been installed even once**.
+Last session ended 2026-08-22. M0–M5 and M7 are complete and hardware-verified. M6 has
+working controls; the curve editor is the last real feature.
 
-**Do this first.** `./scripts/build-deb.sh` produces `fw-helper_<version>_amd64.deb`;
-install it with `sudo apt install ./fw-helper_*.deb` and check three things nobody has
-checked: that it installs and starts, that **fw-helper launches from the GNOME app grid**
-rather than a terminal, and that `sudo apt remove fw-helper` returns the fan to the EC.
-The prerm stops the unit so `ExecStopPost` runs, but that is reasoning, not evidence.
+**The package is verified.** It installs, the daemon starts and serves all five
+capabilities, **fw-helper launches from the GNOME app grid**, and `apt remove` returns the
+fan to the EC (`pwm1_enable=2`, checked directly). Two defects were found and fixed doing
+it: the GUI left every control live-looking while disconnected, and the postinst inferred
+charge-control setup from a runtime sysfs node that can outlive its drop-in.
 
-**The machine is currently bare.** `install-dev.sh --uninstall` ran, so there is no daemon
-installed and the modprobe drop-in is gone — the charge limit is inactive until
-`sudo fw-helper-enable-charge-control` (packaged) or `install-dev.sh --enable-charge-control`
-(dev). `/var/lib/fw-helper/state` survives, so profiles and the learned fan floor are intact.
+**The machine is currently bare again** — the removal test left the package in `rc` state,
+so there is no daemon. Reinstall with `sudo dpkg -i fw-helper_0.0.1_amd64.deb`.
+`/var/lib/fw-helper/state` survives, so profiles and the learned fan floor are intact.
+The modprobe drop-in is **not** installed: charge control still works only because the
+module holds the parameter from a boot on 2026-08-21, and it dies at the next reboot until
+`sudo fw-helper-enable-charge-control` runs.
 
-**Then: the fan curve editor**, the last real M6 feature. Everything under it exists — the
+**The fan curve editor**, the last real M6 feature. Everything under it exists — the
 curve engine validates, the daemon accepts a curve over D-Bus, and `fw-helperctl fan curve
 55:0,70:65` works. What is missing is a way to draw one. The measurements that should shape
 it are in `docs/hardware-baseline.md`: the useful range is duty 30 (stiction, 1107 rpm) to
@@ -208,6 +210,9 @@ All of these cost real time once. Do not rediscover them.
 | `systemctl enable --now` does **not** restart | It starts a unit only if it is not already running, so every reinstall after the first leaves the old process serving the old binary while the files on disk look new. Use `enable` + `restart` |
 | A long method **stalls the poll loop** | The loop took zbus's interface *write* lock every tick; any method awaiting a polkit prompt holds the read lock meanwhile. A password dialog stopped the heartbeat for 6 s and the fan watchdog took the fan back. Keep published state behind its own mutex and read-lock only |
 | **Stale binary on PATH** | Bit us twice, both times looking like a broken daemon. `install-dev.sh` now installs a shim resolving the newest build per invocation. Still: build release *and* debug |
+| `apt install ./pkg.deb` **silently no-ops** on an unchanged version | Same family as the stale binary, one layer up. Rebuilding the `.deb` after a fix does not change `0.0.1`, so apt reports "already the newest version", installs nothing, and the fix is tested against the old payload. `dpkg -i` reinstalls regardless. **md5sum the installed binary against `target/release/`** rather than trusting the install log |
+| A capability can **outlive the config that enables it** | `charge_control_end_threshold` exists whenever the module was *loaded* with `probe_with_fwk_charge_control=1`, including by a drop-in deleted since — the parameter survives until reboot. The postinst read that node and concluded the machine was set up, so it stayed silent about a capability one reboot from vanishing. Test the **persistent config** (`/etc/modprobe.d/fw-helper.conf`), not the runtime symptom |
+| A **disconnected** GUI still looks operable | Sensitivity is decided by `sync_controls` from a snapshot, which cannot run with no daemon — so controls keep whatever state they were built with. Cold-started against no daemon, every control accepted input and discarded it, which reads as "the app does nothing" rather than "nothing is installed". Build controls insensitive; gate the groups on connection, and let per-row capability sensitivity sit underneath |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |
 

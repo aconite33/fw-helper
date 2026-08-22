@@ -102,11 +102,22 @@ if [ "$1" = configure ]; then
     systemctl enable fw-helperd.service || true
     systemctl restart fw-helperd.service || true
 
-    if [ ! -e /sys/class/power_supply/BAT1/charge_control_end_threshold ]; then
+    # Ask whether charge control is configured to *persist*, not whether it happens to
+    # work this minute. The sysfs node exists whenever the module was loaded with the
+    # parameter set - including by a drop-in that has since been removed, since the
+    # module keeps its parameter until reboot. Testing the node alone therefore reports
+    # a machine as set up when the capability is one reboot from silently vanishing.
+    if [ ! -e /etc/modprobe.d/fw-helper.conf ]; then
         echo ""
         echo "fw-helper: battery charge limiting is off by default."
         echo "  It changes which mechanism governs charging on this machine, so it"
         echo "  is opt-in:  sudo fw-helper-enable-charge-control"
+        if [ -e /sys/class/power_supply/BAT1/charge_control_end_threshold ]; then
+            echo ""
+            echo "  Note: it is working right now, but only because the module was"
+            echo "  loaded with the parameter earlier. Without the step above it will"
+            echo "  stop working at the next reboot."
+        fi
         echo ""
     fi
 fi

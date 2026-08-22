@@ -44,6 +44,14 @@ struct Widgets {
     sensor_rows: HashMap<String, (adw::ActionRow, gtk::LevelBar)>,
     caps_group: adw::PreferencesGroup,
     cap_rows: HashMap<String, adw::ActionRow>,
+    /// The groups holding every control, kept so they can be switched off wholesale
+    /// when there is no daemon to receive what they would send. Per-row sensitivity is
+    /// decided by `sync_controls` from a snapshot, which by definition cannot run while
+    /// disconnected - so without this the controls keep whatever state they were built
+    /// with, and a cold start with no daemon shows a fully live-looking window.
+    system_group: adw::PreferencesGroup,
+    save_group: adw::PreferencesGroup,
+    auto_group: adw::PreferencesGroup,
     // Controls. Each is refreshed from telemetry, which means every update would
     // otherwise look like the user operating it — see `settling`.
     profile_row: adw::ComboRow,
@@ -215,6 +223,13 @@ pub fn build(app: &adw::Application) {
         .content(&toolbar)
         .build();
 
+    // Nothing is operable until a snapshot says so. Building these live means the
+    // window is briefly - or, with no daemon installed, permanently - a set of
+    // controls that accept input and silently discard it.
+    for group in [&system_group, &save_group, &auto_group] {
+        group.set_sensitive(false);
+    }
+
     let widgets = Rc::new(RefCell::new(Widgets {
         title,
         banner,
@@ -242,6 +257,9 @@ pub fn build(app: &adw::Application) {
         sensor_rows: HashMap::new(),
         caps_group,
         cap_rows: HashMap::new(),
+        system_group,
+        save_group,
+        auto_group,
     }));
 
     let (rx, commands) = worker::spawn();
@@ -701,12 +719,37 @@ fn disconnected(w: &mut Widgets, why: &str) {
     w.banner
         .set_title(&format!("fw-helperd is not available — {why}"));
     w.banner.set_revealed(true);
+    // Every reading is now stale. Blank all four cards, not the two that happen to
+    // move fastest - a temperature left on screen is read as the current one.
     w.power.set_label("—");
     w.fan.set_label("—");
+    w.cpu_temp.set_label("—");
+    w.system.set_label("—");
+    w.profile.set_label("—");
+    // A control that cannot reach the daemon must not look operable. Switching the
+    // groups off leaves each row's own sensitivity untouched underneath, so whatever
+    // the capabilities said still applies once a snapshot comes back.
+    set_controls_live(w, false);
+    // The sensor and capability lists keep their contents - emptying them would make
+    // the window jump - but they are dimmed to say they are no longer live.
+    w.sensors_group.set_sensitive(false);
+    w.caps_group.set_sensitive(false);
+}
+
+/// Enable or disable the control groups as a whole.
+fn set_controls_live(w: &Widgets, live: bool) {
+    w.system_group.set_sensitive(live);
+    w.save_group.set_sensitive(live);
+    w.auto_group.set_sensitive(live);
 }
 
 fn apply(w: &mut Widgets, s: &Snapshot) {
     w.title.set_subtitle("Framework Laptop 13");
+    // Undo a previous disconnect before `sync_controls` refines each row; the two
+    // levels are independent, so a row the daemon says is unavailable stays off.
+    set_controls_live(w, true);
+    w.sensors_group.set_sensitive(true);
+    w.caps_group.set_sensitive(true);
 
     // Refresh the controls from the daemon. The signals this fires are suppressed by
     // the mutable borrow we are already holding - see the handlers.
