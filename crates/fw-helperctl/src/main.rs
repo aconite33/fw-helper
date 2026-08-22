@@ -23,7 +23,12 @@ USAGE:
     fw-helperctl fan curve T:D,.. follow a custom curve, e.g. 55:0,70:65,85:120
     fw-helperctl power-limit N   set the sustained CPU power limit, in watts
     fw-helperctl profile         show profiles
-    fw-helperctl profile NAME    apply quiet | balanced | performance
+    fw-helperctl profile NAME    apply a profile by name
+    fw-helperctl profile save NAME    save current settings as a profile
+    fw-helperctl profile delete NAME  remove a saved profile
+    fw-helperctl auto-profile          show power-source switching
+    fw-helperctl auto-profile AC BATT  switch profile when the cable changes
+    fw-helperctl auto-profile off      stop switching automatically
 
 Talks to fw-helperd when it is running; otherwise reads sysfs directly, in which
 case package power needs root.
@@ -37,7 +42,14 @@ fn main() {
         Some("charge-limit") => charge_limit(args.get(1).map(String::as_str)),
         Some("fan") => fan(args.get(1).map(String::as_str)),
         Some("power-limit") => power_limit(args.get(1).map(String::as_str)),
-        Some("profile") => profile(args.get(1).map(String::as_str)),
+        Some("profile") => profile(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        Some("auto-profile") => auto_profile(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
         Some("-h") | Some("--help") => print!("{USAGE}"),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -87,6 +99,18 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
     match s.package_watts {
         Some(w) => println!("  package power      {w:.1} W"),
         None => println!("  package power      <unavailable>"),
+    }
+    if let Some(ac) = s.on_ac {
+        let (on_ac, on_batt) = &s.auto_profiles;
+        let auto = if on_ac.is_empty() && on_batt.is_empty() {
+            String::new()
+        } else {
+            format!("  (auto: AC={on_ac} battery={on_batt})")
+        };
+        println!(
+            "  power source       {}{auto}",
+            if ac { "AC" } else { "battery" }
+        );
     }
     if let Some(p) = &s.profile {
         let via = match s.profile_backend.as_deref() {
@@ -402,7 +426,7 @@ fn power_limit(arg: Option<&str>) {
 ///
 /// A profile is a PPD profile plus the knobs PPD does not manage (ADR 0005), so this
 /// also moves the GNOME power slider — that is the point, not a side effect.
-fn profile(arg: Option<&str>) {
+fn profile(arg: Option<&str>, extra: Option<&str>) {
     let (d, _) = match connect() {
         Ok(pair) => pair,
         Err(e) => {
@@ -410,6 +434,27 @@ fn profile(arg: Option<&str>) {
             std::process::exit(1);
         }
     };
+    if matches!(arg, Some("save") | Some("delete")) {
+        let verb = arg.unwrap_or_default();
+        let Some(name) = extra else {
+            eprintln!("usage: fw-helperctl profile {verb} <name>");
+            std::process::exit(2);
+        };
+        let result = if verb == "save" {
+            d.save_profile(name).map(|path| {
+                println!("saved as {name}");
+                println!("  written to {path}");
+                println!("  edit it by hand, or 'fw-helperctl profile delete {name}' to remove");
+            })
+        } else {
+            d.delete_profile(name).map(|()| println!("deleted {name}"))
+        };
+        if let Err(e) = result {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
     let Some(name) = arg else {
         let active = d.active_profile().unwrap_or_default();
         for p in d.profiles().unwrap_or_default() {
@@ -430,6 +475,64 @@ fn profile(arg: Option<&str>) {
             println!("profile {name} applied");
             println!("  power limit and fan curve set; the GNOME power slider follows");
             println!("  the power limit takes ~32 s to show in readings");
+        }
+        Err(e) => {
+            eprintln!("failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Show or set power-source profile switching.
+///
+/// Off unless asked for: a machine that changes behaviour when a cable is plugged in,
+/// without having been told to, is a machine behaving strangely.
+fn auto_profile(ac: Option<&str>, batt: Option<&str>) {
+    let (d, _) = match connect() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fw-helperd unavailable ({e})");
+            std::process::exit(1);
+        }
+    };
+    let Some(ac) = ac else {
+        match d.auto_profiles().unwrap_or_default() {
+            (a, b) if a.is_empty() && b.is_empty() => {
+                println!("automatic switching is off");
+                println!("  set it with: fw-helperctl auto-profile <on-ac> <on-battery>");
+            }
+            (a, b) => {
+                println!(
+                    "on AC:      {}",
+                    if a.is_empty() { "(unchanged)" } else { &a }
+                );
+                println!(
+                    "on battery: {}",
+                    if b.is_empty() { "(unchanged)" } else { &b }
+                );
+            }
+        }
+        std::process::exit(0);
+    };
+
+    let (ac, batt) = if ac == "off" {
+        ("", "")
+    } else {
+        match batt {
+            Some(b) => (ac, b),
+            None => {
+                eprintln!("usage: fw-helperctl auto-profile <on-ac> <on-battery>");
+                eprintln!("   or: fw-helperctl auto-profile off");
+                std::process::exit(2);
+            }
+        }
+    };
+
+    match d.set_auto_profiles(ac, batt) {
+        Ok(()) if ac.is_empty() => println!("automatic switching is off"),
+        Ok(()) => {
+            println!("on AC: {ac}, on battery: {batt}");
+            println!("  applied when the cable changes, not now");
         }
         Err(e) => {
             eprintln!("failed: {e}");

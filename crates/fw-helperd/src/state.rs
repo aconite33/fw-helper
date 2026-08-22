@@ -27,6 +27,11 @@ pub struct State {
     pub power_limit: Option<u32>,
     /// Active profile name, re-applied at startup.
     pub profile: Option<String>,
+    /// Profiles to switch to when the power source changes. Both `None` means the
+    /// feature is off, which is the default: a machine that changes behaviour when a
+    /// cable is plugged in, without being asked to, is a machine behaving strangely.
+    pub profile_on_ac: Option<String>,
+    pub profile_on_battery: Option<String>,
     /// Observed firmware fan duty by temperature, as `(celsius, duty)`.
     pub floor: Vec<(f64, u8)>,
 }
@@ -66,6 +71,12 @@ impl State {
                 "charge_limit" => s.charge_limit = value.trim().parse().ok(),
                 "power_limit" => s.power_limit = value.trim().parse().ok(),
                 "profile" => s.profile = Some(value.trim().to_string()).filter(|v| !v.is_empty()),
+                "profile_on_ac" => {
+                    s.profile_on_ac = Some(value.trim().to_string()).filter(|v| !v.is_empty())
+                }
+                "profile_on_battery" => {
+                    s.profile_on_battery = Some(value.trim().to_string()).filter(|v| !v.is_empty())
+                }
                 "fan_floor" => s.floor = parse_floor(value),
                 _ => {}
             }
@@ -89,6 +100,12 @@ impl State {
         }
         if let Some(v) = &self.profile {
             out.push_str(&format!("profile={v}\n"));
+        }
+        if let Some(v) = &self.profile_on_ac {
+            out.push_str(&format!("profile_on_ac={v}\n"));
+        }
+        if let Some(v) = &self.profile_on_battery {
+            out.push_str(&format!("profile_on_battery={v}\n"));
         }
         if !self.floor.is_empty() {
             let pairs: Vec<String> = self

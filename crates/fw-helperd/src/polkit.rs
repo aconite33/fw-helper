@@ -23,6 +23,23 @@ const FLAG_ALLOW_INTERACTION: u32 = 1;
 /// wedges the method handler forever.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A handle to the tokio runtime, captured while we are still on it.
+///
+/// **Interface methods do not run on the tokio runtime.** zbus drives them on its own
+/// executor (it uses `async-io` by default), so any tokio-specific API called from a
+/// handler panics with "there is no reactor running" — measured on 2026-08-22, when the
+/// first unprivileged caller reached the interactive polkit path and took the
+/// connection's executor thread down with it.
+///
+/// The bounded prompt below genuinely needs a timer, and the timer needs a runtime, so
+/// the work is handed to the runtime that has one rather than assuming we are on it.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Call once from `main`, which *is* on the runtime.
+pub fn init_runtime(handle: tokio::runtime::Handle) {
+    let _ = RUNTIME.set(handle);
+}
+
 #[zbus::proxy(
     interface = "org.freedesktop.PolicyKit1.Authority",
     default_service = "org.freedesktop.PolicyKit1",
@@ -68,17 +85,55 @@ pub async fn check(conn: &zbus::Connection, sender: &str, action: &str) -> Resul
     }
 
     // Authentication is genuinely required. Now allow a prompt, bounded.
-    let prompt =
-        authority.check_authorization(&subject, action, HashMap::new(), FLAG_ALLOW_INTERACTION, "");
-    match tokio::time::timeout(PROMPT_TIMEOUT, prompt).await {
-        Ok(Ok((true, _, _))) => Ok(()),
-        Ok(Ok((false, _, _))) => Err(format!("not authorized for {action}")),
-        Ok(Err(e)) => Err(format!("polkit check failed: {e}")),
-        Err(_) => Err(format!(
-            "no answer from polkit within {}s for {action}. No authentication agent \
-             is available for this caller — run from a desktop session, or as root",
-            PROMPT_TIMEOUT.as_secs()
-        )),
+    //
+    // Run it on the tokio runtime rather than here: this is a zbus executor thread and
+    // has no timer, and `tokio::time::timeout` panics without one. The task owns
+    // everything it touches, because a spawned task must be 'static.
+    let Some(runtime) = RUNTIME.get() else {
+        return Err(format!(
+            "cannot bound the authentication prompt for {action}: no runtime handle. \
+             Refusing rather than waiting forever"
+        ));
+    };
+    let conn = conn.clone();
+    let sender = sender.to_string();
+    let action_id = action.to_string();
+
+    let bounded = runtime.spawn(async move {
+        let authority = AuthorityProxy::new(&conn)
+            .await
+            .map_err(|e| format!("cannot reach polkit: {e}"))?;
+        let mut details = HashMap::new();
+        let name = OwnedValue::try_from(zbus::zvariant::Value::from(sender.as_str()))
+            .map_err(|e| format!("cannot encode caller name: {e}"))?;
+        details.insert("name", name);
+        let subject = (SUBJECT_KIND, details);
+
+        let prompt = authority.check_authorization(
+            &subject,
+            &action_id,
+            HashMap::new(),
+            FLAG_ALLOW_INTERACTION,
+            "",
+        );
+        match tokio::time::timeout(PROMPT_TIMEOUT, prompt).await {
+            Ok(Ok((true, _, _))) => Ok(()),
+            Ok(Ok((false, _, _))) => Err(format!("not authorized for {action_id}")),
+            Ok(Err(e)) => Err(format!("polkit check failed: {e}")),
+            Err(_) => Err(format!(
+                "no answer from polkit within {}s for {action_id}. No authentication \
+                 agent is available for this caller — run from a desktop session, or \
+                 as root",
+                PROMPT_TIMEOUT.as_secs()
+            )),
+        }
+    });
+
+    match bounded.await {
+        Ok(result) => result,
+        // The task itself failed: a panic inside it must surface as a denial, not as a
+        // silent success. Fails closed, like every other error on this path.
+        Err(e) => Err(format!("polkit check did not complete: {e}")),
     }
 }
 

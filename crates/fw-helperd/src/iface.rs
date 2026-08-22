@@ -38,13 +38,20 @@ pub struct Shared {
     pub watchdog: Arc<Watchdog>,
     pub axis: Arc<crate::ppd::ProfileAxis>,
     pub applied_ppd: Arc<std::sync::atomic::AtomicU8>,
-    pub profiles: Arc<Vec<fw_helper_core::Profile>>,
+    /// Behind a mutex because saving a profile changes it at run time.
+    pub profiles: Arc<Mutex<Vec<fw_helper_core::Profile>>>,
 }
 
 pub struct Daemon {
     fs: Sysfs,
     caps: Capabilities,
-    latest: Telemetry,
+    /// Behind a mutex for the same reason `state` is, and it matters more than it
+    /// looks. Updating it used to need `&mut self`, so the poll loop took zbus's
+    /// interface **write** lock every second. Any method awaiting something slow holds
+    /// the read lock meanwhile — and a polkit password prompt is very slow — so the
+    /// poll loop stalled for the length of the prompt. Measured 2026-08-22: a prompt
+    /// stopped the heartbeat for 6 s and the fan watchdog took the fan back, mid-dialog.
+    latest: Mutex<Telemetry>,
     /// Behind a mutex so write methods can take `&self`. A `&mut self` method makes
     /// zbus hold the interface **write** lock for the whole call, and a polkit prompt
     /// can legitimately take tens of seconds — which would stall telemetry for every
@@ -63,7 +70,7 @@ pub struct Daemon {
     /// the two are indistinguishable at the receiving end.
     applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     /// Built-ins merged with anything in `/etc/fw-helper/profiles.d/`.
-    profiles: Arc<Vec<fw_helper_core::Profile>>,
+    profiles: Arc<Mutex<Vec<fw_helper_core::Profile>>>,
 }
 
 impl Daemon {
@@ -71,7 +78,7 @@ impl Daemon {
         Self {
             fs,
             caps,
-            latest: Telemetry::default(),
+            latest: Mutex::new(Telemetry::default()),
             state: Mutex::new(state),
             fan: shared.fan,
             watchdog: shared.watchdog,
@@ -83,13 +90,21 @@ impl Daemon {
 
     /// The temperature a fan decision should be based on, if any sensor is readable.
     fn control_celsius(&self) -> Option<f64> {
-        self.latest.control_temp().map(|t| t.celsius)
+        self.latest
+            .lock()
+            .ok()
+            .and_then(|t| t.control_temp().map(|c| c.celsius))
     }
 
     /// Everything a fan decision needs from the thermal sensors, read from the same
     /// telemetry the daemon publishes.
     fn thermal(&self) -> crate::fan::Thermal {
-        crate::fan::Thermal::from_telemetry(&self.latest)
+        match self.latest.lock() {
+            Ok(t) => crate::fan::Thermal::from_telemetry(&t),
+            // A poisoned lock must not become "no sensor", which would read as a
+            // reason to refuse rather than a reason to be careful.
+            Err(e) => crate::fan::Thermal::from_telemetry(&e.into_inner().clone()),
+        }
     }
 
     /// Authorize a caller for one action, or say why not.
@@ -226,6 +241,37 @@ impl Daemon {
         }
     }
 
+    /// A snapshot of the known profiles.
+    fn known(&self) -> Vec<fw_helper_core::Profile> {
+        self.profiles.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    /// Look a profile up, or say what does exist.
+    fn by_name(&self, name: &str) -> zbus::fdo::Result<fw_helper_core::Profile> {
+        let known = self.known();
+        known
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let names: Vec<&str> = known.iter().map(|p| p.name.as_str()).collect();
+                zbus::fdo::Error::InvalidArgs(format!(
+                    "no profile {name:?}; known profiles are {}",
+                    names.join(", ")
+                ))
+            })
+    }
+
+    /// The profile configured for a power source, if any.
+    pub fn auto_profile_for(&self, on_ac: bool) -> Option<String> {
+        let s = self.state.lock().ok()?;
+        if on_ac {
+            s.profile_on_ac.clone()
+        } else {
+            s.profile_on_battery.clone()
+        }
+    }
+
     /// Re-assert the power limit if something moved it.
     ///
     /// **Our write can be verified and still not stick.** Measured 2026-08-22: after a
@@ -249,9 +295,12 @@ impl Daemon {
 
     /// Called by the poll task. Returns true when the published view actually changed,
     /// so we only emit a PropertiesChanged signal when there is something to say.
-    pub fn update(&mut self, t: Telemetry) -> bool {
-        let changed = self.latest != t;
-        self.latest = t;
+    pub fn update(&self, t: Telemetry) -> bool {
+        let Ok(mut latest) = self.latest.lock() else {
+            return false;
+        };
+        let changed = *latest != t;
+        *latest = t;
         changed
     }
 }
@@ -270,14 +319,20 @@ impl Daemon {
     /// must not be able to drive sampling cadence.
     #[zbus(property)]
     async fn telemetry(&self) -> HashMap<String, OwnedValue> {
-        wire::telemetry_dict(&self.latest)
+        match self.latest.lock() {
+            Ok(t) => wire::telemetry_dict(&t),
+            Err(_) => Default::default(),
+        }
     }
 
     /// Validated critical thresholds per sensor. Sensors reporting implausible
     /// values are omitted entirely rather than published as-is.
     #[zbus(property)]
     async fn critical_temperatures(&self) -> HashMap<String, f64> {
-        wire::critical_temps(&self.latest)
+        match self.latest.lock() {
+            Ok(t) => wire::critical_temps(&t),
+            Err(_) => Default::default(),
+        }
     }
 
     /// Interface version, so a client can refuse to talk to a daemon it does not
@@ -290,7 +345,7 @@ impl Daemon {
     /// Profiles this daemon knows, by name.
     #[zbus(property)]
     async fn profiles(&self) -> Vec<String> {
-        self.profiles.iter().map(|p| p.name.clone()).collect()
+        self.known().iter().map(|p| p.name.clone()).collect()
     }
 
     /// The profile matching whatever PPD currently has active, or empty if unknown.
@@ -327,18 +382,7 @@ impl Daemon {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        let profile = self
-            .profiles
-            .iter()
-            .find(|p| p.name == name)
-            .cloned()
-            .ok_or_else(|| {
-                let known: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
-                zbus::fdo::Error::InvalidArgs(format!(
-                    "no profile {name:?}; known profiles are {}",
-                    known.join(", ")
-                ))
-            })?;
+        let profile = self.by_name(name)?;
         // A profile sets a power limit and takes the fan, so it needs both rights.
         let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
         Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
@@ -367,6 +411,141 @@ impl Daemon {
             state.save();
         }
         eprintln!("profile {} applied by {sender}", profile.name);
+        Ok(())
+    }
+
+    /// Save what the machine is set to now as a profile, under `name`.
+    ///
+    /// Captures the current PPD profile, the current power limit, and the fan curve in
+    /// use — the active profile's curve if the fan is following one, otherwise the
+    /// curve of whichever profile is active. Writes it to
+    /// `/etc/fw-helper/profiles.d/<name>.conf`, which is a plain file the user can edit
+    /// afterwards.
+    ///
+    /// Saving under the name of a built-in replaces it, which is the documented way to
+    /// customise `quiet` rather than accumulating a near-duplicate beside it.
+    async fn save_profile(
+        &self,
+        name: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<String> {
+        let ppd = self
+            .axis
+            .active()
+            .await
+            .ok_or_else(|| zbus::fdo::Error::Failed("no power profile is active".into()))?;
+        let watts = PowerLimit::new(&self.fs)
+            .read()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("cannot read the power limit: {e}")))?;
+
+        // Prefer the curve actually running; fall back to the active profile's.
+        let curve = match self.fan.curve_points() {
+            Some(points) if !points.is_empty() => fw_helper_core::Curve::new(
+                points
+                    .into_iter()
+                    .map(|(celsius, duty)| fw_helper_core::Point { celsius, duty })
+                    .collect(),
+            )
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?,
+            _ => fw_helper_core::Profile::for_ppd(ppd).curve,
+        };
+
+        let profile = fw_helper_core::Profile {
+            name: name.to_string(),
+            ppd,
+            pl1_watts: watts,
+            curve,
+            // Deliberately not captured: a charge limit is a standing preference, and
+            // folding whatever it happens to be into a performance profile would make
+            // switching profiles change it later, which nobody asked for.
+            charge_limit: None,
+        };
+        profile
+            .validate()
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
+
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        let path = crate::profiles::save(&profile).map_err(zbus::fdo::Error::Failed)?;
+
+        // Take effect now rather than at the next restart.
+        if let Ok(mut known) = self.profiles.lock() {
+            match known.iter().position(|p| p.name == profile.name) {
+                Some(i) => known[i] = profile.clone(),
+                None => known.push(profile.clone()),
+            }
+        }
+        eprintln!(
+            "profile {} saved by {sender}: ppd={} pl1={} W -> {}",
+            profile.name,
+            profile.ppd.as_str(),
+            profile.pl1_watts,
+            path.display()
+        );
+        Ok(path.display().to_string())
+    }
+
+    /// Delete a saved profile. Built-ins have no file and cannot be removed.
+    async fn delete_profile(
+        &self,
+        name: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        crate::profiles::delete(name).map_err(zbus::fdo::Error::Failed)?;
+
+        if let Ok(mut known) = self.profiles.lock() {
+            known.retain(|p| p.name != name);
+            // A deleted file may have been shadowing a built-in, which now comes back.
+            for built_in in fw_helper_core::Profile::built_ins() {
+                if built_in.name == name {
+                    known.push(built_in);
+                }
+            }
+        }
+        eprintln!("profile {name} deleted by {sender}");
+        Ok(())
+    }
+
+    /// Profiles applied when the power source changes: `(on_ac, on_battery)`.
+    ///
+    /// Empty strings mean "leave it alone on that source", and both empty means the
+    /// feature is off.
+    #[zbus(property)]
+    async fn auto_profiles(&self) -> (String, String) {
+        match self.state.lock() {
+            Ok(s) => (
+                s.profile_on_ac.clone().unwrap_or_default(),
+                s.profile_on_battery.clone().unwrap_or_default(),
+            ),
+            Err(_) => (String::new(), String::new()),
+        }
+    }
+
+    /// Choose what to apply when the power source changes.
+    ///
+    /// Off by default and never inferred: a machine that changes behaviour when a cable
+    /// is plugged in, without having been asked to, is a machine behaving strangely.
+    async fn set_auto_profiles(
+        &self,
+        on_ac: &str,
+        on_battery: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        for name in [on_ac, on_battery] {
+            if !name.is_empty() {
+                self.by_name(name)?;
+            }
+        }
+        let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
+        if let Ok(mut state) = self.state.lock() {
+            state.profile_on_ac = Some(on_ac.to_string()).filter(|v| !v.is_empty());
+            state.profile_on_battery = Some(on_battery.to_string()).filter(|v| !v.is_empty());
+            state.save();
+        }
+        eprintln!("auto profiles set by {sender}: ac={on_ac:?} battery={on_battery:?}");
         Ok(())
     }
 
@@ -479,7 +658,7 @@ impl Daemon {
             Some(c) => self
                 .fan
                 .floor_duty(c)
-                .max(crate::fan::Thermal::from_telemetry(&self.latest).battery_floor_public()),
+                .max(self.thermal().battery_floor_public()),
             None => u8::MAX,
         }
     }
@@ -659,6 +838,8 @@ mod tests {
             charge_limit: persisted,
             power_limit: None,
             profile: None,
+            profile_on_ac: None,
+            profile_on_battery: None,
             floor: Vec::new(),
         };
         let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));
@@ -674,7 +855,7 @@ mod tests {
                 watchdog: wd,
                 axis,
                 applied_ppd: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-                profiles: Arc::new(fw_helper_core::Profile::built_ins()),
+                profiles: Arc::new(Mutex::new(fw_helper_core::Profile::built_ins())),
             },
         )
     }

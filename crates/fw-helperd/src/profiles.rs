@@ -78,6 +78,68 @@ fn load_from(dir: &Path) -> Vec<Profile> {
     profiles
 }
 
+/// Write a profile to `/etc/fw-helper/profiles.d/<name>.conf`.
+///
+/// The filename comes from the profile's own validated name, which is restricted to
+/// lowercase letters, digits and dashes — so it cannot contain a slash or `..` and
+/// cannot escape the directory. That restriction exists for typing convenience, but it
+/// is load-bearing here, and validation runs again before anything is written.
+pub fn save(profile: &Profile) -> Result<PathBuf, String> {
+    profile.validate().map_err(|e| e.to_string())?;
+    fs::create_dir_all(PROFILE_DIR).map_err(|e| format!("cannot create {PROFILE_DIR}: {e}"))?;
+    let path = Path::new(PROFILE_DIR).join(format!("{}.conf", profile.name));
+    fs::write(&path, render(profile))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Remove a saved profile. Built-ins have no file and cannot be deleted.
+pub fn delete(name: &str) -> Result<(), String> {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!("{name:?} is not a valid profile name"));
+    }
+    let path = Path::new(PROFILE_DIR).join(format!("{name}.conf"));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("no saved profile {name:?}; built-ins have no file"))
+        }
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+    }
+}
+
+/// Render a profile in the same format [`parse`] reads.
+///
+/// Round-trips: a saved profile is a file a user can then edit by hand, which is the
+/// point. The header says so, because a file that looks generated invites people to
+/// assume edits will be overwritten.
+pub fn render(profile: &Profile) -> String {
+    let curve: Vec<String> = profile
+        .curve
+        .points()
+        .iter()
+        .map(|p| format!("{}:{}", p.celsius, p.duty))
+        .collect();
+    // Written line by line: a `\\`-continued string literal keeps the source tidy but
+    // carries the source's own indentation into the file, which then greets the user as
+    // ragged comments in something they are invited to edit.
+    let mut out = String::new();
+    out.push_str("# fw-helper profile, written by fw-helperd.\n");
+    out.push_str("# Safe to edit by hand: it is read at daemon startup and never\n");
+    out.push_str("# rewritten unless you save over it.\n");
+    out.push_str(&format!("name = {}\n", profile.name));
+    out.push_str(&format!("ppd = {}\n", profile.ppd.as_str()));
+    out.push_str(&format!("pl1_watts = {}\n", profile.pl1_watts));
+    out.push_str(&format!("curve = {}\n", curve.join(", ")));
+    if let Some(limit) = profile.charge_limit {
+        out.push_str(&format!("charge_limit = {limit}\n"));
+    }
+    out
+}
+
 /// Parse one profile file.
 pub fn parse(text: &str) -> Result<Profile, String> {
     let mut name = None;
@@ -274,6 +336,31 @@ charge_limit = 80   # trailing comment
         let profiles = load_from(&d);
         assert!(profiles.iter().any(|p| p.name == "silent"));
         assert!(!profiles.iter().any(|p| p.name == "x"));
+    }
+
+    #[test]
+    fn a_saved_profile_reads_back_identically() {
+        // A saved profile is a file the user may then edit, so the writer and the
+        // parser have to agree exactly.
+        let original = parse(GOOD).unwrap();
+        let round_tripped = parse(&render(&original)).unwrap();
+        assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn a_built_in_round_trips_too() {
+        for p in Profile::built_ins() {
+            let back = parse(&render(&p)).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+            assert_eq!(p, back, "{} did not survive a round trip", p.name);
+        }
+    }
+
+    #[test]
+    fn delete_refuses_a_name_that_could_escape_the_directory() {
+        // The name becomes a filename. It is validated on the way in, and again here.
+        for bad in ["../../etc/passwd", "a/b", "..", "Quiet"] {
+            assert!(delete(bad).is_err(), "{bad:?} should be refused");
+        }
     }
 
     #[test]

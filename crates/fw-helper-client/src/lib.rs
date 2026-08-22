@@ -66,6 +66,19 @@ pub trait Daemon {
     /// Switch profile. May prompt via polkit.
     fn set_profile(&self, name: &str) -> zbus::Result<()>;
 
+    /// Save the current settings as a profile. Returns the file written.
+    fn save_profile(&self, name: &str) -> zbus::Result<String>;
+
+    /// Delete a saved profile. Built-ins have no file and cannot be removed.
+    fn delete_profile(&self, name: &str) -> zbus::Result<()>;
+
+    /// Profiles applied on each power source: `(on_ac, on_battery)`. Empty means off.
+    #[zbus(property)]
+    fn auto_profiles(&self) -> zbus::Result<(String, String)>;
+
+    /// Set them. Empty strings turn a side off. May prompt via polkit.
+    fn set_auto_profiles(&self, on_ac: &str, on_battery: &str) -> zbus::Result<()>;
+
     /// Sustained CPU power limit in watts, 0 when unsupported.
     #[zbus(property)]
     fn power_limit(&self) -> zbus::Result<u32>;
@@ -147,6 +160,12 @@ pub struct Snapshot {
     /// Active profile name, and how the axis is driven.
     pub profile: Option<String>,
     pub profile_backend: Option<String>,
+    /// Every profile the daemon knows, built-in and user-defined.
+    pub profiles: Vec<String>,
+    /// Profiles applied on each power source, empty when off.
+    pub auto_profiles: (String, String),
+    /// True on mains, false on battery, `None` when unknown.
+    pub on_ac: Option<bool>,
     /// (knob, available, reason-if-not)
     pub capabilities: Vec<(String, bool, String)>,
 }
@@ -191,6 +210,9 @@ impl Snapshot {
             power_limit_max: d.power_limit_max().ok().filter(|v| *v > 0),
             profile: d.active_profile().ok().filter(|v| !v.is_empty()),
             profile_backend: d.profile_backend().ok(),
+            profiles: d.profiles().unwrap_or_default(),
+            auto_profiles: d.auto_profiles().unwrap_or_default(),
+            on_ac: t.get("on_ac").and_then(as_bool),
             package_watts: t.get("package_watts").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),
@@ -208,6 +230,10 @@ impl Snapshot {
             .find(|(k, _, _)| k == name)
             .map(|(_, ok, why)| (*ok, why.as_str()))
     }
+}
+
+fn as_bool(v: &OwnedValue) -> Option<bool> {
+    bool::try_from(v).ok()
 }
 
 fn as_f64(v: &OwnedValue) -> Option<f64> {

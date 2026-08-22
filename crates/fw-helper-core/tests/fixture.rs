@@ -68,6 +68,9 @@ impl Fixture {
 
         f.write("sys/firmware/acpi/platform_profile", "balanced\n");
         f.write("sys/class/power_supply/BAT1/capacity", "100\n");
+        // Named ACAD on this board, so resolution must be by type, not by name.
+        f.write("sys/class/power_supply/ACAD/type", "Mains\n");
+        f.write("sys/class/power_supply/ACAD/online", "1\n");
         f.write("sys/class/power_supply/BAT1/status", "Not charging\n");
         f.write(
             "sys/module/cros_charge_control/parameters/probe_with_fwk_charge_control",
@@ -140,6 +143,11 @@ fn samples_telemetry_and_picks_the_control_sensor() {
     let t = mon.sample();
 
     assert_eq!(t.fan_rpm, Some(2925));
+    assert_eq!(
+        t.on_ac,
+        Some(true),
+        "mains must be found by type, not by name"
+    );
     assert_eq!(t.battery_percent, Some(100));
     assert_eq!(t.platform_profile.as_deref(), Some("balanced"));
     assert_eq!(t.temps.len(), 2);

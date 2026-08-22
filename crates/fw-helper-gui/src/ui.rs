@@ -1,6 +1,6 @@
 //! Window construction and updates.
 
-use crate::worker::{self, Update};
+use crate::worker::{self, Command, Update};
 use adw::prelude::*;
 use fw_helper_client::Snapshot;
 use gtk::glib;
@@ -41,6 +41,28 @@ struct Widgets {
     sensor_rows: HashMap<String, (adw::ActionRow, gtk::LevelBar)>,
     caps_group: adw::PreferencesGroup,
     cap_rows: HashMap<String, adw::ActionRow>,
+    // Controls. Each is refreshed from telemetry, which means every update would
+    // otherwise look like the user operating it — see `settling`.
+    profile_row: adw::ComboRow,
+    profile_names: Vec<String>,
+    charge_row: adw::SpinRow,
+    power_row: adw::SpinRow,
+    fan_row: adw::ActionRow,
+    fan_auto: gtk::Button,
+    auto_ac: adw::ComboRow,
+    auto_batt: adw::ComboRow,
+    /// Pending debounced sends, so a control that is still being adjusted issues one
+    /// command rather than one per step.
+    pending: HashMap<&'static str, glib::SourceId>,
+    /// Controls whose new value has not been seen coming back yet, with what we are
+    /// waiting for and since when.
+    ///
+    /// Held until **telemetry confirms the value**, not merely until the command
+    /// returns. The snapshot in flight when a command completes was fetched before it,
+    /// so releasing on the result alone writes the old value back for one tick — which
+    /// is exactly the "it changed and then jumped back" people report. The deadline
+    /// stops a change the daemon quietly declined from freezing the control forever.
+    in_flight: HashMap<&'static str, (String, std::time::Instant)>,
 }
 
 pub fn build(app: &adw::Application) {
@@ -60,16 +82,49 @@ pub fn build(app: &adw::Application) {
     stats.append(&stat_card(&fan, "fan"));
 
     let profile = gtk::Label::builder().xalign(0.0).label("—").build();
-    let profile_row = adw::ActionRow::builder()
-        .title("Performance profile")
+    let profile_row = adw::ComboRow::builder()
+        .title("Profile")
+        .subtitle("power limit and fan curve, via power-profiles-daemon")
         .build();
-    profile_row.add_suffix(&profile);
 
     let battery = adw::ActionRow::builder().title("Battery").build();
 
+    let charge_row = adw::SpinRow::builder()
+        .title("Charge limit")
+        .subtitle("stop charging at this percentage")
+        .adjustment(&gtk::Adjustment::new(80.0, 20.0, 100.0, 5.0, 5.0, 0.0))
+        .build();
+
+    let power_row = adw::SpinRow::builder()
+        .title("Power limit")
+        .subtitle("sustained CPU watts; takes ~32 s to settle")
+        .adjustment(&gtk::Adjustment::new(25.0, 8.0, 25.0, 1.0, 1.0, 0.0))
+        .build();
+
+    let fan_auto = gtk::Button::builder()
+        .label("Return to EC")
+        .valign(gtk::Align::Center)
+        .build();
+    let fan_row = adw::ActionRow::builder().title("Fan").build();
+    fan_row.add_suffix(&fan_auto);
+
+    // Automatic switching. Off unless asked for, and "leave alone" is a real choice on
+    // each side rather than a disguised default.
+    let auto_ac = adw::ComboRow::builder().title("On AC").build();
+    let auto_batt = adw::ComboRow::builder().title("On battery").build();
+    let auto_group = adw::PreferencesGroup::builder()
+        .title("Switch automatically")
+        .description("Applied when the cable changes, not immediately")
+        .build();
+    auto_group.add(&auto_ac);
+    auto_group.add(&auto_batt);
+
     let system_group = adw::PreferencesGroup::new();
     system_group.add(&profile_row);
+    system_group.add(&power_row);
+    system_group.add(&fan_row);
     system_group.add(&battery);
+    system_group.add(&charge_row);
 
     let sensors_group = adw::PreferencesGroup::builder()
         .title("Temperatures")
@@ -89,6 +144,7 @@ pub fn build(app: &adw::Application) {
         .build();
     content.append(&stats);
     content.append(&system_group);
+    content.append(&auto_group);
     content.append(&sensors_group);
     content.append(&caps_group);
 
@@ -122,24 +178,368 @@ pub fn build(app: &adw::Application) {
         fan,
         profile,
         battery,
+        profile_row: profile_row.clone(),
+        profile_names: Vec::new(),
+        charge_row: charge_row.clone(),
+        power_row: power_row.clone(),
+        fan_row: fan_row.clone(),
+        fan_auto: fan_auto.clone(),
+        auto_ac: auto_ac.clone(),
+        auto_batt: auto_batt.clone(),
+        pending: HashMap::new(),
+        in_flight: HashMap::new(),
         sensors_group,
         sensor_rows: HashMap::new(),
         caps_group,
         cap_rows: HashMap::new(),
     }));
 
-    let rx = worker::spawn();
+    let (rx, commands) = worker::spawn();
+
+    // Controls send commands; they never touch hardware from the main loop.
+    {
+        let w = Rc::clone(&widgets);
+        let w2 = Rc::clone(&widgets);
+        let tx = commands.clone();
+        profile_row.connect_selected_notify(move |row| {
+            trace(&format!("profile selected_notify -> {}", row.selected()));
+            // A failed borrow *is* the guard. Every control here is both an input and a
+            // display, and setting one from telemetry fires its changed signal exactly
+            // as a click would - synchronously, while `apply` still holds the mutable
+            // borrow. So being unable to borrow means this is our own write, not the
+            // user's. A flag cannot do this job: the borrow panics before it is read,
+            // and the panic is inside a C callback that cannot unwind, so it aborts.
+            let Ok(w) = w.try_borrow() else {
+                trace("profile: skipped, our own write");
+                return;
+            };
+            if let Some(name) = w.profile_names.get(row.selected() as usize).cloned() {
+                trace(&format!("profile: sending {name}"));
+                drop(w);
+                if let Ok(mut w) = w2.try_borrow_mut() {
+                    w.in_flight
+                        .insert("profile", (name.clone(), std::time::Instant::now()));
+                    w.banner.set_title(&format!("applying {name}…"));
+                    w.banner.set_revealed(true);
+                }
+                let _ = tx.send(Command::Profile(name));
+            }
+        });
+    }
+    {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        charge_row.connect_value_notify(move |row| {
+            trace(&format!("charge value_notify -> {}", row.value()));
+            if w.try_borrow().is_err() {
+                trace("charge: skipped, our own write");
+                return;
+            }
+            let value = row.value() as u8;
+            debounce(&w, &tx, "charge", move || Command::ChargeLimit(value));
+        });
+    }
+    {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        power_row.connect_value_notify(move |row| {
+            trace(&format!("power value_notify -> {}", row.value()));
+            if w.try_borrow().is_err() {
+                trace("power: skipped, our own write");
+                return;
+            }
+            let value = row.value() as u32;
+            debounce(&w, &tx, "power", move || Command::PowerLimit(value));
+        });
+    }
+    {
+        let tx = commands.clone();
+        fan_auto.connect_clicked(move |_| {
+            let _ = tx.send(Command::FanAuto);
+        });
+    }
+    for which in ["ac", "battery"] {
+        let w = Rc::clone(&widgets);
+        let tx = commands.clone();
+        let row = if which == "ac" { &auto_ac } else { &auto_batt };
+        row.connect_selected_notify(move |_| {
+            let Ok(w) = w.try_borrow() else { return };
+            // Both sides are sent together: the daemon holds one setting, so sending
+            // only the side that changed would clear the other.
+            let _ = tx.send(Command::AutoProfiles(
+                auto_choice(&w, &w.auto_ac),
+                auto_choice(&w, &w.auto_batt),
+            ));
+        });
+    }
+
     glib::spawn_future_local(async move {
         while let Ok(update) = rx.recv().await {
             let mut w = widgets.borrow_mut();
             match update {
                 Update::Data(s) => apply(&mut w, &s),
                 Update::Disconnected(why) => disconnected(&mut w, &why),
+                Update::CommandResult { key, result } => {
+                    // Only a failure releases the control here. A success keeps holding
+                    // until telemetry actually reports the new value, because the
+                    // snapshot already in flight predates the change.
+                    if result.is_err() {
+                        w.in_flight.remove(key);
+                    }
+                    let msg = match result {
+                        Ok(msg) => {
+                            trace(&format!("command ok: {msg}"));
+                            msg
+                        }
+                        // The daemon's messages are written to be read by a person and
+                        // say what to do about it, so show them rather than a generic
+                        // failure.
+                        Err(msg) => {
+                            trace(&format!("command FAILED: {msg}"));
+                            msg
+                        }
+                    };
+                    w.banner.set_title(&msg);
+                    w.banner.set_revealed(true);
+                }
             }
         }
     });
 
     window.present();
+}
+
+/// The value telemetry should report once a command has taken effect.
+fn expected(cmd: &Command) -> String {
+    match cmd {
+        Command::Profile(name) => name.clone(),
+        Command::PowerLimit(w) => w.to_string(),
+        Command::ChargeLimit(v) => v.to_string(),
+        Command::FanAuto => "auto".to_string(),
+        Command::AutoProfiles(ac, batt) => format!("{ac}/{batt}"),
+    }
+}
+
+/// Trace control activity when FW_HELPER_DEBUG_WIDGETS is set.
+fn trace(what: &str) {
+    if std::env::var_os("FW_HELPER_DEBUG_WIDGETS").is_some() {
+        eprintln!("ui: {what}");
+    }
+}
+
+/// How long to keep showing a value telemetry has not confirmed.
+///
+/// Long enough for a slow write to land, short enough that a silently ignored change
+/// does not leave the control lying about the machine indefinitely.
+const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a control must sit still before its value is sent.
+///
+/// A spin row emits a change per step, so holding `+` or typing a two-digit number
+/// fires several. Each is a D-Bus call through polkit, and they race: the last to land
+/// wins, which is not necessarily the one the user stopped on. 400 ms is below the
+/// threshold where a control feels laggy and far above the gap between key repeats.
+const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Send `cmd` once the user stops adjusting `key`.
+fn debounce(
+    widgets: &Rc<RefCell<Widgets>>,
+    tx: &std::sync::mpsc::Sender<Command>,
+    key: &'static str,
+    make: impl Fn() -> Command + 'static,
+) {
+    let tx = tx.clone();
+    // Cancel whatever was queued for this control: only the value it settles on matters.
+    if let Ok(mut w) = widgets.try_borrow_mut() {
+        if let Some(id) = w.pending.remove(key) {
+            id.remove();
+        }
+    }
+    let w2 = Rc::clone(widgets);
+    let id = glib::timeout_add_local_once(DEBOUNCE, move || {
+        if let Ok(mut w) = w2.try_borrow_mut() {
+            w.pending.remove(key);
+        }
+        trace(&format!("{key}: debounce fired, sending"));
+        let cmd = make();
+        if let Ok(mut w) = w2.try_borrow_mut() {
+            w.in_flight
+                .insert(key, (expected(&cmd), std::time::Instant::now()));
+        }
+        let _ = tx.send(cmd);
+    });
+    if let Ok(mut w) = widgets.try_borrow_mut() {
+        w.pending.insert(key, id);
+    }
+}
+
+/// The profile a combo is pointing at, or empty for "leave alone" (index 0).
+fn auto_choice(w: &Widgets, row: &adw::ComboRow) -> String {
+    match row.selected() {
+        0 => String::new(),
+        i => w
+            .profile_names
+            .get(i as usize - 1)
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+/// Push the daemon's view into the controls, and enable only what this machine can do.
+///
+/// Called with the widgets mutably borrowed, which is what stops the changed signals
+/// these writes fire from being mistaken for user input.
+fn sync_controls(w: &mut Widgets, s: &Snapshot) {
+    // Never overwrite a control the user is still adjusting, or one whose command has
+    // not come back yet. Its value is newer than the daemon's, and writing the old one
+    // back is exactly what makes a setting appear to snap away the instant it changes.
+    // Release anything telemetry has now confirmed, or that has waited long enough.
+    let observed = [
+        ("profile", s.profile.clone().unwrap_or_default()),
+        (
+            "power",
+            s.power_limit.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+        (
+            "charge",
+            s.charge_limit.map(|v| v.to_string()).unwrap_or_default(),
+        ),
+    ];
+    for (key, now) in observed {
+        if let Some((want, since)) = w.in_flight.get(key) {
+            if *want == now || since.elapsed() > CONFIRM_TIMEOUT {
+                w.in_flight.remove(key);
+            }
+        }
+    }
+
+    let charge_busy = w.pending.contains_key("charge") || w.in_flight.contains_key("charge");
+    let power_busy = w.pending.contains_key("power") || w.in_flight.contains_key("power");
+    let profile_busy = w.in_flight.contains_key("profile");
+
+    // The profile list can change under us: user profiles are read at daemon startup,
+    // so a daemon restart can add or remove entries.
+    let names: Vec<String> = s.profiles.clone();
+    let names_changed = names != w.profile_names;
+    if names_changed {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        w.profile_row.set_model(Some(&gtk::StringList::new(&refs)));
+        w.profile_names = names;
+    }
+    if let Some(active) = &s.profile {
+        if !profile_busy {
+            if let Some(i) = w.profile_names.iter().position(|n| n == active) {
+                w.profile_row.set_selected(i as u32);
+            }
+        }
+    }
+    w.profile_row.set_sensitive(
+        !w.profile_names.is_empty() && s.capability("power limit").is_some_and(|(ok, _)| ok),
+    );
+
+    match s.charge_limit {
+        Some(v) => {
+            if !charge_busy {
+                w.charge_row.set_value(f64::from(v));
+            }
+            w.charge_row.set_sensitive(true);
+            w.charge_row
+                .set_subtitle("stop charging at this percentage");
+        }
+        None => {
+            w.charge_row.set_sensitive(false);
+            // A dead control with no explanation is the thing the capability system
+            // exists to prevent, so borrow the daemon's reason.
+            w.charge_row.set_subtitle(
+                s.capability("charge limit")
+                    .map(|(_, why)| why)
+                    .filter(|why| !why.is_empty())
+                    .unwrap_or("unavailable on this machine"),
+            );
+        }
+    }
+
+    match (s.power_limit, s.power_limit_max) {
+        (Some(v), Some(max)) => {
+            // Clamp to what the zone actually admits, never to the MSR zone's
+            // fictional 200 W.
+            w.power_row.adjustment().set_upper(f64::from(max));
+            if !power_busy {
+                w.power_row.set_value(f64::from(v));
+            }
+            w.power_row.set_sensitive(true);
+        }
+        _ => {
+            w.power_row.set_sensitive(false);
+            w.power_row.set_subtitle(
+                s.capability("power limit")
+                    .map(|(_, why)| why)
+                    .filter(|why| !why.is_empty())
+                    .unwrap_or("unavailable on this machine"),
+            );
+        }
+    }
+
+    // The auto-switch combos list "leave alone" first, then every profile.
+    if names_changed {
+        let mut entries: Vec<&str> = vec!["leave alone"];
+        entries.extend(w.profile_names.iter().map(String::as_str));
+        for row in [&w.auto_ac, &w.auto_batt] {
+            row.set_model(Some(&gtk::StringList::new(&entries)));
+        }
+    }
+    let (want_ac, want_batt) = &s.auto_profiles;
+    for (row, want) in [(&w.auto_ac, want_ac), (&w.auto_batt, want_batt)] {
+        let index = w
+            .profile_names
+            .iter()
+            .position(|n| n == want)
+            .map(|i| i as u32 + 1)
+            .unwrap_or(0);
+        row.set_selected(index);
+    }
+
+    // Handing the fan back is only meaningful while we hold it.
+    let ours = matches!(s.fan_mode.as_deref(), Some("manual") | Some("curve"));
+    w.fan_auto.set_sensitive(ours);
+
+    if std::env::var_os("FW_HELPER_DEBUG_WIDGETS").is_some() {
+        eprintln!(
+            "widgets: profile sensitive={} model={} selected={} | auto_ac model={} \
+             | power sensitive={} | charge sensitive={} | fan_auto sensitive={}",
+            w.profile_row.is_sensitive(),
+            w.profile_row.model().map(|m| m.n_items()).unwrap_or(0),
+            w.profile_row.selected(),
+            w.auto_ac.model().map(|m| m.n_items()).unwrap_or(0),
+            w.power_row.is_sensitive(),
+            w.charge_row.is_sensitive(),
+            w.fan_auto.is_sensitive(),
+        );
+    }
+}
+
+/// One line saying who is driving the fan and, when it is us, why it may not be doing
+/// what was asked.
+fn describe_fan(s: &Snapshot) -> String {
+    match s.fan_mode.as_deref() {
+        Some("curve") => {
+            let duty = s.fan_duty.unwrap_or(0);
+            format!("following a curve · duty {duty}/255")
+        }
+        Some("manual") => {
+            let duty = s.fan_duty.unwrap_or(0);
+            match s.fan_floor {
+                // The floor is why a quiet setting may not be honoured, and saying so
+                // is the difference between a bug and a decision (ADR 0006).
+                Some(f) if f > 0 && u32::from(duty) <= u32::from(f) + 3 => {
+                    format!("manual · duty {duty}/255, held at the firmware floor")
+                }
+                _ => format!("manual · duty {duty}/255"),
+            }
+        }
+        Some("unavailable") | None => "unavailable".to_string(),
+        Some(_) => "EC automatic".to_string(),
+    }
 }
 
 fn stat_label() -> gtk::Label {
@@ -173,8 +573,11 @@ fn disconnected(w: &mut Widgets, why: &str) {
 }
 
 fn apply(w: &mut Widgets, s: &Snapshot) {
-    w.banner.set_revealed(false);
     w.title.set_subtitle("Framework Laptop 13");
+
+    // Refresh the controls from the daemon. The signals this fires are suppressed by
+    // the mutable borrow we are already holding - see the handlers.
+    sync_controls(w, s);
 
     w.power.set_label(
         &s.package_watts
@@ -191,6 +594,7 @@ fn apply(w: &mut Widgets, s: &Snapshot) {
 
     w.profile
         .set_label(s.platform_profile.as_deref().unwrap_or("—"));
+    w.fan_row.set_subtitle(&describe_fan(s));
 
     match (s.battery_percent, s.battery_status.as_deref()) {
         (Some(p), Some(st)) => {

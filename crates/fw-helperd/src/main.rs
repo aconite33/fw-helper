@@ -36,10 +36,14 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Capture the runtime while we are on it: interface methods run on zbus's executor,
+    // which has no tokio timer, and the polkit prompt needs one.
+    polkit::init_runtime(tokio::runtime::Handle::current());
+
     let fs = Sysfs::default();
     let caps = Capabilities::probe(&fs);
 
-    eprintln!("fw-helperd starting");
+    eprintln!("fw-helperd starting ({})", build_stamp());
     for (name, cap) in caps.summary() {
         eprintln!("  {name:<18} {cap}");
     }
@@ -85,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let pending_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let applied_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    let known_profiles = Arc::new(profiles::load());
+    let known_profiles = Arc::new(std::sync::Mutex::new(profiles::load()));
 
     let daemon = iface::Daemon::new(
         fs.clone(),
@@ -147,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         applied_ppd: Arc::clone(&applied_ppd),
         fs: fs.clone(),
         persisted_profile,
+        persisted_power_limit: state_power_limit,
         known_profiles: Arc::clone(&known_profiles),
     }));
 
@@ -228,6 +233,51 @@ fn ppd_from_code(c: u8) -> Option<Ppd> {
         2 => Some(Ppd::Balanced),
         3 => Some(Ppd::Performance),
         _ => None,
+    }
+}
+
+/// Find a profile by name in the shared, mutable set.
+fn lookup_profile(profiles: &std::sync::Mutex<Vec<Profile>>, name: &str) -> Option<Profile> {
+    profiles
+        .lock()
+        .ok()?
+        .iter()
+        .find(|p| p.name == name)
+        .cloned()
+}
+
+/// When the running binary was built, as far as its own file can say.
+///
+/// There is otherwise no way to tell a running daemon's vintage from outside, and on
+/// 2026-08-22 a six-hour-old process served three rounds of testing while the fixed
+/// binary sat unused on disk — because `systemctl enable --now` does not restart an
+/// already-running unit. The mtime of our own executable is not a version, but it
+/// answers the only question that actually gets asked: is this the thing I just built?
+fn build_stamp() -> String {
+    let Ok(meta) = std::fs::metadata("/proc/self/exe") else {
+        return "build time unknown".into();
+    };
+    let Ok(modified) = meta.modified() else {
+        return "build time unknown".into();
+    };
+    match modified.elapsed() {
+        Ok(age) => format!("binary {} minutes old", age.as_secs() / 60),
+        Err(_) => "binary newer than the clock".into(),
+    }
+}
+
+/// Did the power source just change, as opposed to being seen for the first time?
+///
+/// Split out and pure because the obvious inline version is wrong in a way that
+/// compiles: `last.replace(now)` sets the value before you can ask whether there was
+/// one, so a "have we seen a source before" guard written after it is always true and
+/// the daemon applies a profile every time it starts.
+fn is_power_source_change(previous: Option<bool>, now: bool) -> bool {
+    match previous {
+        // First sample establishes a baseline. Starting the daemon is not a transition,
+        // and treating it as one would override whatever the user last chose by hand.
+        None => false,
+        Some(before) => before != now,
     }
 }
 
@@ -531,7 +581,8 @@ struct Poll {
     applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     fs: Sysfs,
     persisted_profile: Option<String>,
-    known_profiles: Arc<Vec<Profile>>,
+    persisted_power_limit: Option<u32>,
+    known_profiles: Arc<std::sync::Mutex<Vec<Profile>>>,
 }
 
 async fn poll_loop(ctx: Poll) {
@@ -546,6 +597,7 @@ async fn poll_loop(ctx: Poll) {
         applied_ppd,
         fs,
         persisted_profile,
+        persisted_power_limit,
         known_profiles,
     } = ctx;
     let iface_ref = match conn
@@ -564,7 +616,13 @@ async fn poll_loop(ctx: Poll) {
     let mut restore_fan_after_resume = false;
     let mut govern = Govern::default();
     let mut startup_profile = persisted_profile;
+    // What the state file says the power limit should be. Compared against the
+    // profile's own value to tell "this profile's budget" from "a limit the user set
+    // afterwards", which are the same field but not the same intent.
+    let power_override = persisted_power_limit;
     let mut power_corrections = 0u32;
+    // `None` until the first sample: the first reading is a baseline, not a transition.
+    let mut last_on_ac: Option<bool> = None;
     let mut last_floor_save = std::time::Instant::now();
     let mut saved_floor_revision = 0u64;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
@@ -605,7 +663,7 @@ async fn poll_loop(ctx: Poll) {
         // Apply the persisted profile on the first tick that has real telemetry: the
         // fan curve needs a temperature, and at startup there is not one yet.
         if let Some(name) = startup_profile.take() {
-            match known_profiles.iter().find(|p| p.name == name).cloned() {
+            match lookup_profile(&known_profiles, &name) {
                 Some(p) => {
                     eprintln!("re-applying persisted profile {name}");
                     power_corrections = 0;
@@ -613,11 +671,71 @@ async fn poll_loop(ctx: Poll) {
                     let thermal = fan::Thermal::from_telemetry(&sample);
                     if let Err(e) = apply_profile(&p, true, &axis, &lease, &fs, thermal).await {
                         eprintln!("could not re-apply profile {name}: {e}");
+                    } else if let Some(override_watts) =
+                        power_override.filter(|w| *w != p.pl1_watts)
+                    {
+                        // The user set a power limit by hand after choosing this
+                        // profile. Applying the profile would silently discard it -
+                        // measured, an 18 W setting came back as the profile's 20 W
+                        // after a restart - so the profile is applied first, for its
+                        // fan curve and PPD, and the override put back on top.
+                        eprintln!(
+                            "restoring your {override_watts} W power limit over {}'s {} W",
+                            p.name, p.pl1_watts
+                        );
+                        match fw_helper_core::PowerLimit::new(&fs).set(override_watts) {
+                            Ok(()) => record_profile(&conn, &p.name, override_watts).await,
+                            Err(e) => {
+                                eprintln!("could not restore {override_watts} W: {e}");
+                                record_profile(&conn, &p.name, p.pl1_watts).await;
+                            }
+                        }
                     } else {
                         record_profile(&conn, &p.name, p.pl1_watts).await;
                     }
                 }
                 None => eprintln!("persisted profile {name:?} is not one we know; ignoring"),
+            }
+        }
+
+        // The power source changed. Apply the profile configured for it, if any.
+        //
+        // Edge-triggered, not level: re-applying on every tick would fight anything the
+        // user chose by hand while on that source, which is a machine arguing with its
+        // owner. `None` on the first sample means we have never seen a source, so the
+        // first reading establishes a baseline rather than counting as a change.
+        if let Some(on_ac) = sample.on_ac {
+            let previous = last_on_ac.replace(on_ac);
+            if is_power_source_change(previous, on_ac) {
+                let source = if on_ac { "AC" } else { "battery" };
+                let wanted = match conn
+                    .object_server()
+                    .interface::<_, iface::Daemon>(OBJECT_PATH)
+                    .await
+                {
+                    Ok(guard) => guard.get().await.auto_profile_for(on_ac),
+                    Err(_) => None,
+                };
+                if let Some(name) = wanted {
+                    match lookup_profile(&known_profiles, &name) {
+                        Some(p) => {
+                            eprintln!("switched to {source}; applying profile {name}");
+                            power_corrections = 0;
+                            applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
+                            let thermal = fan::Thermal::from_telemetry(&sample);
+                            if let Err(e) =
+                                apply_profile(&p, true, &axis, &lease, &fs, thermal).await
+                            {
+                                eprintln!("could not apply {name} on {source}: {e}");
+                            } else {
+                                record_profile(&conn, &p.name, p.pl1_watts).await;
+                            }
+                        }
+                        None => {
+                            eprintln!("switched to {source}, but profile {name:?} no longer exists")
+                        }
+                    }
+                }
             }
         }
 
@@ -632,10 +750,7 @@ async fn poll_loop(ctx: Poll) {
                 // replaces a built-in is used, but one under a new name never becomes
                 // the slider's destination.
                 let canonical = Profile::canonical_name_for(target);
-                let p = known_profiles
-                    .iter()
-                    .find(|p| p.name == canonical)
-                    .cloned()
+                let p = lookup_profile(&known_profiles, canonical)
                     .unwrap_or_else(|| Profile::for_ppd(target));
                 eprintln!(
                     "PPD switched to {}; following with profile {}",
@@ -701,7 +816,11 @@ async fn poll_loop(ctx: Poll) {
         }
         govern_fan(&lease, &sample, &mut govern);
 
-        let mut guard = iface_ref.get_mut().await;
+        // `get()`, not `get_mut()`. The write lock would queue behind any method
+        // still running, and a method awaiting a polkit prompt holds the read lock for
+        // as long as the dialog is on screen. Telemetry - and therefore the watchdog's
+        // heartbeat - must not depend on how quickly someone types a password.
+        let guard = iface_ref.get().await;
         if guard.update(sample) {
             let emitter = iface_ref.signal_emitter();
             let _ = guard.telemetry_changed(emitter).await;
@@ -713,6 +832,23 @@ async fn poll_loop(ctx: Poll) {
 #[cfg(test)]
 mod tests {
     use super::next_direction;
+
+    #[test]
+    fn the_first_power_reading_is_a_baseline_not_a_transition() {
+        // Starting the daemon must not count as plugging in: it would override whatever
+        // the user last chose by hand, every boot.
+        assert!(!super::is_power_source_change(None, true));
+        assert!(!super::is_power_source_change(None, false));
+    }
+
+    #[test]
+    fn only_a_real_change_of_source_counts() {
+        assert!(super::is_power_source_change(Some(false), true));
+        assert!(super::is_power_source_change(Some(true), false));
+        // Level-triggered would fight anything the user chose while on that source.
+        assert!(!super::is_power_source_change(Some(true), true));
+        assert!(!super::is_power_source_change(Some(false), false));
+    }
 
     #[test]
     fn a_plateau_keeps_the_direction_it_arrived_with() {

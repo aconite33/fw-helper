@@ -20,6 +20,12 @@ pub struct Telemetry {
     pub battery_percent: Option<u64>,
     pub battery_status: Option<String>,
     pub platform_profile: Option<String>,
+    /// True on mains, false on battery, `None` when no mains supply can be found.
+    ///
+    /// Resolved by the supply's `type` being `Mains`, never by its name: this board
+    /// calls it `ACAD`, others call it `AC` or `ADP1`, and the same reasoning that
+    /// applies to hwmon indices applies here.
+    pub on_ac: Option<bool>,
 }
 
 impl Telemetry {
@@ -97,6 +103,8 @@ impl Monitor {
             ..Default::default()
         };
 
+        t.on_ac = self.read_on_ac();
+
         if let Some(hwmon) = self.caps.ec_hwmon.clone() {
             // fan1_target stayed 0 under manual control during hardware validation
             // (baseline Q4) — fan1_input is the only trustworthy RPM source.
@@ -114,6 +122,22 @@ impl Monitor {
         }
 
         t
+    }
+
+    /// Find the mains supply by type and read whether it is online.
+    fn read_on_ac(&self) -> Option<bool> {
+        let dir = self.fs.path("sys/class/power_supply");
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let base = entry.file_name().to_str()?.to_string();
+            let rel = format!("sys/class/power_supply/{base}");
+            if self.fs.read_string(&format!("{rel}/type")).ok().as_deref() != Some("Mains") {
+                continue;
+            }
+            if let Ok(online) = self.fs.read_u64(&format!("{rel}/online")) {
+                return Some(online == 1);
+            }
+        }
+        None
     }
 
     fn read_temps(&self, hwmon: &str) -> Vec<TempReading> {

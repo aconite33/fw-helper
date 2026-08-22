@@ -138,7 +138,13 @@ if [[ "${1:-}" == "--systemd" ]]; then
     install -m 755 -v "$REPO/target/release/fw-helper-restore-fan" "$RESTORE"
     install -m 644 -v "$REPO/data/fw-helperd.service" "$UNIT"
     systemctl daemon-reload
-    systemctl enable --now fw-helperd.service
+    # enable, then RESTART. `enable --now` only starts a unit that is not already
+    # running, so on every install after the first it would leave the previous process
+    # alive holding the old binary's inode: the files on disk are new, `systemctl
+    # status` says active, and nothing you just built is running. Restarting is also
+    # correct on a first install, where it is equivalent to starting.
+    systemctl enable fw-helperd.service
+    systemctl restart fw-helperd.service
     systemctl --no-pager status fw-helperd.service | head -12
 else
     echo

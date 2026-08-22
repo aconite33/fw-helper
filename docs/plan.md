@@ -469,7 +469,19 @@ Ties M2–M4 together into the actual product.
       10 W *including via the slider*, a file with `ppd = turbo` was reported as
       `line 2: unknown ppd "turbo"` and skipped without affecting the others, and an
       unknown name was refused with the list of what exists
-- [ ] AC/battery auto-switching
+- [x] **AC/battery auto-switching** (2026-08-22). Mains is resolved by the supply's
+      `type` being `Mains`, never by name — this board calls it `ACAD`. **Off unless
+      asked for**: a machine that changes behaviour when a cable is plugged in, without
+      having been told to, is a machine behaving strangely. Edge-triggered, and the first
+      reading is a baseline rather than a transition, so starting the daemon does not
+      count as plugging in and override what the user last chose
+- [x] **Save the current settings as a profile** (2026-08-22): `fw-helperctl profile
+      save NAME` captures the active PPD profile, power limit and fan curve into
+      `/etc/fw-helper/profiles.d/NAME.conf`, which the user can then edit. Writer and
+      parser round-trip exactly, and that is a test. The charge limit is deliberately not
+      captured — it is a standing preference, and folding it in would make switching
+      profiles change it later. `profile delete NAME` removes the file; a deleted file
+      that was shadowing a built-in restores it
 
 **Verified 2026-08-22**, both directions: `fw-helperctl profile quiet` set PPD to
 power-saver and PL1 to 15 W; driving PPD to performance and balanced (the same property
@@ -493,7 +505,7 @@ Two defects found by that run, both now fixed:
 
 ---
 
-### M6 — GUI  🟡 read-only view landed early (during M1b)
+### M6 — GUI  🟡 read-only view plus controls; curve editing outstanding
 
 The telemetry view was pulled forward to have something visible. What exists:
 `crates/fw-helper-gui` (binary `fw-helper`), a libadwaita window showing live stats,
