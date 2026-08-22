@@ -38,24 +38,45 @@ fan to the EC (`pwm1_enable=2`, checked directly). Two defects were found and fi
 it: the GUI left every control live-looking while disconnected, and the postinst inferred
 charge-control setup from a runtime sysfs node that can outlive its drop-in.
 
-**The machine has the package installed** and the daemon running the same binary as
-`target/release`. The modprobe drop-in is **not** installed, though: charge control works
-only because the module has held the parameter since a boot on 2026-08-21, and it dies at
-the next reboot until `sudo fw-helper-enable-charge-control` runs. Reinstalling after a
-rebuild needs `dpkg -i` — `apt install` no-ops on an unchanged version.
+**Do these in order.** Each one tests something that has never been tested, and they are
+ordered so a failure in an early step explains a failure in a later one.
 
-**The fan curve editor landed.** A read-only plot over a row per point, in the right-hand
-column of a two-column window that collapses to one below 800 px. The plot draws the
-learned firmware floor as a shaded band, which is the thing that decides whether a point
-has any effect: `FanFloorCurve` was added to D-Bus for it. Editing is by rows, not by
-dragging — they are keyboard-reachable and cannot express a curve the daemon would refuse,
-since the editor validates with `fw_helper_core::Curve` itself.
+**1 — Install the current build and make charge control persistent.** The `.deb` in the
+repo root already contains the landscape GUI; what is *installed* may not, so check before
+trusting it. `apt install` no-ops on an unchanged version, so use `dpkg -i`.
 
-What it has **not** had is a curve drawn in the GUI and then checked against the fan under
-load. Draw one, apply it, put the machine under load, and confirm `fw-helperctl status`
-and the fan agree with the plot — especially on the way *down*, which is where a custom
-curve wins (firmware holds duty 50–90 to 44.9 °C). The floor band will look empty until the
-daemon has watched the EC's ascending branch for a while; that is honest, not a drawing bug.
+```bash
+sudo dpkg -i fw-helper_0.0.1_amd64.deb && sudo fw-helper-enable-charge-control
+md5sum /usr/bin/fw-helper target/release/fw-helper   # must match; see the stale-binary traps
+```
+
+**2 — Reboot.** Three things have only ever been seen after a `dpkg` restart, never from
+cold: that the packaged stack comes up clean at boot, that the charge limit re-applies (M2's
+path, verified before packaging but not since), and that the modprobe drop-in works. That
+last one *cannot* be tested any other way — charge control has been running on a parameter
+the module has held since a boot on 2026-08-21, so only a reboot distinguishes a working
+drop-in from that leftover. After rebooting:
+
+```bash
+fw-helperctl status          # charge limit present => the drop-in did its job
+systemctl status fw-helperd  # came up at boot, not on demand
+```
+
+**3 — Draw a curve in the GUI and load the machine.** The highest-value item left, and the
+only claim the curve editor rests on that is still unproven. The editor is verified to
+build, draw, validate and apply; no curve drawn in the UI has been checked against a moving
+fan. Heat it with `sudo ./scripts/q6-pl1-load-test.sh` and watch the **descent** — firmware
+holds duty 50-90 all the way down to 44.9 C, so a curve reaching duty 0 by 55 C should be
+audibly quieter coming down while matching firmware going up (ADR 0011). Confirm
+`fw-helperctl status` and the fan agree with the plot. The load test is also what teaches
+the daemon the EC's ascending branch, so the floor band should be better populated
+afterwards - look at the editor again once it has run.
+
+**4 — Fast-forward `main`.** Two commits sit on `m7-verify-and-gui-disconnect`
+(`389a014`, `3644f7e`) and history has been linear until now.
+
+**Then**, if all of that holds, the milestones are genuinely finished and the open items
+below are the remaining work. None is worth starting before step 3.
 
 **Testing discipline, which this project keeps proving the hard way.** Roughly a dozen
 defects across two sessions were invisible to unit tests and appeared only on hardware or in
