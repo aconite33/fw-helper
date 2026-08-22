@@ -23,6 +23,7 @@ RESTORE=/usr/libexec/fw-helper-restore-fan
 CTL=/usr/local/bin/fw-helperctl
 POLKIT=/usr/share/polkit-1/actions/org.fwhelper.policy
 MODPROBE=/etc/modprobe.d/fw-helper.conf
+PROFILES=/etc/fw-helper/profiles.d
 
 # Opt-in, never a side effect of installing: this changes which mechanism governs
 # battery charging on the machine (ADR 0008).
@@ -46,7 +47,10 @@ fi
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl disable --now fw-helperd.service 2>/dev/null || true
-    rm -fv "$POLICY" "$UNIT" "$BIN" "$RESTORE" "$CTL" "$POLKIT" "$MODPROBE"
+    rm -fv "$POLICY" "$UNIT" "$BIN" "$RESTORE" "$CTL" "$POLKIT" "$MODPROBE" \
+        /etc/fw-helper/example-profile.conf
+    # Leave $PROFILES and anything in it: those are the user's, not ours.
+    rmdir --ignore-fail-on-non-empty "$PROFILES" /etc/fw-helper 2>/dev/null || true
     systemctl daemon-reload
     systemctl reload dbus 2>/dev/null || true
     echo "removed."
@@ -114,6 +118,12 @@ chmod 755 "$CTL"
 echo "installed shim: $CTL (resolves newest build at run time)"
 
 install -m 644 -v "$REPO/data/org.fwhelper.policy" "$POLKIT"
+
+# Where user profiles live. Created empty with the example alongside it rather than
+# inside it, so a fresh install does not silently gain a profile nobody asked for.
+install -d -m 755 -v "$PROFILES"
+install -m 644 -v "$REPO/data/example-profile.conf" /etc/fw-helper/example-profile.conf
+echo "user profiles: drop .conf files in $PROFILES (see /etc/fw-helper/example-profile.conf)"
 
 if [[ "${1:-}" == "--systemd" ]]; then
     [[ -x "$REPO/target/release/fw-helperd" ]] || {

@@ -29,6 +29,18 @@ pub enum Reapply {
     Failed,
 }
 
+/// The handles the daemon shares with the poll loop.
+///
+/// A struct rather than five more arguments: they are all `Arc`s of similar shape, and
+/// transposing two of them would compile.
+pub struct Shared {
+    pub fan: Arc<FanLease>,
+    pub watchdog: Arc<Watchdog>,
+    pub axis: Arc<crate::ppd::ProfileAxis>,
+    pub applied_ppd: Arc<std::sync::atomic::AtomicU8>,
+    pub profiles: Arc<Vec<fw_helper_core::Profile>>,
+}
+
 pub struct Daemon {
     fs: Sysfs,
     caps: Capabilities,
@@ -50,27 +62,22 @@ pub struct Daemon {
     /// own echo from a genuine slider move — setting PPD makes PPD emit a change, and
     /// the two are indistinguishable at the receiving end.
     applied_ppd: Arc<std::sync::atomic::AtomicU8>,
+    /// Built-ins merged with anything in `/etc/fw-helper/profiles.d/`.
+    profiles: Arc<Vec<fw_helper_core::Profile>>,
 }
 
 impl Daemon {
-    pub fn new(
-        fs: Sysfs,
-        caps: Capabilities,
-        state: State,
-        fan: Arc<FanLease>,
-        watchdog: Arc<Watchdog>,
-        axis: Arc<crate::ppd::ProfileAxis>,
-        applied_ppd: Arc<std::sync::atomic::AtomicU8>,
-    ) -> Self {
+    pub fn new(fs: Sysfs, caps: Capabilities, state: State, shared: Shared) -> Self {
         Self {
             fs,
             caps,
             latest: Telemetry::default(),
             state: Mutex::new(state),
-            fan,
-            watchdog,
-            axis,
-            applied_ppd,
+            fan: shared.fan,
+            watchdog: shared.watchdog,
+            axis: shared.axis,
+            applied_ppd: shared.applied_ppd,
+            profiles: shared.profiles,
         }
     }
 
@@ -283,10 +290,7 @@ impl Daemon {
     /// Profiles this daemon knows, by name.
     #[zbus(property)]
     async fn profiles(&self) -> Vec<String> {
-        fw_helper_core::Profile::all()
-            .into_iter()
-            .map(|p| p.name.to_string())
-            .collect()
+        self.profiles.iter().map(|p| p.name.clone()).collect()
     }
 
     /// The profile matching whatever PPD currently has active, or empty if unknown.
@@ -296,7 +300,9 @@ impl Daemon {
     #[zbus(property)]
     async fn active_profile(&self) -> String {
         match self.axis.active().await {
-            Some(ppd) => fw_helper_core::Profile::for_ppd(ppd).name.to_string(),
+            // By canonical name, looked up in the merged set, so a user profile that
+            // replaces a built-in is what gets reported.
+            Some(ppd) => fw_helper_core::Profile::canonical_name_for(ppd).to_string(),
             None => String::new(),
         }
     }
@@ -321,11 +327,18 @@ impl Daemon {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] conn: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        let profile = fw_helper_core::Profile::by_name(name).ok_or_else(|| {
-            zbus::fdo::Error::InvalidArgs(format!(
-                "no profile {name:?}; known profiles are quiet, balanced, performance"
-            ))
-        })?;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = self.profiles.iter().map(|p| p.name.as_str()).collect();
+                zbus::fdo::Error::InvalidArgs(format!(
+                    "no profile {name:?}; known profiles are {}",
+                    known.join(", ")
+                ))
+            })?;
         // A profile sets a power limit and takes the fan, so it needs both rights.
         let sender = Self::authorize(&header, conn, polkit::actions::SET_POWER_LIMIT).await?;
         Self::authorize(&header, conn, polkit::actions::SET_FAN).await?;
@@ -652,8 +665,18 @@ mod tests {
         let wd = crate::watchdog::Watchdog::new(Arc::clone(&lease));
         wd.beat();
         let axis = Arc::new(crate::ppd::ProfileAxis::disconnected(fs_.clone()));
-        let applied = Arc::new(std::sync::atomic::AtomicU8::new(0));
-        Daemon::new(fs_, caps, state, lease, wd, axis, applied)
+        Daemon::new(
+            fs_.clone(),
+            caps,
+            state,
+            Shared {
+                fan: lease,
+                watchdog: wd,
+                axis,
+                applied_ppd: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                profiles: Arc::new(fw_helper_core::Profile::built_ins()),
+            },
+        )
     }
 
     fn write_attr(root: &Path, value: &str) {

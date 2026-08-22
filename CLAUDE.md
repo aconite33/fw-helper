@@ -21,7 +21,7 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
 | M3 — fan control | **complete**: all six ADR 0006 safety points and the curve engine verified on hardware |
 | M4 — power limits | PL1 control complete and verified (15 W setpoint → 15.02 W sustained) |
-| M5 — profiles | core complete: PPD delegation both directions, verified; user profiles and AC/battery switching pending |
+| M5 — profiles | PPD delegation both directions and user profiles complete; AC/battery auto-switching pending |
 | M7 | planned; every mechanism pre-verified |
 | M6 — GUI | read-only telemetry view landed early; controls pending M2–M5 |
 
@@ -120,6 +120,7 @@ fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the
 fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
 fw-helperctl power-limit 15               # sustained CPU watts; ~32s to take effect
 fw-helperctl profile | profile quiet      # quiet | balanced | performance; moves the GNOME slider
+/etc/fw-helper/profiles.d/*.conf          # user profiles; see data/example-profile.conf
 ./target/debug/fw-helper                  # the GUI
 
 ./scripts/fw-probe.sh                     # read-only hardware survey

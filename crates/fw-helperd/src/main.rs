@@ -16,6 +16,7 @@ mod iface;
 mod logind;
 mod polkit;
 mod ppd;
+mod profiles;
 mod state;
 mod watchdog;
 mod wire;
@@ -84,15 +85,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let pending_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let applied_ppd = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let known_profiles = Arc::new(profiles::load());
 
     let daemon = iface::Daemon::new(
         fs.clone(),
         caps,
         state,
-        Arc::clone(&lease),
-        Arc::clone(&watchdog),
-        Arc::clone(&axis),
-        Arc::clone(&applied_ppd),
+        iface::Shared {
+            fan: Arc::clone(&lease),
+            watchdog: Arc::clone(&watchdog),
+            axis: Arc::clone(&axis),
+            applied_ppd: Arc::clone(&applied_ppd),
+            profiles: Arc::clone(&known_profiles),
+        },
     );
     daemon.reapply_charge_limit();
     if let Some(watts) = state_power_limit {
@@ -142,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         applied_ppd: Arc::clone(&applied_ppd),
         fs: fs.clone(),
         persisted_profile,
+        known_profiles: Arc::clone(&known_profiles),
     }));
 
     // Shut down cleanly on either signal, and hand the fan back before doing anything
@@ -525,6 +531,7 @@ struct Poll {
     applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     fs: Sysfs,
     persisted_profile: Option<String>,
+    known_profiles: Arc<Vec<Profile>>,
 }
 
 async fn poll_loop(ctx: Poll) {
@@ -539,6 +546,7 @@ async fn poll_loop(ctx: Poll) {
         applied_ppd,
         fs,
         persisted_profile,
+        known_profiles,
     } = ctx;
     let iface_ref = match conn
         .object_server()
@@ -597,7 +605,7 @@ async fn poll_loop(ctx: Poll) {
         // Apply the persisted profile on the first tick that has real telemetry: the
         // fan curve needs a temperature, and at startup there is not one yet.
         if let Some(name) = startup_profile.take() {
-            match Profile::by_name(&name) {
+            match known_profiles.iter().find(|p| p.name == name).cloned() {
                 Some(p) => {
                     eprintln!("re-applying persisted profile {name}");
                     power_corrections = 0;
@@ -606,7 +614,7 @@ async fn poll_loop(ctx: Poll) {
                     if let Err(e) = apply_profile(&p, true, &axis, &lease, &fs, thermal).await {
                         eprintln!("could not re-apply profile {name}: {e}");
                     } else {
-                        record_profile(&conn, p.name, p.pl1_watts).await;
+                        record_profile(&conn, &p.name, p.pl1_watts).await;
                     }
                 }
                 None => eprintln!("persisted profile {name:?} is not one we know; ignoring"),
@@ -620,7 +628,15 @@ async fn poll_loop(ctx: Poll) {
         let code = pending_ppd.swap(0, Ordering::SeqCst);
         if let Some(target) = ppd_from_code(code) {
             if applied_ppd.swap(0, Ordering::SeqCst) != code {
-                let p = Profile::for_ppd(target);
+                // Canonical name, looked up in the merged set: a user profile that
+                // replaces a built-in is used, but one under a new name never becomes
+                // the slider's destination.
+                let canonical = Profile::canonical_name_for(target);
+                let p = known_profiles
+                    .iter()
+                    .find(|p| p.name == canonical)
+                    .cloned()
+                    .unwrap_or_else(|| Profile::for_ppd(target));
                 eprintln!(
                     "PPD switched to {}; following with profile {}",
                     target.as_str(),
@@ -633,7 +649,7 @@ async fn poll_loop(ctx: Poll) {
                 } else {
                     // Before the enforcement below runs, or it would restore the
                     // previous profile's budget over the one just applied.
-                    record_profile(&conn, p.name, p.pl1_watts).await;
+                    record_profile(&conn, &p.name, p.pl1_watts).await;
                 }
             }
         }

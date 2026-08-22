@@ -44,10 +44,47 @@ impl Ppd {
     }
 }
 
+/// Why a profile was rejected. Every variant names something the author can fix.
+#[derive(Debug, PartialEq)]
+pub enum ProfileError {
+    EmptyName,
+    NameNotSimple(String),
+    UnknownPpd(String),
+    PowerOutOfRange(u32),
+    ChargeOutOfRange(u8),
+}
+
+impl std::fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => write!(f, "a profile needs a name"),
+            Self::NameNotSimple(n) => write!(
+                f,
+                "profile name {n:?} must be lowercase letters, digits and dashes: it is \
+                 what a user types and what appears on the D-Bus interface"
+            ),
+            Self::UnknownPpd(p) => write!(
+                f,
+                "{p:?} is not a power-profiles-daemon profile; expected power-saver, \
+                 balanced or performance"
+            ),
+            Self::PowerOutOfRange(w) => write!(
+                f,
+                "{w} W is outside the range a power limit can sensibly take ({}-{} W)",
+                crate::power::MIN_WATTS,
+                crate::power::FALLBACK_MAX_WATTS
+            ),
+            Self::ChargeOutOfRange(v) => write!(f, "{v}% is not a usable charge limit"),
+        }
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     /// Our name for it, as a user types it.
-    pub name: &'static str,
+    pub name: String,
     /// What PPD is asked to switch to.
     pub ppd: Ppd,
     /// Sustained CPU power budget.
@@ -79,7 +116,7 @@ impl Profile {
     /// sustained load, so a curve that starts at 55 °C rarely has to do anything.
     pub fn quiet() -> Self {
         Self {
-            name: "quiet",
+            name: "quiet".into(),
             ppd: Ppd::PowerSaver,
             pl1_watts: 15,
             curve: curve(&[
@@ -98,7 +135,7 @@ impl Profile {
     /// absorb it.
     pub fn balanced() -> Self {
         Self {
-            name: "balanced",
+            name: "balanced".into(),
             ppd: Ppd::Balanced,
             pl1_watts: 20,
             curve: curve(&[
@@ -118,7 +155,7 @@ impl Profile {
     /// before that.
     pub fn performance() -> Self {
         Self {
-            name: "performance",
+            name: "performance".into(),
             ppd: Ppd::Performance,
             pl1_watts: 25,
             curve: curve(&[
@@ -133,24 +170,63 @@ impl Profile {
         }
     }
 
-    pub fn all() -> Vec<Self> {
+    /// The three shipped defaults.
+    pub fn built_ins() -> Vec<Self> {
         vec![Self::quiet(), Self::balanced(), Self::performance()]
     }
 
-    /// Look one up by the name a user types.
-    pub fn by_name(name: &str) -> Option<Self> {
-        Self::all().into_iter().find(|p| p.name == name)
+    /// Validate a profile assembled from somewhere less trustworthy than this file.
+    ///
+    /// Range-checking the power budget here is a courtesy, not the guarantee:
+    /// [`crate::PowerLimit::set`] clamps against the zone's real maximum at apply time,
+    /// and it is the one that matters. This exists so a typo in a config file is
+    /// reported when the file is read rather than when the profile is first used.
+    pub fn validate(&self) -> Result<(), ProfileError> {
+        if self.name.is_empty() {
+            return Err(ProfileError::EmptyName);
+        }
+        if !self
+            .name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(ProfileError::NameNotSimple(self.name.clone()));
+        }
+        if self.pl1_watts < crate::power::MIN_WATTS
+            || self.pl1_watts > crate::power::FALLBACK_MAX_WATTS
+        {
+            return Err(ProfileError::PowerOutOfRange(self.pl1_watts));
+        }
+        if let Some(limit) = self.charge_limit {
+            if !(crate::charge::MIN_LIMIT..=crate::charge::MAX_LIMIT).contains(&limit) {
+                return Err(ProfileError::ChargeOutOfRange(limit));
+            }
+        }
+        Ok(())
     }
 
-    /// The profile matching a PPD profile.
+    /// The canonical name a PPD profile maps to.
     ///
-    /// This is the direction that matters for ADR 0005: when the GNOME slider moves,
-    /// PPD tells us, and we follow. Every PPD profile maps to exactly one of ours, so
-    /// the slider is never left pointing at something we cannot honour.
+    /// **User profiles never take part in this mapping**, even one that names the same
+    /// PPD profile. When the GNOME slider moves, the machine must land somewhere
+    /// predictable; picking between several user profiles that all claim `power-saver`
+    /// would be a coin toss the user cannot see. A user profile that *replaces* a
+    /// built-in by name is used here, because that is an explicit choice.
+    pub fn canonical_name_for(ppd: Ppd) -> &'static str {
+        match ppd {
+            Ppd::PowerSaver => "quiet",
+            Ppd::Balanced => "balanced",
+            Ppd::Performance => "performance",
+        }
+    }
+
+    /// The built-in matching a PPD profile. Callers holding a merged set should prefer
+    /// looking up [`Self::canonical_name_for`] in that set.
     pub fn for_ppd(ppd: Ppd) -> Self {
-        Self::all()
+        let name = Self::canonical_name_for(ppd);
+        Self::built_ins()
             .into_iter()
-            .find(|p| p.ppd == ppd)
+            .find(|p| p.name == name)
             .expect("every PPD profile has a built-in")
     }
 }
@@ -166,6 +242,7 @@ mod tests {
         // ADR 0005 exists to prevent.
         for ppd in [Ppd::PowerSaver, Ppd::Balanced, Ppd::Performance] {
             assert_eq!(Profile::for_ppd(ppd).ppd, ppd);
+            assert_eq!(Profile::for_ppd(ppd).name, Profile::canonical_name_for(ppd));
         }
     }
 
@@ -175,6 +252,29 @@ mod tests {
             assert_eq!(Ppd::parse(ppd.as_str()), Some(ppd));
         }
         assert_eq!(Ppd::parse("turbo"), None);
+    }
+
+    #[test]
+    fn rejects_profiles_a_config_file_could_get_wrong() {
+        let base = Profile::quiet();
+        let with = |f: fn(&mut Profile)| {
+            let mut p = base.clone();
+            f(&mut p);
+            p.validate().unwrap_err()
+        };
+        assert_eq!(with(|p| p.name.clear()), ProfileError::EmptyName);
+        assert!(matches!(
+            with(|p| p.name = "My Profile".into()),
+            ProfileError::NameNotSimple(_)
+        ));
+        assert!(matches!(
+            with(|p| p.pl1_watts = 2),
+            ProfileError::PowerOutOfRange(2)
+        ));
+        assert!(matches!(
+            with(|p| p.charge_limit = Some(5)),
+            ProfileError::ChargeOutOfRange(5)
+        ));
     }
 
     #[test]
@@ -211,16 +311,19 @@ mod tests {
     #[test]
     fn no_built_in_profile_touches_the_charge_limit() {
         // Battery longevity is a standing preference, not a performance choice.
-        for p in Profile::all() {
+        for p in Profile::built_ins() {
             assert_eq!(p.charge_limit, None, "{} sets a charge limit", p.name);
         }
     }
 
     #[test]
     fn power_budgets_stay_inside_the_measured_envelope() {
-        for p in Profile::all() {
-            assert!(p.pl1_watts >= crate::power::MIN_WATTS);
-            assert!(p.pl1_watts <= crate::power::FALLBACK_MAX_WATTS);
+        for p in Profile::built_ins() {
+            assert!(
+                p.validate().is_ok(),
+                "built-in {} does not validate",
+                p.name
+            );
         }
     }
 }

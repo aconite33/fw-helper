@@ -454,7 +454,21 @@ Ties M2–M4 together into the actual product.
 - [x] **Fallback to direct `platform_profile`** when PPD is absent, reported as
       `ProfileBackend` so a client can say why the GNOME slider is not in sync
 - [x] Three defaults: quiet 15 W, balanced 20 W, performance 25 W, each with its own curve
-- [ ] User profiles in `/etc/fw-helper/profiles.d/`
+- [x] **User profiles in `/etc/fw-helper/profiles.d/`** (`fw-helperd/src/profiles.rs`,
+      2026-08-22). Same trivial `key=value` format as the state file — four fields and a
+      curve, not a configuration language — and parsed in the daemon, since core stays
+      free of config handling (ADR 0010). Two rules:
+      **a file naming a built-in replaces it**, including for the GNOME slider, which is
+      how `quiet` is customised rather than accumulating a near-duplicate beside it; and
+      **a profile under a new name is selectable by hand but never auto-applied when the
+      slider moves**, because PPD has three positions and two user profiles both claiming
+      `power-saver` would make the slider's destination a coin toss.
+      One bad file is skipped by name, not fatal. `data/example-profile.conf` ships as
+      documentation and is parsed by a test, because documentation rots.
+      **Verified**: `silent` added at 12 W, a `quiet.conf` replacing the built-in gave
+      10 W *including via the slider*, a file with `ppd = turbo` was reported as
+      `line 2: unknown ppd "turbo"` and skipped without affecting the others, and an
+      unknown name was refused with the list of what exists
 - [ ] AC/battery auto-switching
 
 **Verified 2026-08-22**, both directions: `fw-helperctl profile quiet` set PPD to
