@@ -107,6 +107,85 @@ const BUCKET_C: f64 = 2.0;
 const BUCKET_BASE_C: f64 = 30.0;
 const BUCKETS: usize = 40; // 30 °C to 110 °C
 
+/// Sustained change, in degrees, before the direction is allowed to flip.
+///
+/// `peci-temp` is quantized to ~1 °C and dithers across a boundary. Measured on
+/// hardware over a monotonic cooldown from 49.9 °C to 38.9 °C: 17 genuine falls, 104
+/// steady samples — and **7 upward 1 °C blips**, none of them real heating. Flipping
+/// on a single blip set `rising`, and because the direction then persists through
+/// plateaus it stayed set for the rest of the descent. Carrying direction through
+/// plateaus was necessary but not sufficient: the entry condition needed evidence too.
+///
+/// One bucket width, so a flip always means the reading moved further than the
+/// sensor's own quantization can account for.
+const DIRECTION_HYSTERESIS_C: f64 = 2.0;
+
+/// Which way the temperature is going, with enough hysteresis to survive a quantized
+/// sensor.
+///
+/// A Schmitt trigger rather than a comparison of consecutive samples. `rising` becomes
+/// true only once the reading is [`DIRECTION_HYSTERESIS_C`] above the lowest seen since
+/// it last fell, and false only once it is that far below the highest seen since it
+/// last rose. Inside the band the previous answer stands, so neither a 1 °C blip nor a
+/// plateau of any length moves it — a plateau under sustained load still reads as
+/// heating, which is the single most valuable observation there is.
+///
+/// Asymmetric in consequence rather than in threshold: failing to record costs some
+/// quiet until the bucket is relearned, whereas recording the descending branch
+/// ratchets the floor to a duty firmware only uses on the way down and cannot be
+/// undone, because floors only ever rise.
+#[derive(Debug, Clone, Default)]
+pub struct Direction {
+    rising: bool,
+    /// The extremes since the last flip: the trough while falling, the peak while
+    /// rising. Only one is ever live.
+    trough: Option<f64>,
+    peak: Option<f64>,
+}
+
+impl Direction {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Is the machine heating?
+    pub fn rising(&self) -> bool {
+        self.rising
+    }
+
+    /// Feed one reading; returns the direction after it.
+    ///
+    /// A cold start reads as **not** rising. Assuming heating with no history was the
+    /// other route descending data got in: a daemon restarted partway through a
+    /// cooldown recorded its first samples as ascending, and those are sticky. Under
+    /// real load the die climbs ~4 °C/s, so the threshold is cleared within a second
+    /// and nothing is lost by waiting for evidence.
+    ///
+    /// An unreadable temperature leaves the direction untouched rather than resetting
+    /// it: a dropped sample is not a change of direction.
+    pub fn update(&mut self, celsius: Option<f64>) -> bool {
+        let Some(c) = celsius.filter(|c| c.is_finite()) else {
+            return self.rising;
+        };
+        let trough = self.trough.map_or(c, |t| t.min(c));
+        let peak = self.peak.map_or(c, |p| p.max(c));
+        if !self.rising && c >= trough + DIRECTION_HYSTERESIS_C {
+            self.rising = true;
+            self.peak = Some(c);
+            self.trough = None;
+        } else if self.rising && c <= peak - DIRECTION_HYSTERESIS_C {
+            self.rising = false;
+            self.trough = Some(c);
+            self.peak = None;
+        } else if self.rising {
+            self.peak = Some(peak);
+        } else {
+            self.trough = Some(trough);
+        }
+        self.rising
+    }
+}
+
 /// The EC's floor, as a duty, for the current temperature.
 #[derive(Debug, Clone)]
 pub struct FirmwareFloor {
@@ -628,5 +707,93 @@ mod tests {
         // 92.8 C measured under ordinary multi-core load. Full duty must not be
         // demanded there: firmware itself chose 94/255.
         const { assert!(FULL_DUTY_ABOVE_C > 92.8) };
+    }
+
+    /// The exact sequence measured on hardware on 2026-08-23: a cooldown that only
+    /// ever went down, carrying seven spurious 1 C upward blips. The previous
+    /// implementation flipped to rising on the first of them and stayed there, which
+    /// is how the 44-54 C band came to hold firmware's descending duties.
+    #[test]
+    fn a_quantized_cooldown_never_reads_as_heating() {
+        let mut d = Direction::default();
+        // Arrive at the top of the descent already heating, as a real run does.
+        for t in [40.0, 44.0, 48.0, 49.9] {
+            d.update(Some(t));
+        }
+        assert!(d.rising(), "the climb should register");
+
+        let cooldown = [
+            49.9, 48.9, 47.9, 46.9, 45.9, 44.9, 43.9, 42.9, 43.9, // blip
+            42.9, 41.9, 42.9, // blip
+            41.9, 41.9, 40.9, 39.9, 38.9, 39.9, // blip
+            38.9, 39.9, // blip
+            38.9, 38.9, 39.9, // blip
+            38.9,
+        ];
+        let mut fell = false;
+        for t in cooldown {
+            let rising = d.update(Some(t));
+            if !rising {
+                fell = true;
+            }
+            // Once the descent is established, no blip may undo it.
+            if fell {
+                assert!(!rising, "a 1 C blip at {t} C read as heating");
+            }
+        }
+        assert!(!d.rising(), "should be falling at the end of a cooldown");
+    }
+
+    #[test]
+    fn a_plateau_under_sustained_load_still_counts_as_heating() {
+        // The other half, and why the fix is hysteresis rather than "ignore steady":
+        // holding at temperature under load is firmware stating what that temperature
+        // needs, and it must be recorded.
+        let mut d = Direction::default();
+        for t in [60.0, 65.0, 70.0] {
+            d.update(Some(t));
+        }
+        assert!(d.rising());
+        for _ in 0..100 {
+            assert!(
+                d.update(Some(70.0)),
+                "a plateau while heating is sustained load"
+            );
+        }
+        // A single 1 C dip is sensor noise, not the end of the climb.
+        assert!(d.update(Some(69.0)), "one dip must not end the climb");
+    }
+
+    #[test]
+    fn a_cold_start_does_not_assume_heating() {
+        // Assuming heating with no history is how a daemon restarted partway through a
+        // cooldown recorded its first samples as ascending. Those are sticky, because
+        // floors only ever rise.
+        let mut d = Direction::default();
+        assert!(!d.update(Some(40.0)));
+        assert!(!d.rising());
+    }
+
+    #[test]
+    fn a_sustained_climb_is_recognised_promptly() {
+        // The cost of waiting for evidence has to stay small: the die climbs ~4 C/s
+        // under load, so one 1 Hz sample is enough.
+        let mut d = Direction::default();
+        d.update(Some(38.9));
+        assert!(d.update(Some(42.9)), "4 C in one sample is unambiguous");
+    }
+
+    #[test]
+    fn an_unreadable_sample_does_not_change_direction() {
+        let mut d = Direction::default();
+        for t in [40.0, 44.0] {
+            d.update(Some(t));
+        }
+        assert!(d.rising());
+        assert!(
+            d.update(None),
+            "a dropped sample is not a change of direction"
+        );
+        assert!(d.update(Some(f64::NAN)), "NaN is not a change of direction");
     }
 }

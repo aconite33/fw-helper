@@ -24,7 +24,7 @@ pub use charge::{ChargeControl, ChargeError};
 pub use curve::{Curve, CurveEngine, CurveError, Point};
 pub use energy::EnergySampler;
 pub use fan::{FanControl, FanError, FanMode};
-pub use floor::{FirmwareFloor, STICTION_DUTY};
+pub use floor::{Direction, FirmwareFloor, STICTION_DUTY};
 pub use power::{PowerError, PowerLimit};
 pub use profile::{Ppd, Profile};
 pub use sysfs::Sysfs;
