@@ -30,53 +30,90 @@ actually exposes. **Do not re-derive hardware facts — they are measured and re
 
 ### Resume here
 
-Last session ended 2026-08-22. **M0–M7 are complete and hardware-verified.**
+Last session ended 2026-08-23. **M0-M7 are complete**, and steps 1-2 of the previous
+resume plan are now verified on hardware. The session then found three defects, fixed one,
+and left the tree dirty. **Nothing is committed.**
 
-**The package is verified.** It installs, the daemon starts and serves all five
-capabilities, **fw-helper launches from the GNOME app grid**, and `apt remove` returns the
-fan to the EC (`pwm1_enable=2`, checked directly). Two defects were found and fixed doing
-it: the GUI left every control live-looking while disconnected, and the postinst inferred
-charge-control setup from a runtime sysfs node that can outlive its drop-in.
+**Verified this session, and no longer in doubt:**
 
-**Do these in order.** Each one tests something that has never been tested, and they are
-ordered so a failure in an early step explains a failure in a later one.
+- **The packaged stack comes up clean from cold.** `fw-helperd` starts at boot, serves all
+  five capabilities, and re-applies both the charge limit and the power limit.
+- **The modprobe drop-in works.** `probe_with_fwk_charge_control` read `Y` after a genuine
+  reboot, so charge control no longer rests on a parameter left over from 2026-08-21.
+- **A curve drawn in the GUI drives a real fan.** At 35.9 C, where `fan floor` reports
+  firmware would have the fan off, a hand-drawn curve held 3389 rpm. Editor -> daemon ->
+  hardware is proven end to end. The *descent* claim is still unproven; see step 3.
 
-**1 — Install the current build and make charge control persistent.** The `.deb` in the
-repo root already contains the landscape GUI; what is *installed* may not, so check before
-trusting it. `apt install` no-ops on an unchanged version, so use `dpkg -i`.
+**Do these in order.**
 
-```bash
-sudo dpkg -i fw-helper_0.0.1_amd64.deb && sudo fw-helper-enable-charge-control
-md5sum /usr/bin/fw-helper target/release/fw-helper   # must match; see the stale-binary traps
-```
-
-**2 — Reboot.** Three things have only ever been seen after a `dpkg` restart, never from
-cold: that the packaged stack comes up clean at boot, that the charge limit re-applies (M2's
-path, verified before packaging but not since), and that the modprobe drop-in works. That
-last one *cannot* be tested any other way — charge control has been running on a parameter
-the module has held since a boot on 2026-08-21, so only a reboot distinguishes a working
-drop-in from that leftover. After rebooting:
+**1 - Relearn the firmware floor.** Everything else about the fan waits on this. The
+persisted table was corrupted (see below), has been **cleared**, and is currently empty, so
+the daemon is running on the cold-start model - which `floor.rs` itself notes was measured
+on the descending branch. Needs AC power.
 
 ```bash
-fw-helperctl status          # charge limit present => the drop-in did its job
-systemctl status fw-helperd  # came up at boot, not on demand
+fw-helperctl profile performance && fw-helperctl fan auto
+cat /sys/class/hwmon/hwmon10/pwm1_enable     # MUST be 2, or nothing is observed
+stress-ng --cpu $(nproc) --timeout 300s; sleep 90
+cat /var/lib/fw-helper/state                 # want: 44-62 C band all 0
 ```
 
-**3 — Draw a curve in the GUI and load the machine.** The highest-value item left, and the
-only claim the curve editor rests on that is still unproven. The editor is verified to
-build, draw, validate and apply; no curve drawn in the UI has been checked against a moving
-fan. Heat it with `sudo ./scripts/q6-pl1-load-test.sh` and watch the **descent** — firmware
-holds duty 50-90 all the way down to 44.9 C, so a curve reaching duty 0 by 55 C should be
-audibly quieter coming down while matching firmware going up (ADR 0011). Confirm
-`fw-helperctl status` and the fan agree with the plot. The load test is also what teaches
-the daemon the EC's ascending branch, so the floor band should be better populated
-afterwards - look at the editor again once it has run.
+Order matters and cost a round: **applying a profile re-takes the fan** and installs that
+profile's curve, so `fan auto` must come *after* `profile performance`. Plug in first too -
+an AC/battery transition re-applies the profile and takes the fan back. Do **not** use
+`q6-pl1-load-test.sh` for this; see the PL1 trap below.
 
-**4 — Fast-forward `main`.** Two commits sit on `m7-verify-and-gui-disconnect`
-(`389a014`, `3644f7e`) and history has been linear until now.
+**2 - Install the package and reboot.** `fw-helper_0.0.2_amd64.deb` is already built and its
+payload md5-verified against `target/release/`, so it needs installing, not rebuilding. The
+version was bumped from 0.0.1 precisely so this install cannot silently no-op. Delete the
+stale `fw-helper_0.0.1_amd64.deb` still sitting in the repo root - two installable files,
+one of them wrong, is its own trap.
 
-**Then**, if all of that holds, the milestones are genuinely finished and the open items
-below are the remaining work. None is worth starting before step 3.
+**3 - The descent test, which is still the highest-value unproven claim.** Only meaningful
+once step 1 has given a trustworthy floor: the floor overrides the curve, so a poisoned
+floor makes the test measure nothing. Draw a curve reaching duty 0 by 55 C, heat the machine
+with `stress-ng`, and listen on the way **down** - firmware holds duty 50-90 to 44.9 C, so
+ours should be silent while firmware would not be (ADR 0011).
+
+**4 - Fast-forward `main`.** Now four commits behind on `m7-verify-and-gui-disconnect`, plus
+whatever this session's work is committed as.
+
+**Open defects found this session, in severity order:**
+
+- **The battery charge limit is inert.** Highest impact: a headline feature does nothing.
+  `charge_control_end_threshold` accepts 80, reads back 80, persists and re-applies - and
+  the EC charges straight through it. Measured over 120 samples: 88% -> 93%, +282 mAh,
+  `status=Charging` and `thr=80` on every single one, having started below 80. ADR 0008
+  records that this machine has no UEFI battery limit, so that explanation is out; what
+  remains is the risk the ADR itself names, Framework's custom EC charge command overriding
+  the standard one. **Note what M2 actually verified** - the write path, read-back,
+  persistence, resume and reboot re-apply. It never verified that charging *stops*.
+  `docs/plan.md` and ADR 0008 both currently claim more than was tested.
+- **`fw-helperd` loses a boot race with PPD and never recovers.** `ProfileAxis::connect`
+  probes once at startup. PPD is D-Bus-activatable, so *our own probe* triggers its
+  activation; on a busy boot systemd took 26.9 s to start it, our call hit the ~25 s D-Bus
+  timeout, and we fell back to writing `platform_profile` directly - ADR 0005's forbidden
+  path - for the whole session. PPD appeared 23 ms after we gave up. Measured: 26.8 s to a
+  wrong verdict at boot, 4 ms to the right one on restart. It also blocked startup for 27 s,
+  delaying the charge limit that long. Fix is to stop deciding once: watch
+  `NameOwnerChanged` on both bus names and adopt PPD when it appears, bound the initial
+  probe to ~2 s, and add `After=power-profiles-daemon.service`. The proxy then becomes
+  mutable state, so it goes behind a mutex per the `&self` rule.
+- **A one-off floor anomaly is still permanent.** The cleared table had held `62:184`
+  against neighbours of 79 - roughly 5200 rpm, forever, from a single bad sample. Floors
+  only ever rise, so nothing undoes it. Needs outlier rejection or corroboration before a
+  large jump is trusted; not attempted.
+
+**Fixed this session, not yet proven on hardware:** the floor learned firmware's
+*descending* branch. `next_direction` already carried direction through plateaus, but still
+flipped to rising on a **single 1 C blip**, and `peci-temp` dithers: a measured monotonic
+cooldown from 49.9 C to 38.9 C contained 17 falls, 104 steady samples and **7 upward blips**.
+One blip then held `rising` true for the rest of the descent. Replaying that real capture,
+the old code recorded "heating" down to 35.9 C - 14 C below the peak, writing buckets 34, 36,
+38, 42, 48 - which is how `44:48 46:66 48:66 50:74 52:66 54:66` got in and why a curve asking
+for duty 0 ran the fan at 2307 rpm. Replaced by `fw_helper_core::Direction`, a Schmitt
+trigger with a 2 C band; on the same capture it stops 1.0 C below the peak. A cold start now
+reads as **not** rising, since assuming heating with no history was the second route in.
 
 **Testing discipline, which this project keeps proving the hard way.** Roughly a dozen
 defects across two sessions were invisible to unit tests and appeared only on hardware or in
@@ -221,7 +258,7 @@ All of these cost real time once. Do not rediscover them.
 | `PrepareForSleep` does **not** wait for you | It is a notification, not a request for permission. Without a logind **delay inhibitor lock**, a pre-suspend write races the suspend. Also: `rtcwake -m mem` writes `/sys/power/state` directly and never emits the signal at all, so it cannot test any of this |
 | Handing the fan back to the EC **reduces** airflow | Firmware's curve tops out near 3100 rpm; manual reaches ~5200. Releasing is a last resort that defers to firmware's *whole* thermal protection, not a cooling escalation. Demand full duty first |
 | **The EC's fan curve is hysteretic** | At 61.9 °C firmware runs duty **0** heating and **92** cooling, and holds the fan on down to 44.9 °C. "Never quieter than firmware" is meaningless without naming a branch. Only the ascending branch says what a temperature needs (ADR 0011) |
-| Temperature direction needs **hysteresis of its own** | `peci-temp` is quantized to ~1 °C, so a cooldown reads as long runs of identical values. Deriving rising/falling from consecutive samples treats those as "steady" — count steady as rising and you record the whole descending branch. Carry the direction through plateaus |
+| Temperature direction needs **hysteresis of its own** | `peci-temp` is quantized to ~1 °C, so a cooldown reads as long runs of identical values. Deriving rising/falling from consecutive samples treats those as "steady" — count steady as rising and you record the whole descending branch. Carrying direction through plateaus is necessary and **not sufficient**: the sensor also dithers, and one 1 °C blip flipped the direction back to rising for the rest of a descent. A measured cooldown, 49.9 → 38.9 °C, held 17 falls, 104 steady samples and **7 upward blips**. Needs a real hysteresis band on the flip, not just plateau carry — `fw_helper_core::Direction` |
 | The CPU **protects itself** at Tjmax | `coretemp` crit = 100 °C on every core. A constrained fan costs performance, not hardware. `peci-temp` crit reads 119.8 °C, *above* Tjmax, so it is not a usable limit. What has no protection is the **battery** (crit 49.9 °C) |
 | The machine reaches **92.8 °C** in normal use | Not 76.8 °C — that was one M0 PL1 test. Two thresholds were set from the lower figure and both sat below normal operation |
 | Fan duty→RPM is **concave** | A line through the high points (120/160/181) predicts 1343 rpm at duty 0 and puts 2925 rpm at duty 77; the measured answer is ~85. Fitting a line would set the firmware floor *below* firmware. Interpolate the measured table |
@@ -236,6 +273,9 @@ All of these cost real time once. Do not rediscover them.
 | **Stale binary on PATH** | Bit us twice, both times looking like a broken daemon. `install-dev.sh` now installs a shim resolving the newest build per invocation. Still: build release *and* debug |
 | `apt install ./pkg.deb` **silently no-ops** on an unchanged version | Same family as the stale binary, one layer up. Rebuilding the `.deb` after a fix does not change `0.0.1`, so apt reports "already the newest version", installs nothing, and the fix is tested against the old payload. `dpkg -i` reinstalls regardless. **md5sum the installed binary against `target/release/`** rather than trusting the install log |
 | A capability can **outlive the config that enables it** | `charge_control_end_threshold` exists whenever the module was *loaded* with `probe_with_fwk_charge_control=1`, including by a drop-in deleted since — the parameter survives until reboot. The postinst read that node and concluded the machine was set up, so it stayed silent about a capability one reboot from vanishing. Test the **persistent config** (`/etc/modprobe.d/fw-helper.conf`), not the runtime symptom |
+| Applying a profile **re-takes the fan** | A profile carries a fan curve, so `profile performance` puts the daemon back in control of `pwm1` and undoes a `fan auto` issued before it. Anything needing the EC to own the fan — learning the firmware floor, above all — must order `fan auto` **last**, and must not straddle an AC/battery transition, which re-applies the profile and takes the fan back the same way |
+| The daemon **fights** `q6-pl1-load-test.sh` | The script predates the daemon owning PL1. It writes 15 W for its `LIMITED` arm; the daemon re-asserts its own setpoint within seconds (`power limit was 15 W, expected 25 W; re-applied`), so the arm measures the daemon's budget and the script concludes `NO EFFECT ... Cut M4`. It is an artifact — power settling from 30.47 W to 24.95 W *is* PL1 governing. Stop the daemon, or use plain `stress-ng` when all you need is heat |
+| A **verified** charge limit that does nothing | `charge_control_end_threshold` accepts 80, reads back 80, persists and re-applies across suspend and reboot — and the EC charges straight through it: 88% → 93%, +282 mAh, `status=Charging` throughout. Every layer M2 tested passed; none of them tested whether charging *stops*. Read-back is not efficacy, and for this feature the only real check is watching `charge_now` across the threshold |
 | A **disconnected** GUI still looks operable | Sensitivity is decided by `sync_controls` from a snapshot, which cannot run with no daemon — so controls keep whatever state they were built with. Cold-started against no daemon, every control accepted input and discarded it, which reads as "the app does nothing" rather than "nothing is installed". Build controls insensitive; gate the groups on connection, and let per-row capability sensitivity sit underneath |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |
