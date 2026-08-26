@@ -1,6 +1,7 @@
 # 0008 — Charge limit via `probe_with_fwk_charge_control`, not a custom EC command
 
-- **Status:** Accepted
+- **Status:** **Superseded by [0012](0012-charge-limit-via-custom-ec-command.md)** — failed on
+  hardware; see [Outcome](#outcome-2026-08-26--the-approach-does-not-work)
 - **Date:** 2026-08-18
 
 ## Context
@@ -119,6 +120,74 @@ Appended after the fact; the decision above is unchanged.
   so the override path this ADR anticipates remains *unexercised* — it is implemented and
   unit-tested against a fixture, but has never been triggered by real firmware. Treat it as
   designed-for, not demonstrated.
+
+## Outcome (2026-08-26) — the approach does not work
+
+Appended after the fact. The decision above is left intact as the record of what was
+tried; this section records that it failed.
+
+**The charge limit has never worked on this machine.** Not "works but unverified", not
+"works except when a UEFI limit is set" — the feature has never once stopped charging.
+
+Measured, with `probe_with_fwk_charge_control=Y` and the drop-in in place:
+
+| | |
+|---|---|
+| `charge_control_end_threshold` | `80` |
+| `capacity` | `100` |
+| `charge_now` / `charge_full` | 4 804 000 / 4 806 000 |
+| `status` across the crossing | `Charging` throughout, 120 samples, 88% → 93%, +282 mAh |
+
+No battery limit is set in UEFI setup, so the escape hatch this ADR names — "if the user
+knows they are not going to use the custom command" — was honoured and the override
+happened anyway.
+
+### Why the precondition was never satisfiable
+
+The ADR read upstream's condition as a promise the *user* could make. It is not. The
+custom EC command is not something a user opts into; it is what the EC firmware itself
+runs. Leaving the UEFI setting at default does not stand the custom command down, it only
+leaves it unconfigured — and an unconfigured custom command still wins over the standard
+one. So forcing the binding produced a working sysfs attribute wired to the mechanism the
+kernel had already judged to be the losing one. The driver's refusal to bind was the
+correct verdict about this hardware, and the module parameter is an escape hatch for
+machines where the user has genuinely displaced the custom command, which this is not.
+
+### Why our own detection never fired
+
+The ADR specified: write, read back, and report a persistent mismatch as "a BIOS battery
+limit appears to be set". That anticipates firmware that **writes the value back**. This
+firmware does something the design did not consider — it leaves `80` sitting in the
+attribute, unchanged and readable, and ignores it. The read-back therefore always agrees,
+and `ChargeError::NotApplied` cannot fire for the failure that actually occurs.
+
+This is the general lesson, and it is worth more than the ADR was: **read-back is not
+efficacy.** Every layer M2 verified — write, read-back, persistence, suspend re-apply,
+reboot re-apply — sits upstream of the question "does charging stop". Five green checks,
+none of them the one that mattered. The only honest test for this feature is watching
+`charge_now` and `status` across the threshold.
+
+### What this ADR got right
+
+The `Verification (2026-08-21)` section above already flagged the override path as
+"implemented and unit-tested against a fixture, but ... never been triggered by real
+firmware. Treat it as designed-for, not demonstrated." That was accurate and appropriately
+hedged. What went wrong was downstream of it: `docs/plan.md` marked M2 complete and the
+capability probe reported `Cap::Yes`, both of which claimed more than this ADR ever did.
+
+### Consequence
+
+Replaced by the alternative this ADR considered and rejected — implementing Framework's
+custom EC charge command — under the reconsideration trigger it set for itself:
+"if interoperating with the UEFI setting becomes a requirement rather than something we
+ask users to avoid." It is now a requirement, because the custom command governs the board
+whether or not anybody configures it.
+
+Until that lands, `Capabilities::probe` reports the charge limit **unavailable** whenever
+the binding was forced, and points the user at the UEFI battery limit, which does work.
+The modprobe drop-in stays for now: it is inert rather than harmful, and removing it is
+part of the replacement's install story, not of this correction.
+
 
 ## Alternatives considered
 

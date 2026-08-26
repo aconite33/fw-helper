@@ -66,8 +66,26 @@ impl Capabilities {
         // The kernel driver refuses to bind on Framework hardware unless the module
         // parameter is set — see ADR 0008. Distinguish "needs opting in" from
         // "genuinely absent", because the fix differs.
+        //
+        // The presence of the attribute is NOT evidence that a limit works. When the
+        // binding was forced with `probe_with_fwk_charge_control=1` we are driving the
+        // standard CrOS EC command on a board whose firmware also runs Framework's
+        // custom one, and upstream's own words are that the custom command "can get
+        // overridden" — which is the exact case the driver declines to enter. Measured
+        // on 2026-08-26: threshold 80, battery charged through it to 100%. So a forced
+        // binding reports unavailable, because that is what it is.
         let charge_path = format!("{}/charge_control_end_threshold", paths::BATTERY);
-        let charge_limit = if fs.exists(&charge_path) {
+        let forced = matches!(
+            fs.read_string(paths::CHARGE_LIMIT_PARAM).as_deref(),
+            Ok("Y") | Ok("y") | Ok("1")
+        );
+        let charge_limit = if fs.exists(&charge_path) && forced {
+            Cap::no(
+                "the EC ignores this threshold: Framework's custom charge command \
+                 overrides the standard one, and the battery charges past the limit \
+                 to full. Use the battery limit in UEFI setup instead",
+            )
+        } else if fs.exists(&charge_path) {
             Cap::Yes
         } else if fs.exists(paths::CHARGE_LIMIT_PARAM) {
             Cap::no(

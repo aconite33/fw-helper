@@ -164,7 +164,13 @@ fn status_via_dbus(d: &DaemonProxyBlocking<'_>, version: u32) {
         println!("  battery            {pct}% ({st})");
     }
     if let Some(limit) = s.charge_limit {
-        println!("  charge limit       {limit}%");
+        // The value is real; whether it governs charging is a separate question, and
+        // on this board the answer is no. Say so on the same line rather than leaving
+        // it to be inferred from the capability block above.
+        match s.capability("charge limit") {
+            Some((false, _)) => println!("  charge limit       {limit}% (the EC ignores it)"),
+            _ => println!("  charge limit       {limit}%"),
+        }
     }
 
     if !s.temps.is_empty() {

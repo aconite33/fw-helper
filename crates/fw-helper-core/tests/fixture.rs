@@ -118,13 +118,37 @@ fn finds_hwmon_by_name_not_index() {
 }
 
 #[test]
-fn charge_limit_available_when_threshold_exists() {
+fn charge_limit_available_when_the_driver_bound_on_its_own() {
+    // Threshold present *and* the override parameter still N, i.e. the kernel decided
+    // the standard command is safe here. That is the only case we may call available.
     let f = Fixture::framework_13("charge-ok");
     f.write(
         "sys/class/power_supply/BAT1/charge_control_end_threshold",
         "80\n",
     );
     assert!(Capabilities::probe(&f.sysfs()).charge_limit.is_available());
+}
+
+#[test]
+fn charge_limit_unavailable_when_the_binding_was_forced() {
+    // The target machine's real state, and the one that shipped a lie: the attribute
+    // exists, accepts writes and reads them back — while the EC charges past the limit
+    // to full. Existence of the node is not evidence the limit works, so a forced
+    // binding must report unavailable rather than Cap::Yes.
+    let f = Fixture::framework_13("charge-forced");
+    f.write(
+        "sys/class/power_supply/BAT1/charge_control_end_threshold",
+        "80\n",
+    );
+    f.write(
+        "sys/module/cros_charge_control/parameters/probe_with_fwk_charge_control",
+        "Y\n",
+    );
+    let caps = Capabilities::probe(&f.sysfs());
+    assert!(!caps.charge_limit.is_available());
+    let why = format!("{}", caps.charge_limit);
+    // The reason must give the user something to do, per the capability rule.
+    assert!(why.contains("UEFI setup"), "got: {why}");
 }
 
 #[test]

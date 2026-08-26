@@ -102,22 +102,16 @@ if [ "$1" = configure ]; then
     systemctl enable fw-helperd.service || true
     systemctl restart fw-helperd.service || true
 
-    # Ask whether charge control is configured to *persist*, not whether it happens to
-    # work this minute. The sysfs node exists whenever the module was loaded with the
-    # parameter set - including by a drop-in that has since been removed, since the
-    # module keeps its parameter until reboot. Testing the node alone therefore reports
-    # a machine as set up when the capability is one reboot from silently vanishing.
-    if [ ! -e /etc/modprobe.d/fw-helper.conf ]; then
+    # The charge limit needs no opt-in any more: it goes through Framework's custom EC
+    # command over /dev/cros_ec (ADR 0012), not through the module parameter. Say so
+    # only where the superseded setup is still lying around, so a machine set up under
+    # ADR 0008 does not keep carrying config that governs nothing.
+    if [ -e /etc/modprobe.d/fw-helper.conf ]; then
         echo ""
-        echo "fw-helper: battery charge limiting is off by default."
-        echo "  It changes which mechanism governs charging on this machine, so it"
-        echo "  is opt-in:  sudo fw-helper-enable-charge-control"
-        if [ -e /sys/class/power_supply/BAT1/charge_control_end_threshold ]; then
-            echo ""
-            echo "  Note: it is working right now, but only because the module was"
-            echo "  loaded with the parameter earlier. Without the step above it will"
-            echo "  stop working at the next reboot."
-        fi
+        echo "fw-helper: /etc/modprobe.d/fw-helper.conf is no longer needed."
+        echo "  The charge limit now uses the EC command that actually governs charging;"
+        echo "  the module parameter it sets drove an interface this board ignores."
+        echo "  Safe to remove:  sudo rm /etc/modprobe.d/fw-helper.conf"
         echo ""
     fi
 fi

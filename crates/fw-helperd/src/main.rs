@@ -11,6 +11,7 @@
 //! the thing that proves this daemon is alive is the same thing that proves it is
 //! doing its job.
 
+mod ec;
 mod fan;
 mod iface;
 mod logind;
@@ -41,7 +42,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     polkit::init_runtime(tokio::runtime::Handle::current());
 
     let fs = Sysfs::default();
-    let caps = Capabilities::probe(&fs);
+    let mut caps = Capabilities::probe(&fs);
+    // Core probes sysfs only (ADR 0010), and sysfs is the interface that lies about
+    // this particular knob. Ask the mechanism that actually governs charging instead.
+    let cros_ec: Arc<dyn ec::EcTransport> = Arc::new(ec::CrosEc::default());
+    caps.charge_limit = if ec::CrosEc::default().exists() {
+        ec::charge_capability(&*cros_ec)
+    } else {
+        fw_helper_core::Cap::No(format!("no {}; is cros_ec_chardev loaded?", ec::DEVICE))
+    };
 
     eprintln!("fw-helperd starting ({})", build_stamp());
     for (name, cap) in caps.summary() {
@@ -101,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axis: Arc::clone(&axis),
             applied_ppd: Arc::clone(&applied_ppd),
             profiles: Arc::clone(&known_profiles),
+            ec: Arc::clone(&cros_ec),
         },
     );
     daemon.reapply_charge_limit();
@@ -150,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_ppd: Arc::clone(&pending_ppd),
         applied_ppd: Arc::clone(&applied_ppd),
         fs: fs.clone(),
+        cros_ec: Arc::clone(&cros_ec),
         persisted_profile,
         persisted_power_limit: state_power_limit,
         known_profiles: Arc::clone(&known_profiles),
@@ -309,6 +320,7 @@ async fn apply_profile(
     axis: &ppd::ProfileAxis,
     lease: &fan::FanLease,
     fs: &Sysfs,
+    ec: &dyn ec::EcTransport,
     thermal: fan::Thermal,
 ) -> Result<(), String> {
     if set_ppd {
@@ -326,7 +338,7 @@ async fn apply_profile(
         .map_err(|e| format!("fan curve: {e}"))?;
 
     if let Some(limit) = profile.charge_limit {
-        if let Err(e) = fw_helper_core::ChargeControl::new(fs).set(limit) {
+        if let Err(e) = crate::ec::set_charge_limit(fs, ec, limit) {
             eprintln!(
                 "profile {}: charge limit {limit}% failed: {e}",
                 profile.name
@@ -555,6 +567,7 @@ struct Poll {
     /// The PPD profile we set ourselves, so its echo can be told from a real slider move.
     applied_ppd: Arc<std::sync::atomic::AtomicU8>,
     fs: Sysfs,
+    cros_ec: Arc<dyn ec::EcTransport>,
     persisted_profile: Option<String>,
     persisted_power_limit: Option<u32>,
     known_profiles: Arc<std::sync::Mutex<Vec<Profile>>>,
@@ -571,6 +584,7 @@ async fn poll_loop(ctx: Poll) {
         pending_ppd,
         applied_ppd,
         fs,
+        cros_ec,
         persisted_profile,
         persisted_power_limit,
         known_profiles,
@@ -644,7 +658,9 @@ async fn poll_loop(ctx: Poll) {
                     power_corrections = 0;
                     applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
                     let thermal = fan::Thermal::from_telemetry(&sample);
-                    if let Err(e) = apply_profile(&p, true, &axis, &lease, &fs, thermal).await {
+                    if let Err(e) =
+                        apply_profile(&p, true, &axis, &lease, &fs, &*cros_ec, thermal).await
+                    {
                         eprintln!("could not re-apply profile {name}: {e}");
                     } else if let Some(override_watts) =
                         power_override.filter(|w| *w != p.pl1_watts)
@@ -699,7 +715,8 @@ async fn poll_loop(ctx: Poll) {
                             applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
                             let thermal = fan::Thermal::from_telemetry(&sample);
                             if let Err(e) =
-                                apply_profile(&p, true, &axis, &lease, &fs, thermal).await
+                                apply_profile(&p, true, &axis, &lease, &fs, &*cros_ec, thermal)
+                                    .await
                             {
                                 eprintln!("could not apply {name} on {source}: {e}");
                             } else {
@@ -734,7 +751,9 @@ async fn poll_loop(ctx: Poll) {
                 );
                 power_corrections = 0;
                 let thermal = fan::Thermal::from_telemetry(&sample);
-                if let Err(e) = apply_profile(&p, false, &axis, &lease, &fs, thermal).await {
+                if let Err(e) =
+                    apply_profile(&p, false, &axis, &lease, &fs, &*cros_ec, thermal).await
+                {
                     eprintln!("could not follow PPD to {}: {e}", p.name);
                 } else {
                     // Before the enforcement below runs, or it would restore the

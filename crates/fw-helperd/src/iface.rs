@@ -7,7 +7,7 @@ use crate::fan::FanLease;
 use crate::state::State;
 use crate::watchdog::Watchdog;
 use crate::{polkit, wire};
-use fw_helper_core::{Capabilities, ChargeControl, PowerLimit, Sysfs, Telemetry};
+use fw_helper_core::{Capabilities, PowerLimit, Sysfs, Telemetry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zbus::zvariant::OwnedValue;
@@ -35,6 +35,9 @@ pub enum Reapply {
 /// transposing two of them would compile.
 pub struct Shared {
     pub fan: Arc<FanLease>,
+    /// The EC transport. Injected rather than constructed here so the charge-limit
+    /// paths stay testable: an ioctl has no fixture-tree equivalent (ADR 0012).
+    pub ec: Arc<dyn crate::ec::EcTransport>,
     pub watchdog: Arc<Watchdog>,
     pub axis: Arc<crate::ppd::ProfileAxis>,
     pub applied_ppd: Arc<std::sync::atomic::AtomicU8>,
@@ -45,6 +48,9 @@ pub struct Shared {
 pub struct Daemon {
     fs: Sysfs,
     caps: Capabilities,
+    /// Framework's custom EC command is the only mechanism that governs charging on
+    /// this board; sysfs holds a number that does nothing (ADR 0012).
+    ec: Arc<dyn crate::ec::EcTransport>,
     /// Behind a mutex for the same reason `state` is, and it matters more than it
     /// looks. Updating it used to need `&mut self`, so the poll loop took zbus's
     /// interface **write** lock every second. Any method awaiting something slow holds
@@ -78,6 +84,7 @@ impl Daemon {
         Self {
             fs,
             caps,
+            ec: shared.ec,
             latest: Mutex::new(Telemetry::default()),
             state: Mutex::new(state),
             fan: shared.fan,
@@ -145,9 +152,7 @@ impl Daemon {
         let Some(limit) = self.state.lock().ok().and_then(|s| s.charge_limit) else {
             return Reapply::NothingPersisted;
         };
-        let cc = ChargeControl::new(&self.fs);
-
-        match cc.read() {
+        match crate::ec::read_charge_limit(&*self.ec) {
             Ok(observed) if observed == limit => {
                 eprintln!("charge limit still {limit}%; nothing to re-apply");
                 return Reapply::AlreadyCorrect;
@@ -155,15 +160,15 @@ impl Daemon {
             Ok(observed) => {
                 eprintln!("charge limit is {observed}%, expected {limit}%; re-applying");
             }
-            // Fall through to the write deliberately. The usual cause is the attribute
-            // being absent, and `set` reports that with the actionable message (ADR 0008)
-            // rather than the bare io error we would have to invent here.
+            // Fall through to the write deliberately. The usual cause is the EC being
+            // unreachable, and `set_charge_limit` reports that with the actionable
+            // message rather than the bare error we would have to invent here.
             Err(e) => {
                 eprintln!("cannot read charge limit ({e}); re-applying {limit}% anyway");
             }
         }
 
-        match cc.set(limit) {
+        match crate::ec::set_charge_limit(&self.fs, &*self.ec, limit) {
             Ok(()) => {
                 eprintln!("re-applied charge limit {limit}%");
                 Reapply::Corrected
@@ -611,9 +616,13 @@ impl Daemon {
     }
 
     /// Current charge limit as the EC reports it, or 0 when unsupported.
+    ///
+    /// Read from Framework's custom EC command, not from
+    /// `charge_control_end_threshold` - the sysfs attribute holds a number that does
+    /// not govern charging (ADR 0012).
     #[zbus(property)]
     async fn charge_limit(&self) -> u8 {
-        ChargeControl::new(&self.fs).read().unwrap_or(0)
+        crate::ec::read_charge_limit(&*self.ec).unwrap_or(0)
     }
 
     /// Set the battery charge limit.
@@ -621,7 +630,11 @@ impl Daemon {
     /// The first method in this interface that writes to hardware. Two things are
     /// non-negotiable and set the pattern for every write that follows: polkit is
     /// checked before touching anything, and the value is read back afterwards so a
-    /// silent override surfaces as an error rather than as success (ADR 0008).
+    /// silent override surfaces as an error rather than as success.
+    ///
+    /// The read-back only became meaningful with ADR 0012. Through ADR 0008 it read a
+    /// sysfs attribute that agreed with every write and governed nothing, so it
+    /// reported success for a feature that had never once worked.
     async fn set_charge_limit(
         &self,
         percent: u8,
@@ -630,8 +643,7 @@ impl Daemon {
     ) -> zbus::fdo::Result<()> {
         let sender = Self::authorize(&header, conn, polkit::actions::SET_CHARGE_LIMIT).await?;
 
-        ChargeControl::new(&self.fs)
-            .set(percent)
+        crate::ec::set_charge_limit(&self.fs, &*self.ec, percent)
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         // Lock only to record the result. Never held across an await.
@@ -870,7 +882,11 @@ mod tests {
         root
     }
 
-    fn daemon_with(root: &Path, persisted: Option<u8>) -> Daemon {
+    fn daemon_with_ec(
+        root: &Path,
+        persisted: Option<u8>,
+        ec: Arc<crate::ec::fake::FakeEc>,
+    ) -> Daemon {
         let fs_ = Sysfs::new(root);
         let caps = Capabilities::probe(&fs_);
         let state = State {
@@ -895,6 +911,7 @@ mod tests {
                 axis,
                 applied_ppd: Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 profiles: Arc::new(Mutex::new(fw_helper_core::Profile::built_ins())),
+                ec,
             },
         )
     }
@@ -909,44 +926,53 @@ mod tests {
         fs::read_to_string(root.join(ATTR)).unwrap().trim().into()
     }
 
+    // These read and write the EC, not sysfs. Under ADR 0008 they drove
+    // `charge_control_end_threshold` and passed for years against a value that
+    // governed nothing — which is precisely why the fixture now stands in for the
+    // mechanism rather than for the attribute.
+
     #[test]
     fn reapply_reports_when_firmware_left_the_limit_alone() {
         let root = fixture("already");
-        write_attr(&root, "80\n");
-        let d = daemon_with(&root, Some(80));
+        let ec = Arc::new(crate::ec::fake::FakeEc::new(0, 80));
+        let d = daemon_with_ec(&root, Some(80), Arc::clone(&ec));
 
         assert_eq!(d.reapply_charge_limit(), Reapply::AlreadyCorrect);
-        assert_eq!(read_attr(&root), "80");
+        assert_eq!(ec.max(), 80);
     }
 
     #[test]
     fn reapply_corrects_when_firmware_reset_the_limit() {
         let root = fixture("reset");
-        // What a firmware reset across suspend would look like.
+        // What a reboot leaves behind: the EC back at its 100% default.
         write_attr(&root, "100\n");
-        let d = daemon_with(&root, Some(80));
+        let ec = Arc::new(crate::ec::fake::FakeEc::new(0, 100));
+        let d = daemon_with_ec(&root, Some(80), Arc::clone(&ec));
 
         assert_eq!(d.reapply_charge_limit(), Reapply::Corrected);
+        assert_eq!(ec.max(), 80);
+        // ...and the inert sysfs attribute is dragged along so UPower and GNOME do not
+        // show a third, stale number. It follows the EC; it never leads.
         assert_eq!(read_attr(&root), "80");
     }
 
     #[test]
     fn reapply_does_nothing_without_a_persisted_limit() {
         let root = fixture("none");
-        write_attr(&root, "100\n");
-        let d = daemon_with(&root, None);
+        let ec = Arc::new(crate::ec::fake::FakeEc::new(0, 100));
+        let d = daemon_with_ec(&root, None, Arc::clone(&ec));
 
         assert_eq!(d.reapply_charge_limit(), Reapply::NothingPersisted);
         // Untouched — an absent limit is not a request to set 100%.
-        assert_eq!(read_attr(&root), "100");
+        assert_eq!(ec.max(), 100);
     }
 
     #[test]
-    fn reapply_fails_loudly_when_charge_control_is_unavailable() {
-        // No attribute at all: the module parameter is unset (ADR 0008).
+    fn reapply_fails_loudly_when_the_ec_will_not_take_the_command() {
+        // A board that does not implement Framework's custom command at all.
         let root = fixture("unsupported");
         fs::create_dir_all(&root).unwrap();
-        let d = daemon_with(&root, Some(80));
+        let d = daemon_with_ec(&root, Some(80), Arc::new(crate::ec::fake::FakeEc::dead()));
 
         assert_eq!(d.reapply_charge_limit(), Reapply::Failed);
     }

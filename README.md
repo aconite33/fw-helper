@@ -9,10 +9,12 @@ Inspired by [G-Helper](https://github.com/seerge/g-helper), which does this for 
 on Windows. This shares no code with it — see
 [ADR 0001](docs/adr/0001-separate-repository.md).
 
-> **Status: usable, not yet released.** Fan control, power limits, the battery charge limit
-> and profiles all work and are verified on real hardware, driven from a GTK4 window or the
-> command line. Fan *curve editing* is still command-line only, and there is no released
-> package yet. See [docs/plan.md](docs/plan.md) for what is measured and what is assumed.
+> **Status: usable, not yet released.** Fan control, power limits and profiles work and are
+> verified on real hardware, driven from a GTK4 window or the command line, and the fan
+> curve editor is in the app. The battery charge limit was rebuilt on Framework's custom
+> EC command after the previous mechanism was found inert, and is now verified to stop
+> charging. There is no released package yet.
+> See [docs/plan.md](docs/plan.md) for what is measured and what is assumed.
 
 ## Why
 
@@ -27,12 +29,12 @@ once, switchable from a tray icon or a hotkey.
 |---|---|
 | Live telemetry | **Working** — temps, fan RPM, CPU and whole-machine power, battery life |
 | Capability detection | **Working** — every knob reports available, or why not |
-| Battery charge limit | **Working** — survives suspend and reboot. Needs a module parameter ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)) |
+| Battery charge limit | **Working** — verified to actually stop charging: from below the limit, on AC, it halted at exactly 80% with `current_now=0`. Drives Framework's custom EC command ([ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)); the standard sysfs interface is inert on this board |
 | Fan control | **Working** — manual duty or a curve, with every ADR 0006 safety layer verified on hardware |
 | Power limits (PL1) | **Working** — a 15 W setpoint held 15.02 W sustained, +0.1% |
 | Performance profiles | **Working** — layered over power-profiles-daemon; the GNOME slider stays in sync |
 | Custom profiles | **Working** — saved from the app, or written by hand in `/etc/fw-helper/profiles.d/` |
-| Fan curve editing | Command line only; no graphical editor yet |
+| Fan curve editing | **Working** — graphical editor in the app, or `fw-helperctl fan curve` |
 | PL2 (short-term limit) | Not touched — it governs burst response, not sustained thermals |
 | **Undervolting** | **Not possible.** See below |
 
@@ -98,15 +100,13 @@ sudo apt install ./fw-helper_*.deb
 ```
 
 That installs the daemon, the GTK window (`fw-helper`, also in your app grid) and the CLI,
-enables the service, and creates `/etc/fw-helper/profiles.d/` for your own profiles. The
-battery charge limit needs one extra opt-in step, because it changes which mechanism governs
-charging ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md)):
-
-```bash
-sudo fw-helper-enable-charge-control
-```
+enables the service, and creates `/etc/fw-helper/profiles.d/` for your own profiles.
 
 Nothing takes manual control of the fan until you ask it to.
+
+The charge limit needs no opt-in step any more. `fw-helper-enable-charge-control` and the
+modprobe drop-in belong to the superseded mechanism ([ADR 0008](docs/adr/0008-charge-limit-via-module-parameter.md))
+and no longer do anything useful; they are removed separately.
 
 ## Or run it from source
 

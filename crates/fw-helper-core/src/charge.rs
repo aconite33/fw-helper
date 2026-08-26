@@ -7,9 +7,22 @@
 //! On Framework hardware the kernel driver refuses to bind unless
 //! `cros_charge-control.probe_with_fwk_charge_control=1` is set, because Framework's
 //! EC implements a *custom* charge control command alongside the standard one and the
-//! custom one can override it. See ADR 0008. The practical consequence is that a
-//! write can appear to succeed and then be silently overridden by a limit set in UEFI
-//! setup, so **every write is verified by reading back**.
+//! custom one can override it. See ADR 0008.
+//!
+//! **This path does not work on the target machine, and never has.** Measured
+//! 2026-08-26: threshold written as 80, read back as 80, persisted and re-applied
+//! across suspend and reboot — and the battery charged straight through to 100%
+//! (`charge_now` 4804000 of `charge_full` 4806000). No UEFI battery limit is set, so
+//! the override is the EC firmware's own custom command, exactly the case upstream
+//! declines to bind into.
+//!
+//! The read-back below therefore proves *less* than it appears to. It confirms the
+//! value the kernel stores, not that charging stops — and this firmware leaves the
+//! value alone while ignoring it, so a mismatch never occurs and
+//! [`ChargeError::NotApplied`] can never fire for the failure that actually happens.
+//! **Read-back is not efficacy.** The only honest test is watching `charge_now` and
+//! `status` across the threshold. Kept because it is still the right check for a
+//! firmware that *does* write the value back.
 
 use crate::{paths, Sysfs};
 use std::fmt;
@@ -27,8 +40,11 @@ pub enum ChargeError {
     Unsupported,
     OutOfRange(u8),
     Io(std::io::Error),
-    /// Written successfully, but reading back gave something else. On this hardware
-    /// that most likely means a UEFI battery limit is overriding us.
+    /// Written successfully, but reading back gave something else.
+    ///
+    /// Note what this does *not* catch: the measured failure on this board leaves the
+    /// value intact and ignores it, so this variant stays silent through it. See the
+    /// module note.
     NotApplied {
         requested: u8,
         observed: u8,
@@ -56,7 +72,8 @@ impl fmt::Display for ChargeError {
             } => write!(
                 f,
                 "wrote {requested}% but the EC reports {observed}%; \
-                 a charge limit set in UEFI setup is probably overriding it"
+                 something else is governing charging — check for a battery limit \
+                 in UEFI setup"
             ),
         }
     }
@@ -151,12 +168,17 @@ mod tests {
     }
 
     #[test]
-    fn not_applied_error_blames_uefi() {
+    fn not_applied_error_reports_both_values_and_names_a_check() {
         let msg = ChargeError::NotApplied {
             requested: 80,
             observed: 100,
         }
         .to_string();
-        assert!(msg.contains("UEFI"), "got: {msg}");
+        // It must not assert a cause it cannot know. On the target machine no UEFI
+        // limit is set and the EC overrides us anyway, so "UEFI is probably
+        // overriding it" was a guess stated as the likely fact.
+        assert!(msg.contains("80"), "got: {msg}");
+        assert!(msg.contains("100"), "got: {msg}");
+        assert!(msg.contains("UEFI setup"), "got: {msg}");
     }
 }

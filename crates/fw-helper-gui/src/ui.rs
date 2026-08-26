@@ -623,16 +623,24 @@ fn sync_controls(w: &mut Widgets, s: &Snapshot) {
         applied.join(" · ")
     });
 
-    match s.charge_limit {
-        Some(v) => {
-            if !charge_busy {
-                w.charge_row.set_value(f64::from(v));
-            }
+    // Sensitivity follows the *capability*, not the presence of a value. On this board
+    // the attribute exists, accepts 80 and reads back 80 while the EC charges past it
+    // to full - so "we have a number" is exactly the evidence that misled us. Show the
+    // number, because it is genuinely what the kernel holds, but do not let it be
+    // edited or described as if it governed anything.
+    let charge_ok = s.capability("charge limit").is_some_and(|(ok, _)| ok);
+    if let Some(v) = s.charge_limit {
+        if !charge_busy {
+            w.charge_row.set_value(f64::from(v));
+        }
+    }
+    match (charge_ok, s.charge_limit) {
+        (true, Some(_)) => {
             w.charge_row.set_sensitive(true);
             w.charge_row
                 .set_subtitle("stop charging at this percentage");
         }
-        None => {
+        _ => {
             w.charge_row.set_sensitive(false);
             // A dead control with no explanation is the thing the capability system
             // exists to prevent, so borrow the daemon's reason.

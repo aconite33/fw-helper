@@ -18,7 +18,7 @@ BIOS 03.02, EC `sakura-3.0.2`, Ubuntu 24.04, kernel 7.0.
 | M0 — baseline & architecture | complete: 10 ADRs, all 6 hardware questions answered empirically |
 | M1a — hardware layer | complete, verified on hardware |
 | M1b — daemon + D-Bus | complete, verified unprivileged against a root daemon |
-| M2 — battery charge limit | complete: write path, suspend/resume and reboot re-apply all verified on hardware |
+| M2 — battery charge limit | **complete, and charging verified to stop** (2026-08-26): ADR 0008's sysfs mechanism was inert, so the limit now goes through Framework's custom EC command `0x3E03` over `/dev/cros_ec` (ADR 0012). Halted at exactly 80% on AC from below the limit, `current_now=0` |
 | M3 — fan control | **complete**: all six ADR 0006 safety points and the curve engine verified on hardware |
 | M4 — power limits | PL1 control complete and verified (15 W setpoint → 15.02 W sustained) |
 | M5 — profiles | complete: PPD delegation, user profiles, save/delete, AC/battery switching |
@@ -30,90 +30,73 @@ actually exposes. **Do not re-derive hardware facts — they are measured and re
 
 ### Resume here
 
-Last session ended 2026-08-23. **M0-M7 are complete**, and steps 1-2 of the previous
-resume plan are now verified on hardware. The session then found three defects, fixed one,
-and left the tree dirty. **Nothing is committed.**
+Last session ended 2026-08-26. **M0-M7 are complete**, and M2 is complete *for the first
+time honestly*: the battery charge limit now actually stops charging.
 
-**Verified this session, and no longer in doubt:**
+**The headline, because it changes what the project claims about itself.** The charge
+limit had never worked. `charge_control_end_threshold` accepted 80, read back 80,
+persisted and re-applied across suspend and reboot - and the battery charged to 100%.
+Cause: **this board has two charge-control mechanisms and sysfs is wired to the losing
+one.** Measured with the standard threshold at 80, Framework's custom EC command reported
+`max=100`, and 100 is what happened. ADR 0008 forced `cros_charge-control` to bind with
+`probe_with_fwk_charge_control=1`; the kernel's refusal to bind was a correct verdict
+about this hardware, not an inconvenience to route around.
 
-- **The packaged stack comes up clean from cold.** `fw-helperd` starts at boot, serves all
-  five capabilities, and re-applies both the charge limit and the power limit.
-- **The modprobe drop-in works.** `probe_with_fwk_charge_control` read `Y` after a genuine
-  reboot, so charge control no longer rests on a parameter left over from 2026-08-21.
-- **A curve drawn in the GUI drives a real fan.** At 35.9 C, where `fan floor` reports
-  firmware would have the fan off, a hand-drawn curve held 3389 rpm. Editor -> daemon ->
-  hardware is proven end to end. The *descent* claim is still unproven; see step 3.
+Replaced by **[ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)**: command
+`0x3E03` over `/dev/cros_ec`. Verified 2026-08-26 - charged from below the limit on AC and
+stopped at exactly 80%, `status=Not charging`, `current_now=0`, `charge_now` 3 859 000 of
+`charge_full` 4 821 000. Repeatable via `scripts/q2-charge-limit-efficacy.sh`, which
+refuses to run on battery or when already above the limit.
 
 **Do these in order.**
 
-**1 - Relearn the firmware floor.** Everything else about the fan waits on this. The
-persisted table was corrupted (see below), has been **cleared**, and is currently empty, so
-the daemon is running on the cold-start model - which `floor.rs` itself notes was measured
-on the descending branch. Needs AC power.
+**1 - The descent test. Still the highest-value unproven claim**, and now unblocked: the
+floor table has largely relearned. `/var/lib/fw-helper/state` reads all zeros through the
+44-62 C band except a residual `54:51`, against the corrupted `44:48 46:66 48:66 50:74
+52:66 54:66` that provoked the fix. Draw a curve reaching duty 0 by 55 C, heat with
+`stress-ng`, and listen on the way **down** - firmware holds duty 50-90 to 44.9 C, so ours
+should be silent where firmware would not be (ADR 0011). Decide whether `54:51` is a real
+observation or the same one-off anomaly problem in miniature.
 
-```bash
-fw-helperctl profile performance && fw-helperctl fan auto
-cat /sys/class/hwmon/hwmon10/pwm1_enable     # MUST be 2, or nothing is observed
-stress-ng --cpu $(nproc) --timeout 300s; sleep 90
-cat /var/lib/fw-helper/state                 # want: 44-62 C band all 0
-```
+**2 - Fix the PPD boot race.** Carried over untouched and still the worst live defect.
+`ProfileAxis::connect` probes once at startup; PPD is D-Bus-activatable, so *our own probe*
+triggers its activation. On a busy boot systemd took 26.9 s, our call hit the ~25 s D-Bus
+timeout, and we fell back to writing `platform_profile` directly - ADR 0005's forbidden
+path - for the whole session. PPD appeared 23 ms after we gave up. Measured: 26.8 s to a
+wrong verdict at boot, 4 ms to the right one on restart. It also blocked startup for 27 s.
+Fix: watch `NameOwnerChanged` on both bus names and adopt PPD when it appears, bound the
+initial probe to ~2 s, add `After=power-profiles-daemon.service`. The proxy becomes mutable
+state, so it goes behind a mutex per the `&self` rule.
 
-Order matters and cost a round: **applying a profile re-takes the fan** and installs that
-profile's curve, so `fan auto` must come *after* `profile performance`. Plug in first too -
-an AC/battery transition re-applies the profile and takes the fan back. Do **not** use
-`q6-pl1-load-test.sh` for this; see the PL1 trap below.
+**3 - Retire the ADR 0008 leftovers.** `/etc/modprobe.d/fw-helper.conf` and
+`fw-helper-enable-charge-control` are now inert: they configure an interface nothing reads.
+The postinst says the drop-in is safe to remove but nothing deletes it. Needs an uninstall
+path of its own, which is why it was not folded into the ADR 0012 change.
 
-**2 - Install the package and reboot.** `fw-helper_0.0.2_amd64.deb` is already built and its
-payload md5-verified against `target/release/`, so it needs installing, not rebuilding. The
-version was bumped from 0.0.1 precisely so this install cannot silently no-op. Delete the
-stale `fw-helper_0.0.1_amd64.deb` still sitting in the repo root - two installable files,
-one of them wrong, is its own trap.
+**4 - Reboot and confirm the charge limit survives it.** The EC limit was set at run time
+and the daemon re-applies from `/var/lib/fw-helper/state` at startup, but that re-apply has
+only ever been exercised against the *sysfs* mechanism. It is now a different code path.
 
-**3 - The descent test, which is still the highest-value unproven claim.** Only meaningful
-once step 1 has given a trustworthy floor: the floor overrides the curve, so a poisoned
-floor makes the test measure nothing. Draw a curve reaching duty 0 by 55 C, heat the machine
-with `stress-ng`, and listen on the way **down** - firmware holds duty 50-90 to 44.9 C, so
-ours should be silent while firmware would not be (ADR 0011).
+**Open defects, in severity order:**
 
-**4 - Fast-forward `main`.** Now four commits behind on `m7-verify-and-gui-disconnect`, plus
-whatever this session's work is committed as.
+- **`fw-helperd` loses a boot race with PPD and never recovers.** See step 2.
+- **A one-off floor anomaly is permanent.** Floors only ever rise within a bucket, so a
+  single bad sample sticks forever - the cleared table had held `62:184` against neighbours
+  of 79, roughly 5200 rpm. Needs outlier rejection or corroboration before a large jump is
+  trusted; not attempted. `54:51` in the current table may be an instance.
 
-**Open defects found this session, in severity order:**
+**Verified on hardware and no longer in doubt:**
 
-- **The battery charge limit is inert.** Highest impact: a headline feature does nothing.
-  `charge_control_end_threshold` accepts 80, reads back 80, persists and re-applies - and
-  the EC charges straight through it. Measured over 120 samples: 88% -> 93%, +282 mAh,
-  `status=Charging` and `thr=80` on every single one, having started below 80. ADR 0008
-  records that this machine has no UEFI battery limit, so that explanation is out; what
-  remains is the risk the ADR itself names, Framework's custom EC charge command overriding
-  the standard one. **Note what M2 actually verified** - the write path, read-back,
-  persistence, resume and reboot re-apply. It never verified that charging *stops*.
-  `docs/plan.md` and ADR 0008 both currently claim more than was tested.
-- **`fw-helperd` loses a boot race with PPD and never recovers.** `ProfileAxis::connect`
-  probes once at startup. PPD is D-Bus-activatable, so *our own probe* triggers its
-  activation; on a busy boot systemd took 26.9 s to start it, our call hit the ~25 s D-Bus
-  timeout, and we fell back to writing `platform_profile` directly - ADR 0005's forbidden
-  path - for the whole session. PPD appeared 23 ms after we gave up. Measured: 26.8 s to a
-  wrong verdict at boot, 4 ms to the right one on restart. It also blocked startup for 27 s,
-  delaying the charge limit that long. Fix is to stop deciding once: watch
-  `NameOwnerChanged` on both bus names and adopt PPD when it appears, bound the initial
-  probe to ~2 s, and add `After=power-profiles-daemon.service`. The proxy then becomes
-  mutable state, so it goes behind a mutex per the `&self` rule.
-- **A one-off floor anomaly is still permanent.** The cleared table had held `62:184`
-  against neighbours of 79 - roughly 5200 rpm, forever, from a single bad sample. Floors
-  only ever rise, so nothing undoes it. Needs outlier rejection or corroboration before a
-  large jump is trusted; not attempted.
+- **The charge limit stops charging** (above). The mechanism, the write path through
+  polkit and D-Bus, and the efficacy test all check out.
+- **The packaged stack comes up clean from cold**, serving all five capabilities and
+  re-applying the charge and power limits.
+- **A curve drawn in the GUI drives a real fan**, end to end: at 35.9 C, where firmware
+  would have the fan off, a hand-drawn curve held 3389 rpm.
 
-**Fixed this session, not yet proven on hardware:** the floor learned firmware's
-*descending* branch. `next_direction` already carried direction through plateaus, but still
-flipped to rising on a **single 1 C blip**, and `peci-temp` dithers: a measured monotonic
-cooldown from 49.9 C to 38.9 C contained 17 falls, 104 steady samples and **7 upward blips**.
-One blip then held `rising` true for the rest of the descent. Replaying that real capture,
-the old code recorded "heating" down to 35.9 C - 14 C below the peak, writing buckets 34, 36,
-38, 42, 48 - which is how `44:48 46:66 48:66 50:74 52:66 54:66` got in and why a curve asking
-for duty 0 ran the fan at 2307 rpm. Replaced by `fw_helper_core::Direction`, a Schmitt
-trigger with a 2 C band; on the same capture it stops 1.0 C below the peak. A cold start now
-reads as **not** rising, since assuming heating with no history was the second route in.
+**Housekeeping:** `Cargo.lock` is gitignored. For a workspace shipping binaries that is
+arguably wrong - the `libc` dependency added for ADR 0012 is not captured anywhere in
+version control. Not changed unilaterally.
 
 **Testing discipline, which this project keeps proving the hard way.** Roughly a dozen
 defects across two sessions were invisible to unit tests and appeared only on hardware or in
@@ -275,7 +258,9 @@ All of these cost real time once. Do not rediscover them.
 | A capability can **outlive the config that enables it** | `charge_control_end_threshold` exists whenever the module was *loaded* with `probe_with_fwk_charge_control=1`, including by a drop-in deleted since — the parameter survives until reboot. The postinst read that node and concluded the machine was set up, so it stayed silent about a capability one reboot from vanishing. Test the **persistent config** (`/etc/modprobe.d/fw-helper.conf`), not the runtime symptom |
 | Applying a profile **re-takes the fan** | A profile carries a fan curve, so `profile performance` puts the daemon back in control of `pwm1` and undoes a `fan auto` issued before it. Anything needing the EC to own the fan — learning the firmware floor, above all — must order `fan auto` **last**, and must not straddle an AC/battery transition, which re-applies the profile and takes the fan back the same way |
 | The daemon **fights** `q6-pl1-load-test.sh` | The script predates the daemon owning PL1. It writes 15 W for its `LIMITED` arm; the daemon re-asserts its own setpoint within seconds (`power limit was 15 W, expected 25 W; re-applied`), so the arm measures the daemon's budget and the script concludes `NO EFFECT ... Cut M4`. It is an artifact — power settling from 30.47 W to 24.95 W *is* PL1 governing. Stop the daemon, or use plain `stress-ng` when all you need is heat |
-| A **verified** charge limit that does nothing | `charge_control_end_threshold` accepts 80, reads back 80, persists and re-applies across suspend and reboot — and the EC charges straight through it: 88% → 93%, +282 mAh, `status=Charging` throughout. Every layer M2 tested passed; none of them tested whether charging *stops*. Read-back is not efficacy, and for this feature the only real check is watching `charge_now` across the threshold |
+| A **verified** charge limit that does nothing | `charge_control_end_threshold` accepts 80, reads back 80, persists and re-applies across suspend and reboot — and the EC charges straight through it: 88% → 93%, +282 mAh, `status=Charging` throughout. Every layer M2 tested passed; none of them tested whether charging *stops*. **Read-back is not efficacy.** Fixed in ADR 0012 by driving Framework's custom EC command instead; `scripts/q2-charge-limit-efficacy.sh` is now the check that counts |
+| **Two charge limits exist, and sysfs is the wrong one** | This board runs Framework's custom EC charge command *and* the standard CrOS one. They hold independent values: measured with `charge_control_end_threshold` at 80, the custom command reported `max=100` — and 100 is what happened. Forcing `cros_charge-control` to bind with `probe_with_fwk_charge_control=1` produces a working-looking sysfs attribute wired to the losing mechanism. The kernel's refusal to bind was a correct verdict about the hardware, not an inconvenience to route around (ADR 0012) |
+| An **opcode from memory** is a coin flip | Looking up `EC_CMD_CHARGE_LIMIT_CONTROL` returned `0x3E07` from one summary and `0x3E03` from another. The real answer is **`0x3E03`**, settled only by reading the enum with its neighbours. A wrong opcode is not a compile error and often not a runtime error either — the EC simply answers a different question. Pin it in a test |
 | A **disconnected** GUI still looks operable | Sensitivity is decided by `sync_controls` from a snapshot, which cannot run with no daemon — so controls keep whatever state they were built with. Cold-started against no daemon, every control accepted input and discarded it, which reads as "the app does nothing" rather than "nothing is installed". Build controls insensitive; gate the groups on connection, and let per-row capability sensitivity sit underneath |
 | **XML comments forbid `--`** | Used as an em dash it broke the D-Bus policy; dbus-daemon skipped the file silently and surfaced it as `AccessDenied` much later. Validated in CI now |
 | MSRV silently picks stale deps | At `rust-version = "1.74"` the resolver chose zbus 3 while 5 existed. **Check what resolved, not just that it resolved** |

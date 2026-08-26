@@ -20,7 +20,7 @@ profile — the way G-Helper does for ASUS laptops on Windows.
 | Performance profiles | PPD D-Bus, layered ([0005](adr/0005-delegate-to-power-profiles-daemon.md)) | High — verified present |
 | Fan curves | `cros_ec` hwmon `pwm1` | High — verified working on hardware |
 | Power limits (PL1/PL2) | `intel-rapl-mmio` powercap | High — verified regulating to ±2% |
-| Battery charge limit | sysfs, via module param ([0008](adr/0008-charge-limit-via-module-parameter.md)) | High — mechanism confirmed |
+| Battery charge limit | ~~sysfs, via module param~~ **failed** ([0008](adr/0008-charge-limit-via-module-parameter.md)) | **None** — the EC charges past the limit; needs the custom EC command |
 | Live telemetry | hwmon + powercap `energy_uj` | High |
 | Keyboard backlight | `/sys/class/leds/chromeos::kbd_backlight` | High |
 
@@ -131,15 +131,44 @@ cannot, and the client renders it with no privileges of its own.
 
 ---
 
-### M2 — Battery charge limit  ✅ complete, verified on hardware
+### M2 — Battery charge limit  ✅ **complete — charging verified to stop**
+
+> **Corrected 2026-08-26.** This section previously read "✅ complete, verified on
+> hardware". It was not. **The charge limit has never stopped charging.** With the
+> threshold at 80 the battery charged to 100% (`charge_now` 4 804 000 of `charge_full`
+> 4 806 000; `status=Charging` across 120 samples spanning the crossing), and no UEFI
+> battery limit is set.
+>
+> Every box ticked below is accurate as written — and every one of them sits *upstream*
+> of the question that matters. Write, read-back, persistence, suspend re-apply and
+> reboot re-apply were all verified; whether charging stops was never tested at all.
+> **Read-back is not efficacy.** See the Outcome section of
+> [ADR 0008](adr/0008-charge-limit-via-module-parameter.md) for why the approach could
+> not have worked, and ADR 0012 for what replaces it.
+>
+> The boxes stay ticked rather than being erased: they record work that was genuinely
+> done, and the milestone is not "complete" regardless. The lesson is that a checklist
+> can be entirely true and still add up to nothing.
+>
+> **Rebuilt 2026-08-26.** The limit now goes through Framework's custom EC command
+> (`0x3E03` over `/dev/cros_ec`, [ADR 0012](adr/0012-charge-limit-via-custom-ec-command.md)),
+> which a hardware probe showed to be the mechanism that governs charging — it reported
+> `max=100` while sysfs reported 80. The wire format, byte order and read-modify-write are
+> unit-tested against a fake transport, and the D-Bus round-trip is verified.
+>
+> **Closed 2026-08-26 on the test it named.** The battery charged from below the limit,
+> on AC, and stopped at exactly 80%: `capacity=80`, `status=Not charging`, `current_now=0`,
+> `charge_now` 3 859 000 of `charge_full` 4 821 000, AC still connected. Repeatable via
+> `scripts/q2-charge-limit-efficacy.sh`.
 
 Smallest real feature, lowest risk, immediately useful.
 
 - Ship `/etc/modprobe.d/fw-helper.conf` with `probe_with_fwk_charge_control=1`, then use
   standard `charge_control_end_threshold` ([ADR 0008](adr/0008-charge-limit-via-module-parameter.md))
 - Opt-in install step, not a silent postinst — it changes who governs charging
-- Read back after write; a persistent mismatch means a UEFI battery limit is fighting us.
-  Report that specifically, not as a generic failure
+- ~~Read back after write; a persistent mismatch means a UEFI battery limit is fighting us.
+  Report that specifically, not as a generic failure~~ — done, and it never fires: this
+  firmware leaves the value in place and ignores it, so there is no mismatch to detect
 - polkit action `org.fwhelper.set-charge-limit`
 - Persist across reboot; re-apply on resume
 
