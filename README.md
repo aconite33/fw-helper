@@ -9,12 +9,12 @@ Inspired by [G-Helper](https://github.com/seerge/g-helper), which does this for 
 on Windows. This shares no code with it — see
 [ADR 0001](docs/adr/0001-separate-repository.md).
 
-> **Status: usable, not yet released.** Fan control, power limits and profiles work and are
-> verified on real hardware, driven from a GTK4 window or the command line, and the fan
-> curve editor is in the app. The battery charge limit was rebuilt on Framework's custom
-> EC command after the previous mechanism was found inert, and is now verified to stop
-> charging. There is no released package yet.
-> See [docs/plan.md](docs/plan.md) for what is measured and what is assumed.
+> **Status: 0.1.0, first public preview.** Fan control (with a graphical curve editor),
+> power limits, the battery charge limit and profiles all work and are verified on real
+> hardware. Expect rough edges and read the
+> [known issues](CHANGELOG.md#known-issues) before filing anything — several are already
+> measured and understood. See [docs/plan.md](docs/plan.md) for what is measured and what
+> is assumed, and [CHANGELOG.md](CHANGELOG.md) for the release notes.
 
 ## Why
 

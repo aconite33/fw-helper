@@ -38,7 +38,31 @@ install -m 644 data/fw-helper.desktop         "$STAGE/usr/share/applications/"
 install -m 644 data/example-profile.conf      "$STAGE/usr/share/fw-helper/"
 # Kept out of /etc/modprobe.d: enabling it is the opt-in step, not the install.
 install -m 644 data/fw-helper.modprobe.conf   "$STAGE/usr/share/fw-helper/"
-install -m 644 README.md LICENSE              "$STAGE/usr/share/doc/fw-helper/"
+install -m 644 README.md LICENSE CHANGELOG.md "$STAGE/usr/share/doc/fw-helper/"
+
+# Debian expects a machine-readable copyright file; shipping LICENSE alone is not it.
+cat > "$STAGE/usr/share/doc/fw-helper/copyright" <<'COPYRIGHT'
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: fw-helper
+Source: https://github.com/Wooloomooloo2/fw-helper
+
+Files: *
+Copyright: 2026 Mark Hall
+License: GPL-3.0-only
+
+License: GPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License version 3, as published by the
+ Free Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License version 3
+ can be found in "/usr/share/common-licenses/GPL-3".
+COPYRIGHT
+chmod 644 "$STAGE/usr/share/doc/fw-helper/copyright"
 
 # Work out library dependencies rather than guessing: the GUI links GTK4 and
 # libadwaita and their sonames differ across releases.
