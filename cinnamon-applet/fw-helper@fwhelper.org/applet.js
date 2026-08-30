@@ -833,13 +833,13 @@ FrameworkMonitor.prototype = {
 
         let level = b.capacity / 100;
         let charging = (b.status === "Charging");
+        let color = Draw.batteryColor(level);
         this._canvas("bat:canvas", BAR_PANEL_HEIGHT, (cr, w, h, fg) => {
-            Draw.hbar(cr, 10, 8, w - 20, 10, level,
-                charging ? COLOR_USER : COLOR_BATTERY, fg);
+            Draw.hbar(cr, 10, 8, w - 20, 10, level, color, fg);
         });
 
         this._row("bat:level", "Level", b.capacity + "%   ·   " + (b.status || "—"),
-            charging ? COLOR_USER : COLOR_BATTERY);
+            color);
         // Charge held against charge the pack can hold: what a percentage cannot say,
         // which is how much running time is left in absolute terms.
         if (b.nowMah !== null && b.fullMah !== null) {

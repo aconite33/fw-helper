@@ -338,7 +338,7 @@ function battery(cr, x, y, w, h, level, charging, fg) {
     let innerW = bodyW - stroke - inset;
     let filled = innerW * clamp01(level);
     if (filled > 0) {
-        let color = batteryColor(level, charging);
+        let color = batteryColor(level);
         // Kept below full opacity so the digits over it stay readable; the halo on the
         // text does the rest of that work.
         cr.setSourceRGBA(color[0], color[1], color[2], 0.75);
@@ -353,13 +353,35 @@ function battery(cr, x, y, w, h, level, charging, fg) {
         h * (str.length >= 3 ? 0.50 : 0.66), fg);
 }
 
-/* Green while there is plenty, warning colours as it runs out. Charging keeps green:
- * the bolt says what is happening, so the colour does not need to. */
-function batteryColor(level, charging) {
-    if (charging) return [0.30, 0.78, 0.40];
-    if (level <= 0.10) return [0.90, 0.32, 0.30];
-    if (level <= 0.20) return [0.95, 0.65, 0.25];
-    return [0.30, 0.78, 0.40];
+/* Charge level, by colour.
+ *
+ *   75% and above   green
+ *   50 to 74        amber
+ *   26 to 49        orange
+ *   25 and below    red
+ *
+ * Amber and orange are a deliberate pair rather than one colour twice: amber is held
+ * yellow-gold and orange is pushed towards red, so the two bands are told apart at a
+ * glance on a small panel icon rather than reading as one long warning.
+ *
+ * The colour follows the level even while charging. It used to be forced green on the
+ * grounds that the bolt already says what is happening, which meant a battery at 15%
+ * on the charger showed no warning at all. The bolt says charging; the colour says how
+ * much is in there. They answer different questions and should not overrule each other.
+ */
+const BATTERY_RED_AT = 0.25;
+const BATTERY_ORANGE_BELOW = 0.50;
+const BATTERY_AMBER_BELOW = 0.75;
+const BATTERY_GREEN = [0.30, 0.78, 0.40];
+const BATTERY_AMBER = [0.98, 0.76, 0.20];
+const BATTERY_ORANGE = [0.96, 0.50, 0.13];
+const BATTERY_RED = [0.90, 0.28, 0.26];
+
+function batteryColor(level) {
+    if (level <= BATTERY_RED_AT) return BATTERY_RED;
+    if (level < BATTERY_ORANGE_BELOW) return BATTERY_ORANGE;
+    if (level < BATTERY_AMBER_BELOW) return BATTERY_AMBER;
+    return BATTERY_GREEN;
 }
 
 /* Charging bolt, drawn beside the battery rather than inside it - two digits and a bolt
