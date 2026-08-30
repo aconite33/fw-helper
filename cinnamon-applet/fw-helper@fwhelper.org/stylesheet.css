@@ -53,7 +53,7 @@
  * an applet stylesheet is loaded into the shared theme and a bare rule there would
  * shrink every menu on the desktop. */
 .fw-helper-row {
-    padding-top: 1px;
-    padding-bottom: 1px;
+    padding-top: 3px;
+    padding-bottom: 3px;
     min-height: 0;
 }

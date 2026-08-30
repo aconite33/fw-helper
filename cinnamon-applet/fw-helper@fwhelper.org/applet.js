@@ -43,8 +43,8 @@ const PANEL_BOLT_WIDTH = 10;
 const PANEL_MAX_DISKS = 4;
 
 const MENU_WIDTH = 300;
-const CPU_PANEL_HEIGHT = 168;
-const MEM_PANEL_HEIGHT = 92;
+const CPU_PANEL_HEIGHT = 200;
+const MEM_PANEL_HEIGHT = 96;
 const BAR_PANEL_HEIGHT = 26;
 
 /* Temperature has no natural 0..1 scale, so the gauge needs an explicit span. 30 C is
@@ -573,7 +573,11 @@ FrameworkMonitor.prototype = {
         let cores = this._coreValues;
 
         this._canvas("cpu:canvas", CPU_PANEL_HEIGHT, (cr, w, h, fg) => {
-            let cy = 40;
+            // Every caption shares one baseline below the rings, and the history block
+            // starts well clear of it. The previous layout put "usage" at 88 and
+            // "Usage history" at 94, so a 10px font drew the two on top of each other.
+            let cy = 46;
+            let captionY = 92;
             // Temperature and load flank the usage ring, which is the one that carries
             // two segments and therefore earns the extra size.
             if (temp !== null) {
@@ -581,26 +585,26 @@ FrameworkMonitor.prototype = {
                     value: (temp - TEMP_MIN_C) / (TEMP_MAX_C - TEMP_MIN_C),
                     color: COLOR_TEMP,
                 }], Math.round(temp) + "°", null, fg);
-                Draw.text(cr, 52, cy + 40, "temp", 10, fg, 0.5, "center");
+                Draw.text(cr, 52, captionY, "temp", 10, fg, 0.5, "center");
             }
             Draw.ring(cr, w / 2, cy, 32, 8, [
                 { value: system, color: COLOR_SYSTEM },
                 { value: user, color: COLOR_USER },
             ], Math.round(busy * 100) + "%", null, fg);
-            Draw.text(cr, w / 2, cy + 48, "usage", 10, fg, 0.5, "center");
+            Draw.text(cr, w / 2, captionY, "usage", 10, fg, 0.5, "center");
 
             if (load) {
                 Draw.ring(cr, w - 52, cy, 24, 6, [{
                     value: loadFraction(load.one, coreCount),
                     color: COLOR_USER,
                 }], load.one, null, fg);
-                Draw.text(cr, w - 52, cy + 40, "load", 10, fg, 0.5, "center");
+                Draw.text(cr, w - 52, captionY, "load", 10, fg, 0.5, "center");
             }
 
-            Draw.text(cr, w / 2, 94, "Usage history", 10, fg, 0.5, "center");
-            Draw.spark(cr, 10, 100, w - 20, 40, history, COLOR_USER, fg);
+            Draw.text(cr, w / 2, 118, "Usage history", 10, fg, 0.5, "center");
+            Draw.spark(cr, 10, 124, w - 20, 44, history, COLOR_USER, fg);
             if (cores.length > 0) {
-                Draw.cores(cr, 10, 144, w - 20, 16, cores, COLOR_USER, fg);
+                Draw.cores(cr, 10, 174, w - 20, 18, cores, COLOR_USER, fg);
             }
         });
 
@@ -624,11 +628,10 @@ FrameworkMonitor.prototype = {
         let history = this._memHistory;
 
         this._canvas("mem:canvas", MEM_PANEL_HEIGHT, (cr, w, h, fg) => {
-            Draw.ring(cr, 46, 44, 28, 7,
+            Draw.ring(cr, 48, 48, 28, 7,
                 [{ value: m.percent / 100, color: COLOR_MEM }],
                 Math.round(m.percent) + "%", null, fg);
-            Draw.text(cr, w / 2 + 40, 20, "Usage history", 10, fg, 0.5, "center");
-            Draw.spark(cr, 92, 28, w - 102, 48, history, COLOR_MEM, fg);
+            Draw.spark(cr, 94, 22, w - 104, 52, history, COLOR_MEM, fg);
         });
 
         this._row("mem:used", "Used", m.usedGiB.toFixed(2) + " GiB", COLOR_MEM);

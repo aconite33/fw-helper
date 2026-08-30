@@ -94,6 +94,16 @@ function centeredText(cr, cx, cy, str, size, color, alpha) {
  * in the inverse of the foreground works on either - a dark halo under light text on a
  * dark panel, and the reverse on a light one.
  */
+/* The halo is drawn by stamping the text around itself rather than by stroking a text
+ * path. `Cairo.Context.textPath` does not exist in this GJS - verified, not assumed -
+ * and calling it throws mid-repaint, which silently loses the glyphs and everything
+ * drawn after them. Eight offset copies cost nothing at this size. */
+const HALO_OFFSETS = [
+    [-1, -1], [0, -1], [1, -1],
+    [-1, 0], [1, 0],
+    [-1, 1], [0, 1], [1, 1],
+];
+
 function haloText(cr, cx, cy, str, size, fg) {
     cr.selectFontFace("Sans", 0, 1); // normal slant, bold weight
     cr.setFontSize(size);
@@ -102,15 +112,17 @@ function haloText(cr, cx, cy, str, size, fg) {
     let h = extent(ext, "height", "height");
     let xb = extent(ext, "xBearing", "x_bearing");
     let yb = extent(ext, "yBearing", "y_bearing");
+    let bx = cx - w / 2 - xb;
+    let by = cy - h / 2 - yb;
 
-    cr.moveTo(cx - w / 2 - xb, cy - h / 2 - yb);
-    cr.textPath(str);
-    cr.setLineWidth(3);
-    cr.setLineJoin(1); // ROUND, so the halo has no spikes at the corners
-    cr.setSourceRGBA(1 - fg[0], 1 - fg[1], 1 - fg[2], 0.8);
-    cr.strokePreserve();
+    cr.setSourceRGBA(1 - fg[0], 1 - fg[1], 1 - fg[2], 0.85);
+    for (let o of HALO_OFFSETS) {
+        cr.moveTo(bx + o[0], by + o[1]);
+        cr.showText(str);
+    }
     cr.setSourceRGBA(fg[0], fg[1], fg[2], 1.0);
-    cr.fill();
+    cr.moveTo(bx, by);
+    cr.showText(str);
     cr.newPath();
 }
 
@@ -252,32 +264,40 @@ function usageBar(cr, x, y, w, h, value, fg, vertical) {
  * fails at exactly the boundary where the digits straddle the fill edge.
  */
 function battery(cr, x, y, w, h, level, charging, fg) {
-    let nubW = Math.max(2, Math.round(w * 0.06));
+    // Proportions and weight taken from the desktop's own battery icon: a thick, solid
+    // outline and a clearly visible terminal, so it reads as a battery at panel size
+    // rather than as a rounded rectangle.
+    let nubW = Math.max(3, Math.round(w * 0.075));
     let bodyW = w - nubW - 1;
+    let stroke = Math.max(1.5, h * 0.10);
 
-    cr.setLineWidth(1);
-    cr.setSourceRGBA(fg[0], fg[1], fg[2], 0.55);
-    roundRect(cr, x + 0.5, y + 0.5, bodyW - 1, h - 1, 2.5);
+    cr.setLineWidth(stroke);
+    cr.setSourceRGBA(fg[0], fg[1], fg[2], 0.85);
+    roundRect(cr, x + stroke / 2, y + stroke / 2,
+        bodyW - stroke, h - stroke, h * 0.22);
     cr.stroke();
 
-    cr.setSourceRGBA(fg[0], fg[1], fg[2], 0.55);
-    roundRect(cr, x + bodyW, y + h * 0.30, nubW, h * 0.40, 1);
+    cr.setSourceRGBA(fg[0], fg[1], fg[2], 0.85);
+    roundRect(cr, x + bodyW - stroke / 2, y + h * 0.28, nubW, h * 0.44, 1.5);
     cr.fill();
 
-    let inset = 2;
-    let innerW = bodyW - inset * 2;
+    let inset = stroke + 1;
+    let innerW = bodyW - stroke - inset;
     let filled = innerW * clamp01(level);
     if (filled > 0) {
         let color = batteryColor(level, charging);
         // Kept below full opacity so the digits over it stay readable; the halo on the
         // text does the rest of that work.
-        cr.setSourceRGBA(color[0], color[1], color[2], 0.70);
+        cr.setSourceRGBA(color[0], color[1], color[2], 0.75);
         roundRect(cr, x + inset, y + inset, Math.max(1.5, filled), h - inset * 2, 1.5);
         cr.fill();
     }
 
-    haloText(cr, x + bodyW / 2, y + h / 2, String(Math.round(clamp01(level) * 100)),
-        h * 0.72, fg);
+    // "100" is half again as wide as "58" and overflows the body at the same size, so
+    // three digits get a smaller face rather than a clipped one.
+    let str = String(Math.round(clamp01(level) * 100));
+    haloText(cr, x + bodyW / 2, y + h / 2, str,
+        h * (str.length >= 3 ? 0.50 : 0.66), fg);
 }
 
 /* Green while there is plenty, warning colours as it runs out. Charging keeps green:
