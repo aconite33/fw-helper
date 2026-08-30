@@ -17,6 +17,14 @@ pub struct Telemetry {
     pub fan_rpm: Option<u64>,
     /// Quantized to 0.1 W and updated at most 1 Hz — ADR 0009.
     pub package_watts: Option<f64>,
+    /// Lowest package power seen since this monitor started.
+    ///
+    /// The package draws several watts with nothing running at all - measured 3.6 W
+    /// idle on the AMD board against 32.6 W with every core busy - and that floor is
+    /// caused by no process. Anything attributing power to processes needs to know it,
+    /// and it cannot be a constant: it is a property of the machine, its display, and
+    /// what else is plugged into it.
+    pub package_watts_floor: Option<f64>,
     pub battery_percent: Option<u64>,
     pub battery_status: Option<String>,
     pub platform_profile: Option<String>,
@@ -71,6 +79,9 @@ pub struct Monitor {
     fs: Sysfs,
     caps: Capabilities,
     energy: Option<EnergySampler>,
+    watts_floor: Option<f64>,
+    /// A reading below the floor waits here for a second one to confirm it.
+    pending_low: Option<f64>,
 }
 
 impl Monitor {
@@ -81,7 +92,42 @@ impl Monitor {
                 .ok()
                 .map(EnergySampler::new)
         });
-        Self { fs, caps, energy }
+        Self {
+            fs,
+            caps,
+            energy,
+            watts_floor: None,
+            pending_low: None,
+        }
+    }
+
+    /// Track the lowest package power seen, as the machine's idle floor.
+    ///
+    /// The floor only ever falls, and it takes **two consecutive** readings below the
+    /// current value to move it. That second reading is the whole point. The fan floor
+    /// in this project learned the same lesson the expensive way: a value that only
+    /// rises within a bucket let one bad sample stick permanently, and a table came back
+    /// claiming 5200 rpm at a temperature where its neighbours said 2000. A minimum that
+    /// accepts any single low sample has exactly that shape, and a floor pinned too low
+    /// would over-attribute power to processes for the rest of the daemon's life.
+    ///
+    /// Readings at or below 0.05 W are refused outright: a running package cannot draw
+    /// nothing, so such a sample is a wrapped or mis-scaled counter rather than an
+    /// unusually quiet machine.
+    fn observe_floor(&mut self, watts: f64) {
+        if !watts.is_finite() || watts <= 0.05 {
+            return;
+        }
+        match self.watts_floor {
+            None => self.watts_floor = Some(watts),
+            Some(floor) if watts < floor => match self.pending_low.take() {
+                // Confirmed. Take the higher of the pair, so the floor is never set by
+                // whichever of the two happened to be the lower outlier.
+                Some(previous) => self.watts_floor = Some(previous.max(watts)),
+                None => self.pending_low = Some(watts),
+            },
+            _ => self.pending_low = None,
+        }
     }
 
     pub fn capabilities(&self) -> &Capabilities {
@@ -131,6 +177,10 @@ impl Monitor {
                     .map(EnergySampler::quantize);
             }
         }
+        if let Some(w) = t.package_watts {
+            self.observe_floor(w);
+        }
+        t.package_watts_floor = self.watts_floor;
 
         t
     }
@@ -329,5 +379,72 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.control_temp().unwrap().celsius, 55.0);
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    fn monitor() -> Monitor {
+        Monitor::new(Sysfs::new("/nonexistent-for-floor-tests"))
+    }
+
+    #[test]
+    fn the_first_reading_sets_the_floor() {
+        let mut m = monitor();
+        m.observe_floor(6.0);
+        assert_eq!(m.watts_floor, Some(6.0));
+    }
+
+    #[test]
+    fn a_single_low_reading_does_not_move_the_floor() {
+        // The fan floor learned this the expensive way: a table that accepted any single
+        // sample kept one 5200 rpm outlier forever, against neighbours saying 2000. A
+        // baseline pinned too low would over-attribute power for the daemon's lifetime.
+        let mut m = monitor();
+        m.observe_floor(6.0);
+        m.observe_floor(0.5); // one anomaly
+        assert_eq!(m.watts_floor, Some(6.0), "one low sample moved the floor");
+        m.observe_floor(6.2); // back to normal: the anomaly is forgotten
+        m.observe_floor(0.5);
+        assert_eq!(m.watts_floor, Some(6.0), "a later lone sample moved it");
+    }
+
+    #[test]
+    fn two_consecutive_low_readings_move_it_to_the_higher_of_the_pair() {
+        let mut m = monitor();
+        m.observe_floor(6.0);
+        m.observe_floor(3.6);
+        m.observe_floor(3.9);
+        // The higher of the confirmed pair, so the floor is never set by whichever of
+        // the two happened to be the lower outlier.
+        assert_eq!(m.watts_floor, Some(3.9));
+    }
+
+    #[test]
+    fn the_floor_never_rises() {
+        let mut m = monitor();
+        m.observe_floor(4.0);
+        m.observe_floor(2.0);
+        m.observe_floor(2.1);
+        assert_eq!(m.watts_floor, Some(2.1));
+        for w in [30.0, 12.0, 8.0] {
+            m.observe_floor(w);
+        }
+        assert_eq!(m.watts_floor, Some(2.1), "load raised the idle floor");
+    }
+
+    #[test]
+    fn implausible_readings_are_refused() {
+        // A running package cannot draw nothing; such a sample is a wrapped or
+        // mis-scaled counter, and accepting it would pin the floor at zero forever.
+        let mut m = monitor();
+        m.observe_floor(5.0);
+        for bad in [0.0, -1.0, 0.01, f64::NAN, f64::INFINITY] {
+            m.observe_floor(bad);
+            m.observe_floor(bad);
+        }
+        assert_eq!(m.watts_floor, Some(5.0));
     }
 }

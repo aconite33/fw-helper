@@ -599,11 +599,16 @@ fn power_top(count: usize) {
     const WINDOW: Duration = Duration::from_secs(2);
 
     let daemon = connect().ok();
-    let watts = match &daemon {
-        Some((d, _)) => Snapshot::fetch(d).ok().and_then(|s| s.package_watts),
-        // Without the daemon this needs root. Reported below as a missing daemon rather
-        // than as a board that cannot measure power, because those need different fixes.
-        None => Monitor::new(Sysfs::default()).sample().package_watts,
+    let (watts, floor) = match &daemon {
+        Some((d, _)) => match Snapshot::fetch(d) {
+            Ok(s) => (s.package_watts, s.package_watts_floor),
+            Err(_) => (None, None),
+        },
+        // Without the daemon this needs root, and a floor observed over a single sample
+        // would be meaningless - the daemon earns its by watching continuously. Reported
+        // below as a missing daemon rather than as a board that cannot measure power,
+        // because those need different fixes.
+        None => (Monitor::new(Sysfs::default()).sample().package_watts, None),
     };
 
     let cores = std::thread::available_parallelism()
@@ -626,19 +631,31 @@ fn power_top(count: usize) {
     let shares = procs::shares(&before, &after, total_delta, cores);
     let busy: f64 = shares.iter().map(|s| s.of_machine).sum();
 
-    match watts {
-        Some(w) => {
+    // Power above the machine's idle floor is what running processes actually cost.
+    // Without a floor the only honest fallback is to scale from zero, which understates
+    // every process by whatever the machine draws doing nothing - 3.6 W of a 10 W
+    // reading, on this board.
+    let attributable = match (watts, floor) {
+        (Some(w), Some(f)) => Some((w - f).max(0.0)),
+        (Some(w), None) => Some(w * busy),
+        (None, _) => None,
+    };
+
+    match (watts, floor) {
+        (Some(w), Some(f)) => {
             println!("package power   {w:>7.2} W   measured");
+            println!("idle floor      {f:>7.2} W   lowest the daemon has seen");
             println!(
-                "attributed      {:>7.2} W   to the processes below",
-                w * busy
-            );
-            println!(
-                "unattributed    {:>7.2} W   baseline, memory controller, I/O",
-                w * (1.0 - busy)
+                "attributable    {:>7.2} W   power above that floor",
+                attributable.unwrap_or(0.0)
             );
         }
-        None => {
+        (Some(w), None) => {
+            println!("package power   {w:>7.2} W   measured");
+            println!("idle floor            -     daemon has not established one yet");
+            println!("  estimates below scale from zero and understate every process");
+        }
+        (None, _) => {
             println!("package power   unavailable");
             if daemon.is_none() {
                 println!("  fw-helperd is not running, and energy_uj needs root without it");
@@ -653,8 +670,13 @@ fn power_top(count: usize) {
 
     println!("{:>8}  {:>7}  {:>7}  process", "est. W", "cpu", "pid");
     for s in shares.iter().take(count) {
-        let est = match watts {
-            Some(w) => format!("{:.2}", w * s.of_machine),
+        // Share of the attributable power, in proportion to CPU time. The denominator
+        // is the CPU actually measured rather than the whole machine, so the listed
+        // processes divide the attributable figure between them rather than each taking
+        // a slice of the idle floor as well.
+        let est = match attributable {
+            Some(a) if busy > 0.0 => format!("{:.2}", a * (s.of_machine / busy)),
+            Some(_) => "0.00".to_string(),
             None => "-".to_string(),
         };
         let name: String = s.name.chars().take(28).collect();

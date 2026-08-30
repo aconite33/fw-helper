@@ -154,6 +154,9 @@ pub struct Sensor {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub package_watts: Option<f64>,
+    /// Lowest package power the daemon has seen: the machine's idle floor, which no
+    /// process caused. See `Telemetry::package_watts_floor`.
+    pub package_watts_floor: Option<f64>,
     pub fan_rpm: Option<u64>,
     pub battery_percent: Option<u64>,
     pub battery_status: Option<String>,
@@ -248,6 +251,7 @@ impl Snapshot {
             system_watts: t.get("system_watts").and_then(as_f64),
             battery_minutes: t.get("battery_minutes").and_then(as_u64),
             package_watts: t.get("package_watts").and_then(as_f64),
+            package_watts_floor: t.get("package_watts_floor").and_then(as_f64),
             fan_rpm: t.get("fan_rpm").and_then(as_u64),
             battery_percent: t.get("battery_percent").and_then(as_u64),
             battery_status: t.get("battery_status").and_then(as_string),
