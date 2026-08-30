@@ -108,7 +108,7 @@ FrameworkMonitor.prototype = {
         this._lastProc = 0;
         this._procJiffies = 0;
         this._warned = false;
-        this._labelWidth = 0;
+        this._labelKey = null;
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
         this._graphArea.connect("repaint", (area) => this._drawPanel(area));
@@ -209,6 +209,7 @@ FrameworkMonitor.prototype = {
 
         this._graphArea.set_width(Math.max(0, width));
         this._graphArea.visible = width > 0;
+        this._lockLabelWidth();
 
         // History is one sample per pixel column, so a width change resizes it.
         let max = slot;
@@ -216,6 +217,38 @@ FrameworkMonitor.prototype = {
             if (this[key].length > max) this[key] = this[key].slice(this[key].length - max);
         }
         this._graphArea.queue_repaint();
+    },
+
+    /* Reserve the label's width from the widest string it could ever hold.
+     *
+     * The obvious approach - measure the label and latch its own width as a minimum -
+     * is a feedback loop: once min-width is applied, the next measurement returns that
+     * width PLUS the padding, so the reservation grows by the padding on every tick.
+     * It ran away over minutes, pushing the whole tray leftwards off the panel while
+     * the label itself stayed short, so the growth was invisible.
+     *
+     * Measuring a fixed sample with the inline style cleared has no such loop, and
+     * gives the same answer every time. Recomputed only when the fields or the format
+     * change, since nothing else can alter the worst case.
+     */
+    _lockLabelWidth: function () {
+        let key = [this.compact, this.show_temp, this.show_fan, this.show_power].join(",");
+        if (key === this._labelKey) return;
+        this._labelKey = key;
+
+        let sample = [];
+        if (this.show_temp) sample.push(this.compact ? "100\u00b0" : "100 \u00b0C");
+        if (this.show_fan) sample.push(this.compact ? "8.8k" : "8888 rpm");
+        if (this.show_power) sample.push(this.compact ? "100W" : "100.0 W");
+
+        this._applet_label.style = null;
+        if (sample.length === 0) return;
+
+        let restore = this._applet_label.get_text();
+        this._applet_label.set_text(sample.join("  "));
+        let w = Math.ceil(this._applet_label.get_preferred_width(-1)[1]);
+        this._applet_label.set_text(restore === null ? "" : restore);
+        this._applet_label.style = "min-width: " + w + "px;";
     },
 
     _coreBarsWidth: function () {
@@ -551,14 +584,6 @@ FrameworkMonitor.prototype = {
         // where the number and the level are the same object rather than two.
 
         this.set_applet_label(parts.join("  "));
-
-        // Width only ever grows, and settles within the first few readings. Letting it
-        // shrink again would reintroduce exactly the shifting this prevents.
-        let natural = this._applet_label.get_preferred_width(-1)[1];
-        if (natural > this._labelWidth) {
-            this._labelWidth = natural;
-            this._applet_label.style = "min-width: " + Math.ceil(natural) + "px;";
-        }
 
         let tip = [];
         if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " °C");
