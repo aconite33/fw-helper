@@ -109,6 +109,7 @@ FrameworkMonitor.prototype = {
         this._procJiffies = 0;
         this._warned = false;
         this._labelKey = null;
+        this._debug = (GLib.getenv("FW_HELPER_APPLET_DEBUG") !== null);
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
         this._graphArea.connect("repaint", (area) => this._drawPanel(area));
@@ -277,6 +278,7 @@ FrameworkMonitor.prototype = {
 
         let restore = this._applet_label.get_text();
         this._applet_label.style = null;
+        this._applet_label.set_width(-1); // -1 restores natural sizing for measuring
 
         if (candidates.length === 0) {
             this._applet_label.set_text(restore === null ? "" : restore);
@@ -300,7 +302,11 @@ FrameworkMonitor.prototype = {
         let width = Math.ceil(this._measureLabel(worst.join("  ")));
 
         this._applet_label.set_text(restore === null ? "" : restore);
-        this._applet_label.style = "min-width: " + width + "px;";
+        // set_width rather than a CSS min-width: a minimum is a floor the layout may
+        // still exceed, and something here was still exceeding it by a pixel or two on
+        // every plug and unplug. Pinning the actor's width fixes min and natural to the
+        // same value, so the box cannot vary whatever the text does.
+        this._applet_label.set_width(width);
     },
 
     _coreBarsWidth: function () {
@@ -636,6 +642,15 @@ FrameworkMonitor.prototype = {
         // where the number and the level are the same object rather than two.
 
         this.set_applet_label(parts.join("  "));
+
+        if (this._debug) {
+            global.log("fw-helper widths: label="
+                + this._applet_label.get_width() + " alloc="
+                + this._applet_label.get_allocation_box().get_width()
+                + " graph=" + this._graphArea.get_width()
+                + " actor=" + this.actor.get_width()
+                + "  text='" + parts.join("  ") + "'");
+        }
 
         let tip = [];
         if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " °C");
