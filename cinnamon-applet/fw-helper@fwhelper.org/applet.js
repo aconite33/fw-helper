@@ -75,6 +75,10 @@ const PROC_INTERVAL_S = 3;
 /* A single update taking longer than this is a problem worth naming rather than
  * silently tolerating: at this length it is visible as a stutter. */
 const SLOW_UPDATE_MS = 250;
+/* Slack on the reserved label width. The worst case is measured, but a measurement
+ * taken before fonts and styles have settled can come out a pixel or two short, and
+ * the cost of being short is a field that never appears. */
+const LABEL_MARGIN = 8;
 
 function nowSeconds() {
     return GLib.get_monotonic_time() / 1000000;
@@ -266,14 +270,14 @@ FrameworkMonitor.prototype = {
         }
         if (this.show_power) {
             candidates.push(this.compact
-                ? ["100W", "AC", "8W"] : ["100.0 W", "on AC"]);
+                ? ["100W", "+100W", "AC", "8W"] : ["+100.0 W", "on AC"]);
         }
 
         // Measure what is actually rendered, padding included - the panel pads each
         // field to a fixed character count, and a reservation taken from unpadded text
         // could come out narrower than the string it has to hold.
         if (this.compact) {
-            candidates = candidates.map((group) => group.map((c) => c.padStart(4)));
+            candidates = candidates.map((group) => group.map((c) => c.padStart(5)));
         }
 
         let restore = this._applet_label.get_text();
@@ -302,11 +306,13 @@ FrameworkMonitor.prototype = {
         let width = Math.ceil(this._measureLabel(worst.join("  ")));
 
         this._applet_label.set_text(restore === null ? "" : restore);
-        // set_width rather than a CSS min-width: a minimum is a floor the layout may
-        // still exceed, and something here was still exceeding it by a pixel or two on
-        // every plug and unplug. Pinning the actor's width fixes min and natural to the
-        // same value, so the box cannot vary whatever the text does.
-        this._applet_label.set_width(width);
+        // A minimum, never a pinned width. Pinning the actor guarantees the box cannot
+        // move, but if the measurement comes out even slightly short the text is
+        // clipped instead - which silently hides a whole field. Losing a reading is
+        // worse than moving a pixel, so the floor is set generously and content is
+        // allowed to be narrower than it.
+        this._applet_label.set_width(-1);
+        this._applet_label.style = "min-width: " + (width + LABEL_MARGIN) + "px;";
     },
 
     _coreBarsWidth: function () {
@@ -633,10 +639,16 @@ FrameworkMonitor.prototype = {
                 power = compact
                     ? Math.round(s.battery.watts) + "W"
                     : s.battery.watts.toFixed(1) + " W";
+            } else if (s.battery.chargeWatts !== null) {
+                // Charge rate, marked with a + so it is never mistaken for draw. The
+                // machine's own consumption is not measurable on mains.
+                power = compact
+                    ? "+" + Math.round(s.battery.chargeWatts) + "W"
+                    : "+" + s.battery.chargeWatts.toFixed(1) + " W";
             } else {
                 power = compact ? "AC" : "on AC";
             }
-            parts.push(pad(power, 4));
+            parts.push(pad(power, 5));
         }
         // The battery percentage is no longer text: it is drawn inside the battery,
         // where the number and the level are the same object rather than two.
@@ -843,6 +855,8 @@ FrameworkMonitor.prototype = {
                 value += "   ·   " + hrs + "h " + (mins < 10 ? "0" : "") + mins + "m left";
             }
             this._row("bat:draw", "System draw", value);
+        } else if (b.chargeWatts !== null) {
+            this._row("bat:draw", "Charging at", b.chargeWatts.toFixed(2) + " W");
         } else if (b.onAc) {
             // Say why there is no number rather than showing a dash: nothing reports
             // whole-machine draw on mains.

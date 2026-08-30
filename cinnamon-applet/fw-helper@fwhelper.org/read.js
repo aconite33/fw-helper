@@ -89,7 +89,8 @@ function sensors(node) {
 
 function battery(batNode, acNode) {
     let out = {
-        status: null, capacity: null, watts: null, minutes: null, onAc: null,
+        status: null, capacity: null, watts: null, chargeWatts: null,
+        minutes: null, onAc: null,
         nowMah: null, fullMah: null, designMah: null, healthPercent: null,
         cycles: null, volts: null, technology: null, model: null,
     };
@@ -119,8 +120,16 @@ function battery(batNode, acNode) {
     // Health is what the pack can still hold against what it shipped able to hold.
     if (full !== null && design) out.healthPercent = (full / design) * 100;
 
-    // Draw is only meaningful while discharging: on mains, current_now describes what
-    // is going INTO the battery, which is not what the machine is using.
+    // On mains, current_now describes what is going INTO the battery. That is not
+    // system draw and must never be reported as such - but it is a real number worth
+    // showing, so it is carried separately under its own name.
+    if (out.status === "Charging") {
+        let chargeUa = int(batNode + "/current_now");
+        if (chargeUa !== null && uv !== null && chargeUa > 0) {
+            out.chargeWatts = (chargeUa / 1e6) * (uv / 1e6);
+        }
+        return out;
+    }
     if (out.status !== "Discharging") return out;
 
     // Energy family first (power_now in uW); already watts, no multiplication needed.
