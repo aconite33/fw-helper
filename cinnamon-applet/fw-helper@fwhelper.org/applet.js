@@ -36,8 +36,8 @@ const COLOR_BATTERY = [0.42, 0.76, 0.42];
 
 const PANEL_GAP = 4;
 const PANEL_PAD_Y = 3;
-const PANEL_BATTERY_WIDTH = 42;
-const PANEL_BOLT_WIDTH = 10;
+const PANEL_BATTERY_WIDTH = 46;
+const PANEL_BOLT_WIDTH = 12;
 /* Beyond this the panel is a disk manager rather than a readout; the dropdown still
  * lists every mount. */
 const PANEL_MAX_DISKS = 4;
@@ -108,6 +108,7 @@ FrameworkMonitor.prototype = {
         this._lastProc = 0;
         this._procJiffies = 0;
         this._warned = false;
+        this._labelWidth = 0;
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
         this._graphArea.connect("repaint", (area) => this._drawPanel(area));
@@ -200,8 +201,10 @@ FrameworkMonitor.prototype = {
             if (n > 0) width += n * (this._diskBarWidth() + PANEL_GAP);
         }
         if (this.show_battery && this._batteryLevel !== null) {
-            width += PANEL_BATTERY_WIDTH + PANEL_GAP;
-            if (this._batteryCharging) width += PANEL_BOLT_WIDTH;
+            // The bolt's space is reserved whether or not it is drawn. Adding it only
+            // while charging made the whole panel jump every time the charger went in
+            // or out, dragging every applet to its right along with it.
+            width += PANEL_BATTERY_WIDTH + PANEL_BOLT_WIDTH + PANEL_GAP;
         }
 
         this._graphArea.set_width(Math.max(0, width));
@@ -315,11 +318,14 @@ FrameworkMonitor.prototype = {
                 }
             }
             if (this.show_battery && this._batteryLevel !== null) {
+                let bh = Math.max(14, Math.min(gh, 24));
                 if (this._batteryCharging) {
-                    Draw.bolt(cr, x + PANEL_BOLT_WIDTH / 2, h / 2, gh * 0.7, fg);
-                    x += PANEL_BOLT_WIDTH;
+                    // Sized against the battery rather than the panel: at 0.7 of the
+                    // full panel height the bolt was taller than the battery it was
+                    // annotating and crowded its left edge.
+                    Draw.bolt(cr, x + PANEL_BOLT_WIDTH / 2 - 1, h / 2, bh * 0.72, fg);
                 }
-                let bh = Math.min(gh, 19);
+                x += PANEL_BOLT_WIDTH;
                 Draw.battery(cr, x, (h - bh) / 2, PANEL_BATTERY_WIDTH, bh,
                     this._batteryLevel, this._batteryCharging, fg);
             }
@@ -508,27 +514,51 @@ FrameworkMonitor.prototype = {
         let compact = this.compact;
         let parts = [];
 
+        // Each field is padded to a fixed width. Combined with tabular figures in the
+        // stylesheet this keeps the label one constant size, so a reading that changes
+        // width - or a power draw that vanishes on mains - never shifts the applets
+        // beside it.
+        let pad = (str, width) => compact ? str.padStart(width) : str;
+
         if (this.show_temp && s.cpuTemp !== null) {
-            parts.push(Math.round(s.cpuTemp) + (compact ? "°" : "°C"));
+            parts.push(pad(Math.round(s.cpuTemp) + (compact ? "°" : "°C"), 4));
         }
         if (this.show_fan && s.fanRpm !== null) {
             // A stopped fan is worth saying plainly rather than showing "0": firmware
             // keeps it off entirely at idle here, so that is normal, not a fault.
-            if (s.fanRpm === 0) parts.push("off");
+            let fan;
+            if (s.fanRpm === 0) fan = "idle";
             else if (compact) {
-                parts.push(s.fanRpm >= 1000
-                    ? (s.fanRpm / 1000).toFixed(1) + "k" : String(s.fanRpm));
-            } else parts.push(s.fanRpm + " rpm");
+                fan = s.fanRpm >= 1000
+                    ? (s.fanRpm / 1000).toFixed(1) + "k" : String(s.fanRpm);
+            } else fan = s.fanRpm + " rpm";
+            parts.push(pad(fan, 4));
         }
-        if (this.show_power && s.battery.watts !== null) {
-            parts.push(compact
-                ? Math.round(s.battery.watts) + "W"
-                : s.battery.watts.toFixed(1) + " W");
+        if (this.show_power) {
+            // "AC" rather than dropping the field: nothing reports whole-machine draw
+            // on mains, and saying so holds the space that the number occupies.
+            let power;
+            if (s.battery.watts !== null) {
+                power = compact
+                    ? Math.round(s.battery.watts) + "W"
+                    : s.battery.watts.toFixed(1) + " W";
+            } else {
+                power = compact ? "AC" : "on AC";
+            }
+            parts.push(pad(power, 4));
         }
         // The battery percentage is no longer text: it is drawn inside the battery,
         // where the number and the level are the same object rather than two.
 
         this.set_applet_label(parts.join("  "));
+
+        // Width only ever grows, and settles within the first few readings. Letting it
+        // shrink again would reintroduce exactly the shifting this prevents.
+        let natural = this._applet_label.get_preferred_width(-1)[1];
+        if (natural > this._labelWidth) {
+            this._labelWidth = natural;
+            this._applet_label.style = "min-width: " + Math.ceil(natural) + "px;";
+        }
 
         let tip = [];
         if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " °C");
@@ -680,7 +710,7 @@ FrameworkMonitor.prototype = {
             this._row("t:ec:" + t.label, t.label, value);
         }
         if (s.fanRpm !== null) {
-            this._row("fan", "fan", s.fanRpm === 0 ? "off" : s.fanRpm + " rpm");
+            this._row("fan", "fan", s.fanRpm === 0 ? "idle" : s.fanRpm + " rpm");
         }
     },
 

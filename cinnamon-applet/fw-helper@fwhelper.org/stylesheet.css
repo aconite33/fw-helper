@@ -10,7 +10,8 @@
  */
 
 .fw-helper-label {
-    font-size: 0.9em;
+    font-size: 1em;
+    font-feature-settings: "tnum";
     padding-left: 3px;
     padding-right: 3px;
 }
