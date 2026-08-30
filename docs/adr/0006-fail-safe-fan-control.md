@@ -1,6 +1,8 @@
 # 0006 — Fan control must fail safe, never fail silent
 
-- **Status:** Accepted — **point 4 amended by [0011](0011-quiet-is-a-legitimate-choice.md)**
+- **Status:** Accepted — **point 4 amended by [0011](0011-quiet-is-a-legitimate-choice.md)**,
+  **point 3 and the read-back requirement amended by
+  [0013](0013-fan-control-via-ec-commands.md) on the AMD board**
 - **Date:** 2026-08-18
 
 ## Context
