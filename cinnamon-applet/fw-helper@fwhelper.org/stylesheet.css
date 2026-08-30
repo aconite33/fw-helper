@@ -1,0 +1,16 @@
+/* Condense the panel readout.
+ *
+ * Cinnamon's default applet label carries generous horizontal padding, which is right
+ * for a one-word applet and wasteful for three numeric fields. Slightly smaller text
+ * and tighter padding fit the whole readout in roughly the width the padding alone was
+ * taking.
+ *
+ * Font size is relative so this still tracks the panel's own scaling rather than
+ * pinning a pixel size that breaks on a HiDPI panel or a resized one.
+ */
+
+.fw-helper-label {
+    font-size: 0.9em;
+    padding-left: 3px;
+    padding-right: 3px;
+}

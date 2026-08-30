@@ -3,6 +3,18 @@
         "type": "header",
         "description": "Panel display"
     },
+    "compact": {
+        "type": "checkbox",
+        "default": true,
+        "description": "Compact readout",
+        "tooltip": "52° · 2.1k · 18W  instead of  52°C  2150 rpm  18.3 W"
+    },
+    "show-icon": {
+        "type": "checkbox",
+        "default": false,
+        "description": "Show the icon",
+        "tooltip": "The icon costs more panel width than any single reading."
+    },
     "show-temp": {
         "type": "checkbox",
         "default": true,

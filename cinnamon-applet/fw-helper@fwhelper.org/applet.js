@@ -155,13 +155,17 @@ FrameworkMonitor.prototype = {
     _init: function (metadata, orientation, panelHeight, instanceId) {
         Applet.TextIconApplet.prototype._init.call(this, orientation, panelHeight, instanceId);
 
-        this.set_applet_icon_symbolic_name("temperature-symbolic");
         this.set_applet_label("…");
+        // Trims the default applet padding and font size; see stylesheet.css.
+        this._applet_label.add_style_class_name("fw-helper-label");
 
         this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
-        for (let key of ["interval", "show-temp", "show-fan", "show-power"]) {
-            this.settings.bind(key, key.replace(/-/g, "_"), () => this._restartTimer());
+        for (let key of ["interval", "show-temp", "show-fan", "show-power",
+                         "compact", "show-icon"]) {
+            this.settings.bind(key, key.replace(/-/g, "_"),
+                () => this._onSettingsChanged());
         }
+        this._applyAppearance();
 
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
@@ -179,6 +183,22 @@ FrameworkMonitor.prototype = {
         this._cpu = findHwmon("k10temp") || findHwmon("coretemp");
         this._bat = findSupply("Battery");
         this._ac = findSupply("Mains");
+    },
+
+    /* The icon costs more panel width than any single reading, so it is optional and
+     * off by default - the numbers are the point of this applet. */
+    _applyAppearance: function () {
+        if (this.show_icon) {
+            this.set_applet_icon_symbolic_name("temperature-symbolic");
+        } else {
+            this.hide_applet_icon();
+        }
+    },
+
+    _onSettingsChanged: function () {
+        this._applyAppearance();
+        this._update();
+        this._restartTimer();
     },
 
     _restartTimer: function () {
@@ -226,19 +246,38 @@ FrameworkMonitor.prototype = {
     },
 
     _updatePanel: function (cpuTemp, fanRpm, battery) {
+        let compact = this.compact;
         let parts = [];
+
         if (this.show_temp && cpuTemp !== null) {
-            parts.push(Math.round(cpuTemp) + "°C");
+            parts.push(Math.round(cpuTemp) + (compact ? "°" : "°C"));
         }
         if (this.show_fan && fanRpm !== null) {
-            // A stopped fan is worth saying plainly. On this board firmware keeps it off
-            // entirely at idle, so 0 rpm is the normal state, not a fault.
-            parts.push(fanRpm === 0 ? "fan off" : fanRpm + " rpm");
+            // A stopped fan is worth saying plainly rather than showing "0". On this
+            // board firmware keeps it off entirely at idle, so that is the normal
+            // state, not a fault.
+            if (fanRpm === 0) {
+                parts.push("off");
+            } else if (compact) {
+                // Four digits plus a unit is the widest field here; thousands notation
+                // keeps it to three characters without losing anything readable.
+                parts.push(fanRpm >= 1000
+                    ? (fanRpm / 1000).toFixed(1) + "k"
+                    : String(fanRpm));
+            } else {
+                parts.push(fanRpm + " rpm");
+            }
         }
         if (this.show_power && battery.watts !== null) {
-            parts.push(battery.watts.toFixed(1) + " W");
+            parts.push(compact
+                ? Math.round(battery.watts) + "W"
+                : battery.watts.toFixed(1) + " W");
         }
-        this.set_applet_label(parts.length > 0 ? parts.join("  ") : "no sensors");
+
+        // A middle dot groups the fields more tightly than whitespace can, and stays
+        // legible where a double space just reads as a gap.
+        let separator = compact ? " · " : "  ";
+        this.set_applet_label(parts.length > 0 ? parts.join(separator) : "no sensors");
 
         let tip = [];
         if (cpuTemp !== null) tip.push("CPU " + cpuTemp.toFixed(1) + " °C");
