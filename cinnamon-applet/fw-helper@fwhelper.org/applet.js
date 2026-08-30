@@ -16,6 +16,7 @@
  */
 
 const Applet = imports.ui.applet;
+const GLib = imports.gi.GLib;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
@@ -56,6 +57,28 @@ function loadFraction(load, coreCount) {
     return Math.min(1, parseFloat(load) / Math.max(1, coreCount));
 }
 
+/* Everything in a Cinnamon applet runs on the compositor's own main loop, so any slow
+ * synchronous work here does not merely make the applet late - it stalls the desktop,
+ * pointer included. Two readings are heavy enough to deserve their own, slower cadence
+ * than the display tick:
+ *
+ *   - Walking every /proc/PID for the process list: hundreds of file reads.
+ *   - Asking each mount for its free space: normally instant, but a filesystem that is
+ *     unhealthy or backed by something slow can make the call block.
+ *
+ * Neither changes fast enough to be worth a two-second refresh, so both are throttled
+ * independently of how often the panel redraws.
+ */
+const DISK_INTERVAL_S = 5;
+const PROC_INTERVAL_S = 3;
+/* A single update taking longer than this is a problem worth naming rather than
+ * silently tolerating: at this length it is visible as a stutter. */
+const SLOW_UPDATE_MS = 250;
+
+function nowSeconds() {
+    return GLib.get_monotonic_time() / 1000000;
+}
+
 function FrameworkMonitor(metadata, orientation, panelHeight, instanceId) {
     this._init(metadata, orientation, panelHeight, instanceId);
 }
@@ -80,6 +103,10 @@ FrameworkMonitor.prototype = {
         this._procMap = null;
         this._procList = [];
         this._state = {};
+        this._lastDisk = 0;
+        this._lastProc = 0;
+        this._procJiffies = 0;
+        this._warned = false;
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
         this._graphArea.connect("repaint", (area) => this._drawPanel(area));
@@ -185,9 +212,32 @@ FrameworkMonitor.prototype = {
         }
         let seconds = Math.max(1, this.interval || 2);
         this._timer = Mainloop.timeout_add_seconds(seconds, () => {
-            this._update();
+            this._tick();
             return true;
         });
+    },
+
+    /* A throw inside a Mainloop callback returns undefined, which removes the source -
+     * so an error on one tick would silently stop the applet forever rather than
+     * skipping a frame. Catching keeps the timer alive, and the warning fires once so a
+     * recurring fault does not fill the journal. */
+    _tick: function () {
+        let started = nowSeconds();
+        try {
+            this._update();
+        } catch (e) {
+            if (!this._warned) {
+                this._warned = true;
+                global.logError("fw-helper applet update failed: " + e);
+            }
+            return;
+        }
+        let elapsedMs = (nowSeconds() - started) * 1000;
+        if (elapsedMs > SLOW_UPDATE_MS && !this._warned) {
+            this._warned = true;
+            global.logWarning("fw-helper applet update took "
+                + elapsedMs.toFixed(0) + " ms, which stalls the compositor");
+        }
     },
 
     _fg: function (area) {
@@ -345,10 +395,15 @@ FrameworkMonitor.prototype = {
         s.cpuTemps = Read.sensors(this._cpuHwmon);
         s.battery = Read.battery(this._bat, this._ac);
         s.memory = Read.memory();
-        // Re-read every tick rather than caching: a drive mounted or unmounted while
-        // the applet runs should simply appear or vanish, with nothing to configure.
-        s.mounts = Read.mounts();
-        this._mounts = s.mounts;
+        // Throttled: free space is the part that can block, and a disk does not fill
+        // fast enough to need a two-second refresh. A drive mounted or unmounted still
+        // appears or vanishes within DISK_INTERVAL_S, with nothing to configure.
+        let now = nowSeconds();
+        if (now - this._lastDisk >= DISK_INTERVAL_S || this._mounts.length === 0) {
+            this._lastDisk = now;
+            this._mounts = Read.mounts();
+        }
+        s.mounts = this._mounts;
         s.load = Read.loadAvg();
         s.uptime = Read.uptime();
 
@@ -374,12 +429,22 @@ FrameworkMonitor.prototype = {
         if (s.cpu !== null) this._push("_cpuHistory", s.cpu.busy);
         if (s.memory !== null) this._push("_memHistory", s.memory.percent / 100);
 
-        // Only walk /proc while someone is looking at the result.
-        if (this.menu.isOpen && s.cpu !== null) {
-            let r = Read.processes(this._procMap, s.cpu.totalJiffies,
+        // Only walk /proc while someone is looking at the result, and then no more often
+        // than PROC_INTERVAL_S - this is hundreds of synchronous reads on the
+        // compositor's own loop.
+        //
+        // Jiffies are accumulated across skipped ticks so the shares stay correct: the
+        // delta must be measured over the same span the process counters were, not over
+        // the last display tick.
+        if (s.cpu !== null) this._procJiffies += s.cpu.totalJiffies;
+        if (this.menu.isOpen && this._procJiffies > 0
+            && now - this._lastProc >= PROC_INTERVAL_S) {
+            this._lastProc = now;
+            let r = Read.processes(this._procMap, this._procJiffies,
                 s.coreCount || 1, Math.max(1, this.proc_count || 5));
             this._procMap = r.map;
             this._procList = r.list;
+            this._procJiffies = 0;
         }
 
         s.cpuTemp = this._pickCpuTemp(s.cpuTemps, s.ecTemps);
