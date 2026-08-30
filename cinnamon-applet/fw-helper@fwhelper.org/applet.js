@@ -496,16 +496,20 @@ FrameworkMonitor.prototype = {
     },
 
     _hideRow: function (key) {
-        if (this._rows[key] && this._rows[key].item) {
-            this._rows[key].item.actor.visible = false;
-        }
+        let row = this._rows[key];
+        if (!row) return;
+        // Text rows are menu items; canvases are bare actors in the section box.
+        let actor = row.item ? row.item.actor : row.actor;
+        if (actor) actor.visible = false;
     },
 
     /* A drawn block inside the menu. `paint(cr, w, h, fg)` does the work. */
     _canvas: function (key, height, paint) {
         if (!this._rows[key]) {
-            let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-            item.actor.add_style_class_name("fw-helper-row");
+            // Added straight to the section's box rather than wrapped in a
+            // PopupBaseMenuItem. A menu item is sized for a row of text, and a canvas
+            // taller than that does not make it grow - the canvas overflows and every
+            // row after it is drawn on top of the graphs.
             let area = new St.DrawingArea({ style_class: "fw-helper-canvas" });
             area.set_width(Math.ceil(MENU_WIDTH * this._scale));
             area.set_height(Math.ceil(height * this._scale));
@@ -521,11 +525,12 @@ FrameworkMonitor.prototype = {
                     cr.$dispose();
                 }
             });
-            item.addActor(area, { expand: true });
-            this._menuSection.addMenuItem(item);
-            this._rows[key] = { item: item, area: area, paint: paint };
+            this._menuSection.box.add_actor(area);
+            this._rows[key] = { actor: area, area: area, paint: paint };
         }
         this._rows[key].paint = paint;
+        // A canvas hidden when its drive unmounted has to come back when it returns.
+        this._rows[key].area.visible = true;
         this._rows[key].area.queue_repaint();
     },
 
