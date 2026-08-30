@@ -39,6 +39,9 @@ pub struct Capabilities {
     pub package_power: Cap,
     /// Resolved hwmon path for the EC, if found.
     pub ec_hwmon: Option<String>,
+    /// Powercap zone whose `energy_uj` actually reads, if any. Which zone that is
+    /// differs by board, so it is discovered rather than assumed.
+    pub energy_zone: Option<String>,
 }
 
 impl Capabilities {
@@ -103,14 +106,31 @@ impl Capabilities {
         };
 
         // energy_uj is 0400 (PLATYPUS mitigation) — existence is not enough, we must
-        // be able to read it. Probe with an actual read.
-        let energy_path = format!("{}/energy_uj", paths::RAPL_MMIO);
-        let package_power = if !fs.exists(&energy_path) {
-            Cap::no("rapl zone exposes no energy_uj")
-        } else if fs.read_u64(&energy_path).is_err() {
+        // be able to read it. Probe every candidate zone with an actual read, and keep
+        // the one that answers so telemetry does not have to repeat the search.
+        //
+        // The two failures are reported separately because the fix differs: a zone that
+        // exists but will not read needs root, while no zone at all is a property of
+        // the board and no amount of privilege changes it.
+        let mut energy_zone = None;
+        let mut any_zone_exists = false;
+        for zone in paths::RAPL_ENERGY_ZONES {
+            let path = format!("{zone}/energy_uj");
+            if !fs.exists(&path) {
+                continue;
+            }
+            any_zone_exists = true;
+            if fs.read_u64(&path).is_ok() {
+                energy_zone = Some(zone.to_string());
+                break;
+            }
+        }
+        let package_power = if energy_zone.is_some() {
+            Cap::Yes
+        } else if any_zone_exists {
             Cap::no("energy_uj unreadable; daemon must run as root")
         } else {
-            Cap::Yes
+            Cap::no("no rapl zone exposes energy_uj")
         };
 
         Self {
@@ -120,6 +140,7 @@ impl Capabilities {
             platform_profile,
             package_power,
             ec_hwmon,
+            energy_zone,
         }
     }
 

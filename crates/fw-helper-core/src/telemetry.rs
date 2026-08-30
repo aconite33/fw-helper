@@ -76,13 +76,11 @@ pub struct Monitor {
 impl Monitor {
     pub fn new(fs: Sysfs) -> Self {
         let caps = Capabilities::probe(&fs);
-        let energy = if caps.package_power.is_available() {
-            fs.read_u64(&format!("{}/max_energy_range_uj", paths::RAPL_MMIO))
+        let energy = caps.energy_zone.as_ref().and_then(|zone| {
+            fs.read_u64(&format!("{zone}/max_energy_range_uj"))
                 .ok()
                 .map(EnergySampler::new)
-        } else {
-            None
-        };
+        });
         Self { fs, caps, energy }
     }
 
@@ -124,8 +122,9 @@ impl Monitor {
             t.temps = self.read_temps(&hwmon);
         }
 
-        if let Some(sampler) = self.energy.as_mut() {
-            let path = format!("{}/energy_uj", paths::RAPL_MMIO);
+        if let (Some(sampler), Some(zone)) = (self.energy.as_mut(), self.caps.energy_zone.as_ref())
+        {
+            let path = format!("{zone}/energy_uj");
             if let Ok(uj) = self.fs.read_u64(&path) {
                 t.package_watts = sampler
                     .sample(uj, Instant::now())

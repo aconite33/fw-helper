@@ -313,3 +313,81 @@ fn prefers_the_energy_family_where_the_board_reports_it() {
     assert_eq!(t.system_watts, Some(9.0));
     assert_eq!(t.battery_minutes, Some(300), "45 Wh at 9 W is five hours");
 }
+
+/// A Framework 13 AMD as actually observed: no MMIO zone at all, so no power limit,
+/// but `intel-rapl:0` counts joules perfectly well.
+fn framework_13_amd(tag: &str) -> Fixture {
+    let f = Fixture::new(tag);
+    let hwmon = "sys/class/hwmon/hwmon8";
+    f.write(&format!("{hwmon}/name"), "cros_ec\n");
+    f.write(&format!("{hwmon}/fan1_input"), "0\n");
+    // No pwm1 or pwm1_enable: this board exposes neither (ADR 0013).
+    f.write(&format!("{hwmon}/temp1_input"), "42850\n");
+    f.write(&format!("{hwmon}/temp1_label"), "cpu_f75303@4d\n");
+
+    // Only the MSR zone, and it carries no constraints - measured on the real board.
+    let rapl = "sys/class/powercap/intel-rapl:0";
+    f.write(&format!("{rapl}/name"), "package-0\n");
+    f.write(&format!("{rapl}/energy_uj"), "818399647\n");
+    f.write(&format!("{rapl}/max_energy_range_uj"), "65532610987\n");
+
+    f.write("sys/firmware/acpi/platform_profile", "balanced\n");
+    f.write(
+        "sys/firmware/acpi/platform_profile_choices",
+        "low-power balanced performance\n",
+    );
+    f.write("sys/class/power_supply/BAT1/capacity", "96\n");
+    f.write("sys/class/power_supply/BAT1/status", "Discharging\n");
+    f
+}
+
+#[test]
+fn package_power_works_on_a_board_with_no_mmio_zone() {
+    // The AMD board has no intel-rapl-mmio:0, which is what upstream reads. Before the
+    // energy zone was discovered rather than assumed, this reported "no energy_uj" and
+    // the GUI showed a dash - on a machine whose counter reads 1.111 W quite happily.
+    let f = framework_13_amd("amd-energy");
+    let caps = Capabilities::probe(&f.sysfs());
+
+    assert!(caps.package_power.is_available(), "{}", caps.package_power);
+    assert_eq!(
+        caps.energy_zone.as_deref(),
+        Some("sys/class/powercap/intel-rapl:0")
+    );
+    // Energy and limits are separate questions: this board answers one and not the other.
+    assert!(!caps.power_limit.is_available());
+}
+
+#[test]
+fn the_mmio_zone_is_preferred_when_both_exist() {
+    // On Intel both zones exist and MMIO is the authoritative one (baseline Q2), so
+    // adding the MSR fallback must not quietly change which zone Intel reads.
+    let f = Fixture::framework_13("prefer-mmio");
+    f.write("sys/class/powercap/intel-rapl:0/energy_uj", "5\n");
+    f.write(
+        "sys/class/powercap/intel-rapl:0/max_energy_range_uj",
+        "262143328850\n",
+    );
+    let caps = Capabilities::probe(&f.sysfs());
+    assert_eq!(
+        caps.energy_zone.as_deref(),
+        Some("sys/class/powercap/intel-rapl-mmio:0")
+    );
+}
+
+#[test]
+fn a_board_with_no_energy_counter_says_so_without_blaming_privilege() {
+    // "needs root" is the wrong hint when no zone exists at all - no amount of
+    // privilege conjures one, and the daemon printed exactly that while running as root.
+    let f = Fixture::new("no-rapl");
+    f.write("sys/class/hwmon/hwmon0/name", "cros_ec\n");
+    let caps = Capabilities::probe(&f.sysfs());
+    assert!(caps.energy_zone.is_none());
+    match &caps.package_power {
+        fw_helper_core::Cap::No(reason) => {
+            assert!(reason.contains("no rapl zone"), "reason was: {reason}");
+            assert!(!reason.contains("root"), "reason blamed root: {reason}");
+        }
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+}

@@ -1,0 +1,18 @@
+== RAPL zones present ==
+  intel-rapl                   name=             enabled=1
+  intel-rapl:0                 name=package-0    enabled=0
+  intel-rapl:0:0               name=core         enabled=0
+
+== intel-rapl:0 (package-0) ==
+  energy_uj 818399647 -> 821734252   delta 3334605 uJ over 3 s = 1.111 W
+  -> counter ADVANCES; usable as a power source
+
+== intel-rapl:0:0 (core) ==
+  energy_uj 61872715 -> 61877491   delta 4776 uJ over 3 s = 0.001 W
+  -> counter ADVANCES; usable as a power source
+
+== BAT1 (whole-system draw, only meaningful on battery) ==
+  status      Discharging
+  current_now 761000 uA
+  voltage_now 17038000 uV
+  power       12.965 W
