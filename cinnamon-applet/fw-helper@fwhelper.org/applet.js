@@ -36,8 +36,10 @@ const COLOR_BATTERY = [0.42, 0.76, 0.42];
 
 const PANEL_GAP = 4;
 const PANEL_PAD_Y = 3;
-const PANEL_BATTERY_WIDTH = 46;
-const PANEL_BOLT_WIDTH = 12;
+/* Battery proportions, all derived from its width so one setting scales the whole
+ * thing: the body, the digits inside it, and the charging bolt beside it. */
+const BATTERY_ASPECT = 0.52;   // height / width
+const BOLT_RATIO = 0.26;       // bolt slot / battery width
 /* Beyond this the panel is a disk manager rather than a readout; the dropdown still
  * lists every mount. */
 const PANEL_MAX_DISKS = 4;
@@ -150,6 +152,7 @@ FrameworkMonitor.prototype = {
         for (let key of ["interval", "show-temp", "show-fan", "show-power",
                          "show-battery", "show-cpu", "show-mem", "show-disk",
                          "show-cores", "disk-bar-width", "graph-width", "compact",
+                         "battery-width",
                          "show-icon", "proc-count"]) {
             this.settings.bind(key, key.replace(/-/g, "_"),
                 () => this._onSettingsChanged());
@@ -237,7 +240,7 @@ FrameworkMonitor.prototype = {
             // The bolt's space is reserved whether or not it is drawn. Adding it only
             // while charging made the whole panel jump every time the charger went in
             // or out, dragging every applet to its right along with it.
-            width += PANEL_BATTERY_WIDTH + PANEL_BOLT_WIDTH + PANEL_GAP;
+            width += this._batteryWidth() + this._boltWidth() + PANEL_GAP;
         }
 
         // Text slots are part of the same canvas, so they must be counted BEFORE the
@@ -304,6 +307,14 @@ FrameworkMonitor.prototype = {
     _coreBarsWidth: function () {
         let n = Math.max(1, this._coreValues.length);
         return Math.min(64, n * 4);
+    },
+
+    _batteryWidth: function () {
+        return Math.max(20, this.battery_width || 35);
+    },
+
+    _boltWidth: function () {
+        return Math.round(this._batteryWidth() * BOLT_RATIO);
     },
 
     _diskBarWidth: function () {
@@ -404,17 +415,19 @@ FrameworkMonitor.prototype = {
                 }
             }
             if (this.show_battery && this._batteryLevel !== null) {
-                let bh = Math.max(14, Math.min(gh, 24));
+                let bw = this._batteryWidth();
+                let boltW = this._boltWidth();
+                let bh = Math.min(gh, Math.round(bw * BATTERY_ASPECT));
                 if (this._batteryCharging) {
-                    // Sized against the battery rather than the panel: at 0.7 of the
-                    // full panel height the bolt was taller than the battery it was
-                    // annotating and crowded its left edge.
-                    Draw.bolt(cr, x + PANEL_BOLT_WIDTH / 2 - 1, h / 2, bh * 0.72, fg);
+                    // Sized against the battery rather than the panel: measured against
+                    // the panel it came out taller than the battery it annotates and
+                    // crowded its left edge.
+                    Draw.bolt(cr, x + boltW / 2 - 1, h / 2, bh * 0.72, fg);
                 }
-                x += PANEL_BOLT_WIDTH;
-                Draw.battery(cr, x, (h - bh) / 2, PANEL_BATTERY_WIDTH, bh,
+                x += boltW;
+                Draw.battery(cr, x, (h - bh) / 2, bw, bh,
                     this._batteryLevel, this._batteryCharging, fg);
-                x += PANEL_BATTERY_WIDTH + PANEL_GAP;
+                x += bw + PANEL_GAP;
             }
 
             // Right-aligned within a slot sized for the field's widest possible value,

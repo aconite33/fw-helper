@@ -60,6 +60,16 @@
         "description": "Battery",
         "tooltip": "Drawn as a battery with the percentage inside it. A bolt appears beside it while charging."
     },
+    "battery-width": {
+        "type": "spinbutton",
+        "default": 35,
+        "min": 20,
+        "max": 70,
+        "step": 1,
+        "units": "pixels",
+        "description": "Battery width",
+        "tooltip": "Height, the digits inside it and the charging bolt all scale with this."
+    },
     "show-fan": {
         "type": "checkbox",
         "default": true,
