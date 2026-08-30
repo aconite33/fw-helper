@@ -126,6 +126,44 @@ function haloText(cr, cx, cy, str, size, fg) {
     cr.newPath();
 }
 
+/* Text width, measured off-screen.
+ *
+ * Lets the caller reserve space for a string before drawing it, without involving the
+ * widget layout at all - which is the point: a St.Label sizes itself to its own text,
+ * so a panel built from labels changes width whenever a reading does.
+ */
+function measure(str, size) {
+    let surface = new Cairo.ImageSurface(Cairo.Format.ARGB32, 1, 1);
+    let cr = new Cairo.Context(surface);
+    try {
+        cr.selectFontFace("Sans", 0, 0);
+        cr.setFontSize(size);
+        let ext = cr.textExtents(str);
+        return extent(ext, "xAdvance", "x_advance");
+    } finally {
+        cr.$dispose();
+    }
+}
+
+/* Text on a vertical centre line rather than a baseline, so it lines up with the graphs
+ * beside it whatever the glyphs are. */
+function label(cr, x, cy, str, size, color, alpha, align) {
+    cr.selectFontFace("Sans", 0, 0);
+    cr.setFontSize(size);
+    let ext = cr.textExtents(str);
+    let w = extent(ext, "width", "width");
+    let h = extent(ext, "height", "height");
+    let xb = extent(ext, "xBearing", "x_bearing");
+    let yb = extent(ext, "yBearing", "y_bearing");
+    let dx = 0;
+    if (align === "center") dx = -w / 2 - xb;
+    else if (align === "right") dx = -w - xb;
+    cr.setSourceRGBA(color[0], color[1], color[2], alpha);
+    cr.moveTo(x + dx, cy - h / 2 - yb);
+    cr.showText(str);
+    cr.newPath();
+}
+
 /* Filled area chart. History runs oldest-to-newest, left to right, values 0..1. */
 function spark(cr, x, y, w, h, history, color, fg) {
     cr.setSourceRGBA(fg[0], fg[1], fg[2], 0.10);
@@ -326,6 +364,6 @@ function bolt(cr, cx, cy, h, fg) {
 
 module.exports = {
     clamp01, hsv, usageColor, roundRect,
-    text, centeredText, haloText, spark, vbar, hbar, usageBar, ring, cores, swatch,
+    text, centeredText, haloText, measure, label, spark, vbar, hbar, usageBar, ring, cores, swatch,
     battery, batteryColor, bolt,
 };

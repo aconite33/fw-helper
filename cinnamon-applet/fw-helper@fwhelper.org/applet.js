@@ -75,10 +75,12 @@ const PROC_INTERVAL_S = 3;
 /* A single update taking longer than this is a problem worth naming rather than
  * silently tolerating: at this length it is visible as a stutter. */
 const SLOW_UPDATE_MS = 250;
-/* Slack on the reserved label width. The worst case is measured, but a measurement
- * taken before fonts and styles have settled can come out a pixel or two short, and
- * the cost of being short is a field that never appears. */
-const LABEL_MARGIN = 8;
+/* Space between text fields. */
+const TEXT_GAP = 8;
+/* Each text field is drawn into a slot wide enough for the widest value it can ever
+ * hold, so a reading that grows a glyph - "14W" becoming "+32W" - repaints inside its
+ * own slot instead of resizing the applet. */
+const TEXT_SIZE = 13;
 
 function nowSeconds() {
     return GLib.get_monotonic_time() / 1000000;
@@ -94,8 +96,13 @@ FrameworkMonitor.prototype = {
     _init: function (metadata, orientation, panelHeight, instanceId) {
         Applet.TextIconApplet.prototype._init.call(this, orientation, panelHeight, instanceId);
 
-        this.set_applet_label("…");
-        this._applet_label.add_style_class_name("fw-helper-label");
+        // No St.Label for the readings. A label sizes itself to its own text, so any
+        // value that changes width - a "+" appearing when the charger goes in, "idle"
+        // becoming "2.5k" - resizes the applet and shoves every neighbour along the
+        // panel. The text is drawn into the same DrawingArea as the graphs instead,
+        // whose width this applet computes and therefore controls.
+        this.set_applet_label("");
+        this.hide_applet_label(true);
 
         this._cpuHistory = [];
         this._memHistory = [];
@@ -112,7 +119,9 @@ FrameworkMonitor.prototype = {
         this._lastProc = 0;
         this._procJiffies = 0;
         this._warned = false;
-        this._labelKey = null;
+        this._fieldKey = null;
+        this._fieldWidths = {};
+        this._fields = [];
         this._debug = (GLib.getenv("FW_HELPER_APPLET_DEBUG") !== null);
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
@@ -175,14 +184,9 @@ FrameworkMonitor.prototype = {
         this._update();
         this._restartTimer();
 
-        // Fonts and theme styles are not necessarily resolved while the applet is still
-        // being constructed, and a width measured then can come out short - letting real
-        // content push past it later, which is the shift this exists to prevent.
-        Mainloop.timeout_add_seconds(2, () => {
-            this._labelKey = null;
-            this._lockLabelWidth();
-            return false;
-        });
+        // No deferred re-measure here. Cairo measures against a font face and size it
+        // is given directly, so unlike a widget it does not need the theme to have
+        // settled first - the answer is the same on the first tick as on the hundredth.
     },
 
     _resolve: function () {
@@ -223,7 +227,8 @@ FrameworkMonitor.prototype = {
 
         this._graphArea.set_width(Math.max(0, width));
         this._graphArea.visible = width > 0;
-        this._lockLabelWidth();
+        this._measureFields();
+        width += this._textWidth();
 
         // History is one sample per pixel column, so a width change resizes it.
         let max = slot;
@@ -233,86 +238,46 @@ FrameworkMonitor.prototype = {
         this._graphArea.queue_repaint();
     },
 
-    /* Reserve the label's width from the widest string it could ever hold.
+    /* Width of each text slot, from the widest value that field can ever hold.
      *
-     * Padding the fields to equal character counts is not enough on its own. Tabular
-     * figures make DIGITS equal width, but the letters do not follow: "AC" and "14W"
-     * are both three glyphs and different widths, because W is wide and A and C are
-     * not. So the reservation has to come from the box, not the string.
-     *
-     * Note what this must not do. Measuring the label and latching its own width as a
-     * minimum is a feedback loop - once min-width is applied the next measurement
-     * returns that width plus the padding, and the reservation grows every tick until
-     * it shoves the whole tray off the panel. Every measurement here is taken with the
-     * inline style cleared, so there is nothing to feed back.
+     * Measured with Cairo off-screen rather than through the widget layout, so nothing
+     * here can feed back into the applet's size. Recomputed only when the fields or the
+     * format change, since nothing else moves the worst case.
      */
-    _measureLabel: function (str) {
-        this._applet_label.set_text(str);
-        return this._applet_label.get_preferred_width(-1)[1];
-    },
-
-    _lockLabelWidth: function () {
+    _measureFields: function () {
         let key = [this.compact, this.show_temp, this.show_fan, this.show_power].join(",");
-        if (key === this._labelKey) return;
-        this._labelKey = key;
+        if (key === this._fieldKey) return;
+        this._fieldKey = key;
 
-        // Every value each field can take, so the widest is measured rather than
-        // guessed. "AC" is here because it replaces the wattage on mains, and it was
-        // the pair "AC" / "14W" that shifted the panel.
-        let candidates = [];
+        let widest = (candidates) => {
+            let best = 0;
+            for (let c of candidates) best = Math.max(best, Draw.measure(c, TEXT_SIZE));
+            return Math.ceil(best);
+        };
+
+        this._fieldWidths = {};
         if (this.show_temp) {
-            candidates.push(this.compact
-                ? ["100\u00b0", "50\u00b0"] : ["100 \u00b0C", "50 \u00b0C"]);
+            this._fieldWidths.temp = widest(this.compact
+                ? ["100\u00b0"] : ["100 \u00b0C"]);
         }
         if (this.show_fan) {
-            candidates.push(this.compact
+            this._fieldWidths.fan = widest(this.compact
                 ? ["8.8k", "idle", "999"] : ["8888 rpm", "idle"]);
         }
         if (this.show_power) {
-            candidates.push(this.compact
-                ? ["100W", "+100W", "AC", "8W"] : ["+100.0 W", "on AC"]);
+            // "+100W" is the widest: the plus that appears while charging is a wider
+            // glyph than the space it replaces, which is what was moving the panel.
+            this._fieldWidths.power = widest(this.compact
+                ? ["+100W", "100W", "AC"] : ["+100.0 W", "on AC"]);
         }
+    },
 
-        // Measure what is actually rendered, padding included - the panel pads each
-        // field to a fixed character count, and a reservation taken from unpadded text
-        // could come out narrower than the string it has to hold.
-        if (this.compact) {
-            candidates = candidates.map((group) => group.map((c) => c.padStart(5)));
+    _textWidth: function () {
+        let total = 0;
+        for (let key of Object.keys(this._fieldWidths)) {
+            total += this._fieldWidths[key] + TEXT_GAP;
         }
-
-        let restore = this._applet_label.get_text();
-        this._applet_label.style = null;
-        this._applet_label.set_width(-1); // -1 restores natural sizing for measuring
-
-        if (candidates.length === 0) {
-            this._applet_label.set_text(restore === null ? "" : restore);
-            return;
-        }
-
-        // Widest per field, then the worst case assembled from those and measured as
-        // one string - which is exact, where summing the parts would double-count the
-        // label's own padding.
-        let worst = candidates.map((group) => {
-            let best = group[0], bestWidth = -1;
-            for (let candidate of group) {
-                let width = this._measureLabel(candidate);
-                if (width > bestWidth) {
-                    bestWidth = width;
-                    best = candidate;
-                }
-            }
-            return best;
-        });
-        let width = Math.ceil(this._measureLabel(worst.join("  ")));
-
-        this._applet_label.set_text(restore === null ? "" : restore);
-        // A minimum, never a pinned width. Pinning the actor guarantees the box cannot
-        // move, but if the measurement comes out even slightly short the text is
-        // clipped instead - which silently hides a whole field. Losing a reading is
-        // worse than moving a pixel, so the floor is set generously and content is
-        // allowed to be narrower than it.
-        this._applet_label.set_width(-1);
-        this._applet_label.style = "min-width: " + (width + LABEL_MARGIN) + "px;";
+        return total;
     },
 
     _coreBarsWidth: function () {
@@ -425,6 +390,17 @@ FrameworkMonitor.prototype = {
                 x += PANEL_BOLT_WIDTH;
                 Draw.battery(cr, x, (h - bh) / 2, PANEL_BATTERY_WIDTH, bh,
                     this._batteryLevel, this._batteryCharging, fg);
+                x += PANEL_BATTERY_WIDTH + PANEL_GAP;
+            }
+
+            // Right-aligned within a slot sized for the field's widest possible value,
+            // so a reading that gains a glyph repaints inside its own slot rather than
+            // resizing the applet.
+            for (let f of this._fields) {
+                let width = this._fieldWidths[f.key];
+                if (!width) continue;
+                Draw.label(cr, x + width, h / 2, f.str, TEXT_SIZE, fg, 0.95, "right");
+                x += width + TEXT_GAP;
             }
         } finally {
             // GJS will not collect the Cairo context on its own.
@@ -609,31 +585,26 @@ FrameworkMonitor.prototype = {
 
     _updatePanel: function (s) {
         let compact = this.compact;
-        let parts = [];
-
-        // Each field is padded to a fixed width. Combined with tabular figures in the
-        // stylesheet this keeps the label one constant size, so a reading that changes
-        // width - or a power draw that vanishes on mains - never shifts the applets
-        // beside it.
-        let pad = (str, width) => compact ? str.padStart(width) : str;
+        this._fields = [];
 
         if (this.show_temp && s.cpuTemp !== null) {
-            parts.push(pad(Math.round(s.cpuTemp) + (compact ? "°" : "°C"), 4));
+            this._fields.push({
+                key: "temp",
+                str: Math.round(s.cpuTemp) + (compact ? "\u00b0" : " \u00b0C"),
+            });
         }
         if (this.show_fan && s.fanRpm !== null) {
-            // A stopped fan is worth saying plainly rather than showing "0": firmware
-            // keeps it off entirely at idle here, so that is normal, not a fault.
+            // A stopped fan reads "idle" rather than "off": firmware keeps it off
+            // entirely at idle on this board, so that is the normal state, not a fault.
             let fan;
             if (s.fanRpm === 0) fan = "idle";
             else if (compact) {
                 fan = s.fanRpm >= 1000
                     ? (s.fanRpm / 1000).toFixed(1) + "k" : String(s.fanRpm);
             } else fan = s.fanRpm + " rpm";
-            parts.push(pad(fan, 4));
+            this._fields.push({ key: "fan", str: fan });
         }
         if (this.show_power) {
-            // "AC" rather than dropping the field: nothing reports whole-machine draw
-            // on mains, and saying so holds the space that the number occupies.
             let power;
             if (s.battery.watts !== null) {
                 power = compact
@@ -648,24 +619,11 @@ FrameworkMonitor.prototype = {
             } else {
                 power = compact ? "AC" : "on AC";
             }
-            parts.push(pad(power, 5));
-        }
-        // The battery percentage is no longer text: it is drawn inside the battery,
-        // where the number and the level are the same object rather than two.
-
-        this.set_applet_label(parts.join("  "));
-
-        if (this._debug) {
-            global.log("fw-helper widths: label="
-                + this._applet_label.get_width() + " alloc="
-                + this._applet_label.get_allocation_box().get_width()
-                + " graph=" + this._graphArea.get_width()
-                + " actor=" + this.actor.get_width()
-                + "  text='" + parts.join("  ") + "'");
+            this._fields.push({ key: "power", str: power });
         }
 
         let tip = [];
-        if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " °C");
+        if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " \u00b0C");
         if (s.cpu !== null) tip.push("Load " + (s.cpu.busy * 100).toFixed(0) + "%");
         if (s.fanRpm !== null) tip.push("Fan " + s.fanRpm + " rpm");
         if (s.memory) {
@@ -680,10 +638,14 @@ FrameworkMonitor.prototype = {
             tip.push("Battery " + s.battery.capacity + "%"
                 + (s.battery.status ? " (" + s.battery.status + ")" : ""));
         }
+        if (s.battery.watts !== null) {
+            tip.push("Draw " + s.battery.watts.toFixed(2) + " W");
+        } else if (s.battery.chargeWatts !== null) {
+            tip.push("Charging at " + s.battery.chargeWatts.toFixed(2) + " W");
+        }
         this.set_applet_tooltip(tip.join("\n"));
     },
 
-    /* ---------- menu ---------- */
 
     _updateMenu: function (s) {
         this._cpuSection(s);
