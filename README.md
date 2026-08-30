@@ -13,6 +13,12 @@ further along, and none of the caveats below apply to it.
 > control is *proven possible* on this board but not yet wired into the daemon. Power limits
 > have no mechanism here at all. Read the table before expecting anything.
 
+![The panel applet](docs/images/applet-panel.png)
+
+CPU and memory sparklines, a usage bar per mounted drive, the battery with its percentage
+inside it, then temperature, fan and power draw. Every screenshot here is from the machine
+described under [Hardware](#hardware) — nothing is mocked up.
+
 ## Why a fork rather than a patch
 
 Four of the interfaces upstream depends on are absent or different here, and two of its
@@ -56,13 +62,24 @@ and sysfs directly, so it needs no daemon, no D-Bus policy and no root.
 
 Then right-click the panel → Applets → **Framework Monitor**.
 
+<img src="docs/images/applet-menu.png" alt="The applet dropdown" width="380" align="right">
+
 **Panel:** CPU and memory sparklines, a usage bar per mounted drive, a battery with its
 percentage inside it, and CPU temperature, fan speed and power draw as text.
 
 **Dropdown:** ring gauges for temperature, CPU usage and load; a usage-history chart;
 per-core bars; a user/system/idle breakdown; every EC sensor with its critical threshold;
 memory and swap; every mounted filesystem; battery charge in mAh, health against design
-capacity, and cycle count; and the top processes by CPU.
+capacity, and cycle count; and the top processes by CPU. It scrolls, because on a laptop
+screen it is taller than the display.
+
+The dropdown's layout follows [Stats](https://github.com/exelban/stats) on macOS: gauges
+first, then history, then the breakdown, then what is responsible.
+
+<br clear="right">
+
+The screenshot above is a live one, which is why the disk list has three real entries —
+`/`, `/boot`, and an unlocked VeraCrypt volume that the applet picked up on its own.
 
 Details worth knowing:
 
@@ -77,6 +94,19 @@ Details worth knowing:
 - **HiDPI is handled**, and the process list is only gathered while the dropdown is open,
   since walking every `/proc/PID` on the compositor's own main loop is the one thing here
   that could stutter the desktop.
+
+## The application
+
+![The GTK window](docs/images/gui.png)
+
+Carried over from upstream, and worth reading as a status report in itself: the controls
+that cannot work on this board say so rather than sitting there dead. `cpu package` shows a
+dash because there is no RAPL energy counter, the power limit explains that there is no
+`intel-rapl-mmio:0` zone, and the fan reports unavailable until [ADR 0013](docs/adr/0013-fan-control-via-ec-commands.md)
+is implemented. Whole-machine draw, temperature, battery and profiles all work.
+
+The fan curve editor is shown for completeness — it edits and saves a curve, but nothing
+drives the fan from it yet on this hardware.
 
 ## Hardware
 
