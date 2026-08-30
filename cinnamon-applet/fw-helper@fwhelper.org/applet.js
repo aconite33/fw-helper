@@ -169,6 +169,15 @@ FrameworkMonitor.prototype = {
         this._resolve();
         this._update();
         this._restartTimer();
+
+        // Fonts and theme styles are not necessarily resolved while the applet is still
+        // being constructed, and a width measured then can come out short - letting real
+        // content push past it later, which is the shift this exists to prevent.
+        Mainloop.timeout_add_seconds(2, () => {
+            this._labelKey = null;
+            this._lockLabelWidth();
+            return false;
+        });
     },
 
     _resolve: function () {
@@ -221,34 +230,77 @@ FrameworkMonitor.prototype = {
 
     /* Reserve the label's width from the widest string it could ever hold.
      *
-     * The obvious approach - measure the label and latch its own width as a minimum -
-     * is a feedback loop: once min-width is applied, the next measurement returns that
-     * width PLUS the padding, so the reservation grows by the padding on every tick.
-     * It ran away over minutes, pushing the whole tray leftwards off the panel while
-     * the label itself stayed short, so the growth was invisible.
+     * Padding the fields to equal character counts is not enough on its own. Tabular
+     * figures make DIGITS equal width, but the letters do not follow: "AC" and "14W"
+     * are both three glyphs and different widths, because W is wide and A and C are
+     * not. So the reservation has to come from the box, not the string.
      *
-     * Measuring a fixed sample with the inline style cleared has no such loop, and
-     * gives the same answer every time. Recomputed only when the fields or the format
-     * change, since nothing else can alter the worst case.
+     * Note what this must not do. Measuring the label and latching its own width as a
+     * minimum is a feedback loop - once min-width is applied the next measurement
+     * returns that width plus the padding, and the reservation grows every tick until
+     * it shoves the whole tray off the panel. Every measurement here is taken with the
+     * inline style cleared, so there is nothing to feed back.
      */
+    _measureLabel: function (str) {
+        this._applet_label.set_text(str);
+        return this._applet_label.get_preferred_width(-1)[1];
+    },
+
     _lockLabelWidth: function () {
         let key = [this.compact, this.show_temp, this.show_fan, this.show_power].join(",");
         if (key === this._labelKey) return;
         this._labelKey = key;
 
-        let sample = [];
-        if (this.show_temp) sample.push(this.compact ? "100\u00b0" : "100 \u00b0C");
-        if (this.show_fan) sample.push(this.compact ? "8.8k" : "8888 rpm");
-        if (this.show_power) sample.push(this.compact ? "100W" : "100.0 W");
+        // Every value each field can take, so the widest is measured rather than
+        // guessed. "AC" is here because it replaces the wattage on mains, and it was
+        // the pair "AC" / "14W" that shifted the panel.
+        let candidates = [];
+        if (this.show_temp) {
+            candidates.push(this.compact
+                ? ["100\u00b0", "50\u00b0"] : ["100 \u00b0C", "50 \u00b0C"]);
+        }
+        if (this.show_fan) {
+            candidates.push(this.compact
+                ? ["8.8k", "idle", "999"] : ["8888 rpm", "idle"]);
+        }
+        if (this.show_power) {
+            candidates.push(this.compact
+                ? ["100W", "AC", "8W"] : ["100.0 W", "on AC"]);
+        }
 
-        this._applet_label.style = null;
-        if (sample.length === 0) return;
+        // Measure what is actually rendered, padding included - the panel pads each
+        // field to a fixed character count, and a reservation taken from unpadded text
+        // could come out narrower than the string it has to hold.
+        if (this.compact) {
+            candidates = candidates.map((group) => group.map((c) => c.padStart(4)));
+        }
 
         let restore = this._applet_label.get_text();
-        this._applet_label.set_text(sample.join("  "));
-        let w = Math.ceil(this._applet_label.get_preferred_width(-1)[1]);
+        this._applet_label.style = null;
+
+        if (candidates.length === 0) {
+            this._applet_label.set_text(restore === null ? "" : restore);
+            return;
+        }
+
+        // Widest per field, then the worst case assembled from those and measured as
+        // one string - which is exact, where summing the parts would double-count the
+        // label's own padding.
+        let worst = candidates.map((group) => {
+            let best = group[0], bestWidth = -1;
+            for (let candidate of group) {
+                let width = this._measureLabel(candidate);
+                if (width > bestWidth) {
+                    bestWidth = width;
+                    best = candidate;
+                }
+            }
+            return best;
+        });
+        let width = Math.ceil(this._measureLabel(worst.join("  ")));
+
         this._applet_label.set_text(restore === null ? "" : restore);
-        this._applet_label.style = "min-width: " + w + "px;";
+        this._applet_label.style = "min-width: " + width + "px;";
     },
 
     _coreBarsWidth: function () {
