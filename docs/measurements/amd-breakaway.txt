@@ -1,0 +1,15 @@
+== breakaway: lowest duty that starts the fan from rest ==
+  temp 44.9 C
+  settling to rest. rpm=0
+
+  duty%    rpm        verdict
+  8        0          still at rest
+  9        0          still at rest
+  10       0          still at rest
+  11       1098       STARTED
+
+  releasing to EC automatic
+  after release: rpm=0
+
+  BREAKAWAY = 11%. No curve may command a non-zero duty below this,
+  even though the sweep shows the fan sustains rotation lower.

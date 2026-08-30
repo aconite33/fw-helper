@@ -18,6 +18,64 @@
 /// `EcCommands::ChargeLimitControl`.
 pub const CHARGE_LIMIT_CONTROL: u32 = 0x3E03;
 
+/// Fan control over raw EC commands.
+///
+/// The Intel board drives the fan through `pwm1` / `pwm1_enable` in `cros_ec` hwmon.
+/// **This board exposes neither** — only read-only `fan1_input`, `fan1_target` and
+/// `fan1_fault` — so the fan is reachable only through the EC's own commands.
+/// `EC_FEATURE_PWM_FAN` is advertised (`flags[0]=0x0207E6AE`, bit 2) and both commands
+/// below were verified on hardware 2026-08-29: 40% gave ~4000 rpm, 70% ~6200 rpm, and
+/// the EC took the fan back to 0 rpm within 2 s.
+///
+/// This is the second interface to reach ADR 0004's raw-EC tier, after the charge limit,
+/// and for the same reason: there is no sysfs path that works.
+///
+/// Definitions verified against `torvalds/linux`
+/// `include/linux/platform_data/cros_ec_commands.h`, not from memory. Pinned in tests
+/// below because a wrong opcode is neither a compile error nor reliably a runtime one —
+/// the EC simply answers a different question.
+pub mod fan {
+    /// `EC_CMD_PWM_SET_FAN_DUTY`. v0 params: `{ uint32_t percent; }`.
+    pub const SET_FAN_DUTY: u32 = 0x0024;
+    /// `EC_CMD_THERMAL_AUTO_FAN_CTRL`. v0 takes no parameters. Hands the fan back to
+    /// firmware, and is the command every release path in the daemon depends on.
+    pub const AUTO_FAN_CTRL: u32 = 0x0052;
+    /// `EC_CMD_PWM_GET_FAN_TARGET_RPM`.
+    ///
+    /// **Measured to return 0 on this board**, under manual control and after release
+    /// alike. It is the Intel board's `fan1_target` trap arriving through a different
+    /// interface. Defined here so the number is written down once, with the reason not
+    /// to use it; read `fan1_input` for actual RPM.
+    pub const GET_FAN_TARGET_RPM: u32 = 0x0020;
+
+    /// Full duty on this interface. **Duty is a percentage here, not an 8-bit count** —
+    /// the single most consequential difference from the hwmon path, where 255 is full.
+    /// A duty of 255 sent to this command is not "maximum", it is out of range.
+    pub const MAX_DUTY: u8 = 100;
+
+    /// Encode a duty request.
+    ///
+    /// The EC's wire format is little-endian regardless of host, so this is explicit
+    /// rather than relying on `to_ne_bytes` happening to agree on x86.
+    ///
+    /// Duty is clamped rather than rejected: this is the last layer before the wire, and
+    /// range policy belongs above it. Refusing a duty that cannot turn the fan is a
+    /// separate decision made against the measured stall and break-away points.
+    pub fn set_duty_request(percent: u8) -> [u8; 4] {
+        (percent.min(MAX_DUTY) as u32).to_le_bytes()
+    }
+
+    /// Release the fan to firmware. Version 0 carries no payload.
+    ///
+    /// Idempotent: handing the fan to an EC that already owns it is a no-op. That
+    /// property is load-bearing on this board — with no mode register to read, the
+    /// daemon cannot ask whether it holds the fan, so it releases unconditionally
+    /// instead of conditionally.
+    pub fn auto_request() -> [u8; 0] {
+        []
+    }
+}
+
 /// Bytes in a charge-limit request: `modes`, `max_percentage`, `min_percentage`.
 pub const REQUEST_LEN: usize = 3;
 /// Bytes the EC returns for a `Get`: `max_percentage`, `min_percentage`.
@@ -117,6 +175,49 @@ mod tests {
     fn refuses_a_short_response_rather_than_inventing_a_limit() {
         assert_eq!(parse_limits(&[]), None);
         assert_eq!(parse_limits(&[80]), None);
+    }
+
+    #[test]
+    fn fan_command_ids_are_the_ones_verified_against_the_kernel_header() {
+        // Pinned for the same reason as the charge command above: a wrong opcode is not
+        // a compile error and often not a runtime error either. These three were read
+        // out of cros_ec_commands.h with their neighbours, not recalled.
+        assert_eq!(fan::SET_FAN_DUTY, 0x0024);
+        assert_eq!(fan::AUTO_FAN_CTRL, 0x0052);
+        assert_eq!(fan::GET_FAN_TARGET_RPM, 0x0020);
+    }
+
+    #[test]
+    fn duty_is_a_percent_not_an_eight_bit_count() {
+        // The difference that breaks every constant carried over from the hwmon path.
+        // 255 is full duty there and out of range here, so it must clamp to 100 rather
+        // than wrap to 255 % 256 = 255 or truncate to some middling speed.
+        assert_eq!(fan::MAX_DUTY, 100);
+        assert_eq!(fan::set_duty_request(255), 100u32.to_le_bytes());
+        assert_eq!(fan::set_duty_request(101), 100u32.to_le_bytes());
+    }
+
+    #[test]
+    fn duty_request_is_little_endian() {
+        // Explicit rather than to_ne_bytes: the EC's wire format is little-endian
+        // regardless of host, and on x86 a native-endian bug would never show up.
+        assert_eq!(fan::set_duty_request(70), [70, 0, 0, 0]);
+        assert_eq!(fan::set_duty_request(0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn releasing_the_fan_carries_no_payload() {
+        // Version 0 of AUTO_FAN_CTRL takes no parameters. Sending bytes it does not
+        // expect risks the EC reading them as a fan index.
+        assert!(fan::auto_request().is_empty());
+    }
+
+    #[test]
+    fn a_duty_that_starts_the_fan_survives_encoding() {
+        // 11% is the measured break-away duty on this board (2026-08-29): 10% sustains
+        // rotation at 967 rpm but will not start the fan from rest, and 11% starts it
+        // at 1098 rpm. Encoding must not round or clamp anywhere near here.
+        assert_eq!(fan::set_duty_request(11), [11, 0, 0, 0]);
     }
 
     #[test]

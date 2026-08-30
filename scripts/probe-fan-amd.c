@@ -23,7 +23,8 @@
  *
  *   gcc -O2 -Wall -o probe-fan-amd probe-fan-amd.c
  *   sudo ./probe-fan-amd            Q4: does duty move the fan, does the EC take it back?
- *   sudo ./probe-fan-amd --sweep    duty -> RPM table, and where stiction sits
+ *   sudo ./probe-fan-amd --sweep    duty -> RPM table, and where the fan stalls
+ *   sudo ./probe-fan-amd --breakaway  lowest duty that starts the fan from rest
  */
 
 #define _GNU_SOURCE
@@ -274,6 +275,85 @@ static int run_sweep(int settle)
 	return 0;
 }
 
+/* Breakaway: the lowest duty that will start the fan FROM REST.
+ *
+ * The descending sweep answers a different question. It measures where a fan already
+ * turning finally stalls, which is a dynamic-friction number. Starting from rest has to
+ * overcome static friction and needs more duty. The gap between the two is the dangerous
+ * band: a curve idling there runs fine while cooling down, then fails to spin up from
+ * cold, and a fan that never starts is silent - indistinguishable from a working quiet
+ * curve until something overheats.
+ *
+ * Ascending is normally forbidden in this file. It is correct here precisely because
+ * finding a duty that does NOT move the fan is the measurement.
+ */
+static const uint32_t BREAKAWAY[] = { 8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 25 };
+
+static int run_breakaway(void)
+{
+	uint32_t result = 0;
+
+	printf("== breakaway: lowest duty that starts the fan from rest ==\n");
+	printf("  temp %.1f C\n", hottest_temp());
+
+	/* Bring the fan to a genuine stop first, or we would be measuring a coast-down. */
+	took_control = 1;
+	if (set_duty(0, &result) < 0) {
+		fprintf(stderr, "  SET_FAN_DUTY 0 failed (result %u)\n", result);
+		return 2;
+	}
+	printf("  settling to rest");
+	fflush(stdout);
+	for (int i = 0; i < 20; i++) {
+		sleep(1);
+		printf(".");
+		fflush(stdout);
+		if (hwmon_rpm() == 0)
+			break;
+	}
+	long at_rest = hwmon_rpm();
+	printf(" rpm=%ld\n", at_rest);
+	if (at_rest != 0) {
+		fprintf(stderr, "  fan did not come to rest; result would be a coast-down.\n");
+		fprintf(stderr, "  Is the machine idle and cool?\n");
+		return 2;
+	}
+
+	printf("\n  %-8s %-10s %s\n", "duty%", "rpm", "verdict");
+	uint32_t started_at = 0;
+	for (size_t i = 0; i < sizeof(BREAKAWAY) / sizeof(BREAKAWAY[0]); i++) {
+		if (set_duty(BREAKAWAY[i], &result) < 0) {
+			fprintf(stderr, "  SET_FAN_DUTY %u failed (result %u)\n",
+			        BREAKAWAY[i], result);
+			return 2;
+		}
+		for (int s = 0; s < 8; s++)
+			sleep(1);
+		long rpm = hwmon_rpm();
+		printf("  %-8u %-10ld %s\n", BREAKAWAY[i], rpm,
+		       rpm > 0 ? "STARTED" : "still at rest");
+		fflush(stdout);
+		if (rpm > 0) {
+			started_at = BREAKAWAY[i];
+			break;
+		}
+	}
+
+	printf("\n  releasing to EC automatic\n");
+	release_fan();
+	sleep(3);
+	printf("  after release: rpm=%ld\n", hwmon_rpm());
+
+	if (started_at)
+		printf("\n  BREAKAWAY = %u%%. No curve may command a non-zero duty below this,\n"
+		       "  even though the sweep shows the fan sustains rotation lower.\n",
+		       started_at);
+	else
+		printf("\n  Fan never started across the tested range. Re-run; if it repeats,\n"
+		       "  the minimum usable duty is above 25%% and a quiet curve is not viable.\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	ec_fd = open(DEV, O_RDWR);
@@ -298,6 +378,11 @@ int main(int argc, char **argv)
 
 	if (argc > 1 && strcmp(argv[1], "--sweep") == 0) {
 		int rc = run_sweep(7);
+		close(ec_fd);
+		return rc;
+	}
+	if (argc > 1 && strcmp(argv[1], "--breakaway") == 0) {
+		int rc = run_breakaway();
 		close(ec_fd);
 		return rc;
 	}

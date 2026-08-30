@@ -165,6 +165,75 @@ defect does not apply here.
 
 No `ectool`, `framework_tool`, or `ryzenadj` installed. No discrete GPU.
 
+### Duty → RPM, measured
+
+Full sweep 2026-08-29, descending from 100% so the fan never had to start from rest below
+stiction, 7 s settling per point, machine idle. Temperature drifted 47.9 → 44.9 °C across the
+run — falling, because the fan was cooling the machine.
+
+| Duty % | 0 | 4 | 6 | 8 | 10 | 12 | 14 | 16 | 18 | 20 | 25 | 30 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| RPM | 0 | **0** | **0** | **0** | 967 | 1221 | 1456 | 1689 | 1920 | 2155 | 2671 | 3160 |
+
+| Duty % | 35 | 40 | 45 | 50 | 60 | 70 | 80 | 90 | 100 |
+|---|---|---|---|---|---|---|---|---|---|
+| RPM | 3614 | 4045 | 4468 | 4890 | 5585 | 6261 | 6779 | 7336 | **7864** |
+
+**The fan stalls between duty 8% and 10%.** Duty 10 turns it at 967 rpm; duty 8 leaves it
+stopped. Any duty in 1–9 is a stopped fan wearing a costume and must be refused, not accepted
+and silently ignored. The Intel board stalled between its 8-bit duty 20 and 30 — 7.8% and
+11.8% — so both boards stall in the same 8–12% band despite the different fan.
+
+**This measures the STALL point, not the START point** — the sweep descends, so the fan was
+already turning at every point. The two differ, and the gap was measured separately below.
+
+### Break-away: the fan will not start at the duty it will sustain
+
+Measured 2026-08-29 at 44.9 °C with `probe-fan-amd --breakaway`, from a confirmed standstill:
+
+| Duty % | 8 | 9 | 10 | 11 |
+|---|---|---|---|---|
+| From rest | still at rest | still at rest | **still at rest** | **1098 rpm — starts** |
+
+**Duty 10 sustains rotation at 967 rpm but cannot begin it.** That two-point gap between
+stall and break-away is the dangerous band this fork must not put a curve into: a curve
+idling at 10 would run correctly all the way down a cooldown, then silently fail to spin up
+from cold. A fan that never starts is indistinguishable from a working quiet curve until
+something overheats — the exact failure ADR 0006 exists to prevent, arriving through
+arithmetic rather than through a crash.
+
+So the minimum usable non-zero duty on this board is **11%, not 10%**, and the constant that
+encodes it must carry the break-away number.
+
+`STICTION_DUTY` should be set **above** the measured 11, not equal to it. This is a single
+observation, taken at one temperature, with the fan already warm; bearing drag rises when
+cold and as dust accumulates, and the failure direction is silent. **13% is the proposed
+value** — 11 measured plus two points of margin, costing roughly 235 rpm of minimum speed.
+Worth re-measuring from cold before that is treated as settled.
+
+> Note for anyone reading the Intel baseline alongside this: that board's `STICTION_DUTY`
+> (8-bit 30) was derived from a **descending** sweep too — duty 20 → 0 rpm, duty 30 → 1107
+> rpm. If break-away exceeds stall there as it does here, that constant may sit below the
+> Intel board's true starting duty. Unverified, and not this fork's problem to fix, but it
+> is the same latent bug.
+
+**The curve is concave**, and steeply so. Slope in rpm per duty point:
+
+| Duty band | 10–20 | 20–30 | 30–50 | 50–70 | 70–100 |
+|---|---|---|---|---|---|
+| rpm per point | ~117 | ~100 | ~87 | ~69 | ~53 |
+
+The bottom of the range is **more than twice as responsive** as the top. This is the Intel
+board's lesson reproduced on different hardware, and it bites in the same direction: a line
+fitted through the high points (80% and 100%) predicts **2982 rpm at duty 10**, against a
+measured **967** — a threefold overestimate. Inverting that fit to ask "what duty matches
+firmware's RPM?" would return a duty roughly three times too low, i.e. a floor *below*
+firmware, which is the one direction that is not safe. **Interpolate the table. Do not fit
+a line to it.**
+
+For scale against the Intel board: 7864 rpm at full duty here, and 6261 rpm at 70% against
+its 5201 rpm at duty 180/255 (71%) — the ~20% margin holds across the range.
+
 ## Not yet measured
 
 Everything below was measured on the Intel board and is **unverified here**. None of it should
