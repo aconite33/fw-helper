@@ -230,6 +230,56 @@ function disk(path) {
     }
 }
 
+/* Filesystems backed by a real block device.
+ *
+ * Two filters, and both are load-bearing. The device must live under /dev/, which drops
+ * the FUSE bookkeeping mounts that would otherwise show up as drives - on this machine
+ * `gvfsd-fuse`, `portal`, and VeraCrypt's own `fuse.veracrypt` auxiliary mount at
+ * /tmp/.veracrypt_aux_mnt1, none of which hold user data. And the filesystem type must
+ * be one that stores files, which drops the kernel's virtual filesystems.
+ *
+ * An unlocked VeraCrypt volume passes both: it appears as /dev/mapper/veracrypt1 with
+ * its real filesystem type, so it is picked up the moment it is mounted and disappears
+ * when it is closed. Nothing needs configuring.
+ *
+ * Network mounts (nfs, cifs) do not pass the /dev/ test. Deliberate - they are not
+ * local drives, and their free space can block on an unreachable server.
+ */
+const DISK_FSTYPES = [
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "jfs", "reiserfs",
+    "vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "hfsplus", "zfs", "bcachefs",
+];
+
+function mounts() {
+    let text = file("/proc/mounts");
+    if (text === null) return [];
+    let seen = {};
+    let out = [];
+    for (let line of text.split("\n")) {
+        let f = line.split(/\s+/);
+        if (f.length < 3) continue;
+        let device = f[0];
+        // Mount points are escaped octal-style in /proc/mounts.
+        let point = f[1].replace(/\\040/g, " ").replace(/\\011/g, "\t");
+        let fstype = f[2];
+        if (!device.startsWith("/dev/")) continue;
+        if (DISK_FSTYPES.indexOf(fstype) === -1) continue;
+        if (seen[point]) continue;
+        seen[point] = true;
+
+        let usage = disk(point);
+        if (usage === null) continue;
+        usage.point = point;
+        usage.device = device;
+        usage.fstype = fstype;
+        // The last path element reads better in a narrow row than the whole path, and
+        // "/" has no last element of its own.
+        usage.name = (point === "/") ? "/" : point.split("/").filter(Boolean).pop();
+        out.push(usage);
+    }
+    return out;
+}
+
 function loadAvg() {
     let text = file("/proc/loadavg");
     if (text === null) return null;
@@ -304,5 +354,5 @@ function processes(prevMap, totalJiffies, coreCount, limit) {
 
 module.exports = {
     file, int, dir, hwmon, supply, sensors, battery,
-    cpuTimes, cpuDelta, memory, disk, loadAvg, uptime, processes,
+    cpuTimes, cpuDelta, memory, disk, mounts, loadAvg, uptime, processes,
 };

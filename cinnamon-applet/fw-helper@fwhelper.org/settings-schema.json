@@ -22,8 +22,18 @@
     "show-disk": {
         "type": "checkbox",
         "default": true,
-        "description": "Disk usage  (bar)",
-        "tooltip": "A bar rather than a graph: disk usage barely moves, so its history carries nothing."
+        "description": "Disk usage  (bars)",
+        "tooltip": "One bar per mounted drive, detected automatically - a VeraCrypt or USB volume appears when mounted and vanishes when closed."
+    },
+    "disk-bar-width": {
+        "type": "spinbutton",
+        "default": 14,
+        "min": 6,
+        "max": 40,
+        "step": 1,
+        "units": "pixels",
+        "description": "Disk bar width",
+        "tooltip": "Colour runs green when empty to purple when full."
     },
     "graph-width": {
         "type": "spinbutton",
@@ -34,12 +44,6 @@
         "units": "pixels",
         "description": "Sparkline width",
         "tooltip": "One sample per pixel, so this is also how much history is kept."
-    },
-    "disk-path": {
-        "type": "entry",
-        "default": "/",
-        "description": "Filesystem to report",
-        "tooltip": "Any path on the filesystem you want measured, for example /home"
     },
     "head-text": {
         "type": "header",
@@ -53,8 +57,8 @@
     "show-battery": {
         "type": "checkbox",
         "default": true,
-        "description": "Battery percentage",
-        "tooltip": "A leading + means charging."
+        "description": "Battery",
+        "tooltip": "Drawn as a battery with the percentage inside it. A bolt appears beside it while charging."
     },
     "show-fan": {
         "type": "checkbox",
@@ -71,7 +75,7 @@
         "type": "checkbox",
         "default": true,
         "description": "Compact text",
-        "tooltip": "52° · 2.1k · 15W · 30%   instead of the long form"
+        "tooltip": "52\u00b0  2.1k  15W   instead of the long form"
     },
     "head-display": {
         "type": "header",

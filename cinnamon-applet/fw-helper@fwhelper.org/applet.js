@@ -29,13 +29,16 @@ const Read = require("./read");
 const COLOR_USER = [0.20, 0.52, 0.93];
 const COLOR_SYSTEM = [0.92, 0.34, 0.30];
 const COLOR_MEM = [0.36, 0.72, 0.46];
-const COLOR_DISK = [0.96, 0.71, 0.36];
 const COLOR_TEMP = [0.95, 0.55, 0.25];
 const COLOR_BATTERY = [0.42, 0.76, 0.42];
 
 const PANEL_GAP = 4;
-const PANEL_DISK_WIDTH = 9;
 const PANEL_PAD_Y = 3;
+const PANEL_BATTERY_WIDTH = 34;
+const PANEL_BOLT_WIDTH = 8;
+/* Beyond this the panel is a disk manager rather than a readout; the dropdown still
+ * lists every mount. */
+const PANEL_MAX_DISKS = 4;
 
 const MENU_WIDTH = 300;
 const CPU_PANEL_HEIGHT = 168;
@@ -69,7 +72,9 @@ FrameworkMonitor.prototype = {
         this._cpuHistory = [];
         this._memHistory = [];
         this._coreValues = [];
-        this._diskValue = null;
+        this._mounts = [];
+        this._batteryLevel = null;
+        this._batteryCharging = false;
         this._prevCpu = null;
         this._prevCores = null;
         this._procMap = null;
@@ -86,7 +91,7 @@ FrameworkMonitor.prototype = {
         this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
         for (let key of ["interval", "show-temp", "show-fan", "show-power",
                          "show-battery", "show-cpu", "show-mem", "show-disk",
-                         "show-cores", "disk-path", "graph-width", "compact",
+                         "show-cores", "disk-bar-width", "graph-width", "compact",
                          "show-icon", "proc-count"]) {
             this.settings.bind(key, key.replace(/-/g, "_"),
                 () => this._onSettingsChanged());
@@ -134,7 +139,14 @@ FrameworkMonitor.prototype = {
         if (this.show_cpu) width += slot + PANEL_GAP;
         if (this.show_cores) width += this._coreBarsWidth() + PANEL_GAP;
         if (this.show_mem) width += slot + PANEL_GAP;
-        if (this.show_disk) width += PANEL_DISK_WIDTH + PANEL_GAP;
+        if (this.show_disk) {
+            let n = Math.min(PANEL_MAX_DISKS, this._panelDisks().length);
+            if (n > 0) width += n * (this._diskBarWidth() + PANEL_GAP);
+        }
+        if (this.show_battery && this._batteryLevel !== null) {
+            width += PANEL_BATTERY_WIDTH + PANEL_GAP;
+            if (this._batteryCharging) width += PANEL_BOLT_WIDTH;
+        }
 
         this._graphArea.set_width(Math.max(0, width));
         this._graphArea.visible = width > 0;
@@ -150,6 +162,14 @@ FrameworkMonitor.prototype = {
     _coreBarsWidth: function () {
         let n = Math.max(1, this._coreValues.length);
         return Math.min(64, n * 4);
+    },
+
+    _diskBarWidth: function () {
+        return Math.max(6, this.disk_bar_width || 14);
+    },
+
+    _panelDisks: function () {
+        return this._mounts || [];
     },
 
     _onSettingsChanged: function () {
@@ -208,8 +228,21 @@ FrameworkMonitor.prototype = {
                 x += slot + PANEL_GAP;
             }
             if (this.show_disk) {
-                Draw.vbar(cr, x, PANEL_PAD_Y, PANEL_DISK_WIDTH, gh, this._diskValue,
-                    COLOR_DISK, fg);
+                let bw = this._diskBarWidth();
+                let disks = this._panelDisks().slice(0, PANEL_MAX_DISKS);
+                for (let d of disks) {
+                    Draw.usageBar(cr, x, PANEL_PAD_Y, bw, gh, d.percent / 100, fg, true);
+                    x += bw + PANEL_GAP;
+                }
+            }
+            if (this.show_battery && this._batteryLevel !== null) {
+                if (this._batteryCharging) {
+                    Draw.bolt(cr, x + PANEL_BOLT_WIDTH / 2, h / 2, gh * 0.7, fg);
+                    x += PANEL_BOLT_WIDTH;
+                }
+                let bh = Math.min(gh, 15);
+                Draw.battery(cr, x, (h - bh) / 2, PANEL_BATTERY_WIDTH, bh,
+                    this._batteryLevel, this._batteryCharging, fg);
             }
         } finally {
             // GJS will not collect the Cairo context on its own.
@@ -312,9 +345,16 @@ FrameworkMonitor.prototype = {
         s.cpuTemps = Read.sensors(this._cpuHwmon);
         s.battery = Read.battery(this._bat, this._ac);
         s.memory = Read.memory();
-        s.disk = Read.disk(this.disk_path || "/");
+        // Re-read every tick rather than caching: a drive mounted or unmounted while
+        // the applet runs should simply appear or vanish, with nothing to configure.
+        s.mounts = Read.mounts();
+        this._mounts = s.mounts;
         s.load = Read.loadAvg();
         s.uptime = Read.uptime();
+
+        this._batteryLevel = (s.battery.capacity === null)
+            ? null : s.battery.capacity / 100;
+        this._batteryCharging = (s.battery.status === "Charging");
 
         let times = Read.cpuTimes();
         s.cpu = null;
@@ -333,7 +373,6 @@ FrameworkMonitor.prototype = {
 
         if (s.cpu !== null) this._push("_cpuHistory", s.cpu.busy);
         if (s.memory !== null) this._push("_memHistory", s.memory.percent / 100);
-        this._diskValue = s.disk === null ? null : s.disk.percent / 100;
 
         // Only walk /proc while someone is looking at the result.
         if (this.menu.isOpen && s.cpu !== null) {
@@ -389,14 +428,10 @@ FrameworkMonitor.prototype = {
                 ? Math.round(s.battery.watts) + "W"
                 : s.battery.watts.toFixed(1) + " W");
         }
-        if (this.show_battery && s.battery.capacity !== null) {
-            // A leading + marks charging, so a rising percentage is not read as a
-            // draining one at a glance.
-            let mark = (s.battery.status === "Charging") ? "+" : "";
-            parts.push(mark + s.battery.capacity + "%");
-        }
+        // The battery percentage is no longer text: it is drawn inside the battery,
+        // where the number and the level are the same object rather than two.
 
-        this.set_applet_label(parts.join(compact ? " · " : "  "));
+        this.set_applet_label(parts.join("  "));
 
         let tip = [];
         if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " °C");
@@ -406,7 +441,10 @@ FrameworkMonitor.prototype = {
             tip.push("RAM " + s.memory.usedGiB.toFixed(1) + " / "
                 + s.memory.totalGiB.toFixed(1) + " GiB");
         }
-        if (s.disk) tip.push("Disk " + s.disk.freeGiB.toFixed(0) + " GiB free");
+        for (let d of (s.mounts || [])) {
+            tip.push("Disk " + d.name + " " + d.percent.toFixed(0) + "% used, "
+                + d.freeGiB.toFixed(0) + " GiB free");
+        }
         if (s.battery.capacity !== null) {
             tip.push("Battery " + s.battery.capacity + "%"
                 + (s.battery.status ? " (" + s.battery.status + ")" : ""));
@@ -507,16 +545,27 @@ FrameworkMonitor.prototype = {
     },
 
     _diskSection: function (s) {
-        if (!s.disk) return;
-        this._section("sec:disk", "Disk");
-        let d = s.disk;
-        this._canvas("disk:canvas", BAR_PANEL_HEIGHT, (cr, w, h, fg) => {
-            Draw.hbar(cr, 10, 8, w - 20, 10, d.percent / 100, COLOR_DISK, fg);
-        });
-        this._row("disk:used", this.disk_path || "/",
-            d.usedGiB.toFixed(0) + " of " + d.totalGiB.toFixed(0) + " GiB   ("
-            + d.percent.toFixed(0) + "%)", COLOR_DISK);
-        this._row("disk:free", "Free", d.freeGiB.toFixed(0) + " GiB");
+        if (!s.mounts || s.mounts.length === 0) return;
+        this._section("sec:disk", "Disks");
+
+        // Rows are keyed by mount point, so an unmounted drive's row is hidden rather
+        // than left showing a stale figure, and a newly mounted one builds its own.
+        let live = {};
+        for (let d of s.mounts) {
+            live[d.point] = true;
+            let percent = d.percent / 100;
+            this._canvas("disk:bar:" + d.point, BAR_PANEL_HEIGHT, (cr, w, h, fg) => {
+                Draw.usageBar(cr, 10, 7, w - 20, 12, percent, fg, false);
+            });
+            this._row("disk:row:" + d.point,
+                d.name + "   " + d.fstype,
+                d.usedGiB.toFixed(0) + " of " + d.totalGiB.toFixed(0) + " GiB   ("
+                + d.percent.toFixed(0) + "%,  " + d.freeGiB.toFixed(0) + " free)");
+        }
+        for (let key of Object.keys(this._rows)) {
+            let m = key.match(/^disk:(?:bar|row):(.*)$/);
+            if (m && !live[m[1]]) this._hideRow(key);
+        }
     },
 
     _sensorSection: function (s) {
