@@ -586,31 +586,22 @@ fn watch(secs: u64) {
 ///
 /// **This is an attribution, not a measurement, and the output says so.** RAPL counts
 /// joules for the whole package; nothing in Linux can tell you which process spent
-/// them. Each process is credited with package power in proportion to the CPU time it
-/// used over the sampling window.
+/// them. Each process is credited with the power above the machine's idle floor, in
+/// proportion to the CPU time it used.
 ///
-/// The denominator is the whole machine, idle time included, so the shares deliberately
-/// do NOT sum to the package figure. What is left over is the draw that continues when
-/// nothing is running: memory controller, I/O, and the package floor, measured at 3.6 W
-/// idle against 32.6 W with all twelve cores busy on this board. Dividing all of it
-/// among whatever happens to be running would credit an idle machine's baseline to the
-/// first process that twitched.
+/// Package power is averaged across the whole sampling window rather than read once.
+/// The floor it is compared against is itself a thirty-second mean, and a single 1 Hz
+/// reading is not the same statistic: measured on an idle machine, consecutive samples
+/// ranged 1.6 W to 5.5 W around a mean near 4.4 W. Subtracting a mean from an
+/// instantaneous sample produced a negative figure more often than not, which clamped
+/// the whole attribution to zero. Both sides must be averages or the comparison is
+/// meaningless.
 fn power_top(count: usize) {
-    const WINDOW: Duration = Duration::from_secs(2);
+    // Long enough that the mean is steady against the 1 Hz noise, short enough to wait
+    // for at a prompt. Also gives the per-process CPU figures a usable window.
+    const WINDOW_SECS: u64 = 8;
 
     let daemon = connect().ok();
-    let (watts, floor) = match &daemon {
-        Some((d, _)) => match Snapshot::fetch(d) {
-            Ok(s) => (s.package_watts, s.package_watts_floor),
-            Err(_) => (None, None),
-        },
-        // Without the daemon this needs root, and a floor observed over a single sample
-        // would be meaningless - the daemon earns its by watching continuously. Reported
-        // below as a missing daemon rather than as a board that cannot measure power,
-        // because those need different fixes.
-        None => (Monitor::new(Sysfs::default()).sample().package_watts, None),
-    };
-
     let cores = std::thread::available_parallelism()
         .map(|n| n.get() as f64)
         .unwrap_or(1.0);
@@ -620,12 +611,36 @@ fn power_top(count: usize) {
         std::process::exit(1);
     };
     let before = procs::sample();
-    sleep(WINDOW);
+
+    eprintln!("sampling for {WINDOW_SECS} s...");
+    let mut watt_samples: Vec<f64> = Vec::new();
+    let mut floor = None;
+    for _ in 0..WINDOW_SECS {
+        sleep(Duration::from_secs(1));
+        if let Some((d, _)) = &daemon {
+            if let Ok(s) = Snapshot::fetch(d) {
+                if let Some(w) = s.package_watts {
+                    watt_samples.push(w);
+                }
+                // The floor only falls, so the last reading is the best one.
+                floor = s.package_watts_floor;
+            }
+        }
+    }
+
     let Some(after_total) = procs::total_ticks() else {
         eprintln!("cannot read /proc/stat");
         std::process::exit(1);
     };
     let after = procs::sample();
+
+    let watts = if watt_samples.is_empty() {
+        // Without the daemon this needs root, and a floor observed over one sample would
+        // be meaningless - the daemon earns its by watching continuously.
+        Monitor::new(Sysfs::default()).sample().package_watts
+    } else {
+        Some(watt_samples.iter().sum::<f64>() / watt_samples.len() as f64)
+    };
 
     let total_delta = after_total.saturating_sub(before_total);
     let shares = procs::shares(&before, &after, total_delta, cores);
@@ -633,8 +648,7 @@ fn power_top(count: usize) {
 
     // Power above the machine's idle floor is what running processes actually cost.
     // Without a floor the only honest fallback is to scale from zero, which understates
-    // every process by whatever the machine draws doing nothing - 3.6 W of a 10 W
-    // reading, on this board.
+    // every process by whatever the machine draws doing nothing.
     let attributable = match (watts, floor) {
         (Some(w), Some(f)) => Some((w - f).max(0.0)),
         (Some(w), None) => Some(w * busy),
@@ -643,15 +657,18 @@ fn power_top(count: usize) {
 
     match (watts, floor) {
         (Some(w), Some(f)) => {
-            println!("package power   {w:>7.2} W   measured");
+            println!("package power   {w:>7.2} W   mean over {WINDOW_SECS} s");
             println!("idle floor      {f:>7.2} W   lowest the daemon has seen");
             println!(
                 "attributable    {:>7.2} W   power above that floor",
                 attributable.unwrap_or(0.0)
             );
+            if attributable == Some(0.0) {
+                println!("  the machine is drawing no more than its idle floor right now");
+            }
         }
         (Some(w), None) => {
-            println!("package power   {w:>7.2} W   measured");
+            println!("package power   {w:>7.2} W   mean over {WINDOW_SECS} s");
             println!("idle floor            -     daemon has not established one yet");
             println!("  estimates below scale from zero and understate every process");
         }
@@ -670,8 +687,8 @@ fn power_top(count: usize) {
 
     println!("{:>8}  {:>7}  {:>7}  process", "est. W", "cpu", "pid");
     for s in shares.iter().take(count) {
-        // Share of the attributable power, in proportion to CPU time. The denominator
-        // is the CPU actually measured rather than the whole machine, so the listed
+        // Share of the attributable power, in proportion to CPU time. The denominator is
+        // the CPU actually measured rather than the whole machine, so the listed
         // processes divide the attributable figure between them rather than each taking
         // a slice of the idle floor as well.
         let est = match attributable {
