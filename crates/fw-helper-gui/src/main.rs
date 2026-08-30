@@ -58,16 +58,48 @@ fn follow_desktop_color_scheme() {
         return;
     }
 
-    let Some(settings) = gtk::Settings::default() else {
-        return;
-    };
-    let theme = settings
-        .gtk_theme_name()
-        .map(|t| t.to_lowercase())
-        .unwrap_or_default();
-    if theme.contains("dark") {
+    // Ask GSettings directly rather than going through GTK.
+    //
+    // GTK4 does not read XSettings — it asks the same settings portal libadwaita just
+    // failed to get an answer from, so on Cinnamon `gtk_theme_name()` reports a bare
+    // "Adwaita" rather than the "Adwaita-dark" the session is actually using. Reading
+    // the schema itself is the only place the truth is available.
+    let prefers_dark = gsetting("org.gnome.desktop.interface", "color-scheme")
+        .is_some_and(|v| v.contains("dark"))
+        || [
+            "org.cinnamon.desktop.interface",
+            "org.gnome.desktop.interface",
+            "org.mate.interface",
+        ]
+        .iter()
+        .filter_map(|schema| gsetting(schema, "gtk-theme"))
+        .any(|theme| theme.to_lowercase().contains("dark"))
+        || gtk::Settings::default()
+            .and_then(|s| s.gtk_theme_name())
+            .is_some_and(|t| t.to_lowercase().contains("dark"));
+
+    if prefers_dark {
         manager.set_color_scheme(adw::ColorScheme::ForceDark);
     }
+}
+
+/// Read one GSettings key, or `None` if this desktop does not have it.
+///
+/// Both guards are load-bearing: constructing a `Settings` for a schema that is not
+/// installed **aborts the process**, and so does reading a key the schema does not
+/// define. Neither is a catchable error, and a GUI that dies on a desktop for having
+/// the wrong schemas installed would be a worse bug than the one this fixes.
+fn gsetting(schema_id: &str, key: &str) -> Option<String> {
+    let schema = gtk::gio::SettingsSchemaSource::default()?.lookup(schema_id, true)?;
+    if !schema.has_key(key) {
+        return None;
+    }
+    Some(
+        gtk::gio::Settings::new(schema_id)
+            .string(key)
+            .trim_matches('\'')
+            .to_string(),
+    )
 }
 
 fn main() -> glib::ExitCode {
