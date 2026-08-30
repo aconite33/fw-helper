@@ -74,7 +74,9 @@ capacity, and cycle count; and the top processes by CPU. It scrolls, because on 
 screen it is taller than the display.
 
 The dropdown's layout follows [Stats](https://github.com/exelban/stats) on macOS: gauges
-first, then history, then the breakdown, then what is responsible.
+first, then history, then the breakdown, then what is responsible. Its first entry opens
+the full application; `install-dev.sh` puts `fw-helper` on `PATH` for that, and the
+applet's settings take an explicit path if you are running from a build tree.
 
 <br clear="right">
 

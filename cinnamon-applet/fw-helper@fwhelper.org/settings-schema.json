@@ -91,6 +91,12 @@
         "type": "header",
         "description": "Other"
     },
+    "gui-command": {
+        "type": "entry",
+        "default": "fw-helper",
+        "description": "Command for \"Open fw-helper\"",
+        "tooltip": "A bare name is looked up on PATH. Give a full path to run from a build tree, e.g. ~/src/fw-helper/target/release/fw-helper"
+    },
     "proc-count": {
         "type": "spinbutton",
         "default": 5,

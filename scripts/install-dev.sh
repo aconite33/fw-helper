@@ -21,6 +21,7 @@ UNIT=/etc/systemd/system/fw-helperd.service
 BIN=/usr/libexec/fw-helperd
 RESTORE=/usr/libexec/fw-helper-restore-fan
 CTL=/usr/local/bin/fw-helperctl
+GUI=/usr/local/bin/fw-helper
 POLKIT=/usr/share/polkit-1/actions/org.fwhelper.policy
 MODPROBE=/etc/modprobe.d/fw-helper.conf
 PROFILES=/etc/fw-helper/profiles.d
@@ -47,7 +48,7 @@ fi
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl disable --now fw-helperd.service 2>/dev/null || true
-    rm -fv "$POLICY" "$UNIT" "$BIN" "$RESTORE" "$CTL" "$POLKIT" "$MODPROBE" \
+    rm -fv "$POLICY" "$UNIT" "$BIN" "$RESTORE" "$CTL" "$GUI" "$POLKIT" "$MODPROBE" \
         /etc/fw-helper/example-profile.conf
     # Leave $PROFILES and anything in it: those are the user's, not ours.
     rmdir --ignore-fail-on-non-empty "$PROFILES" /etc/fw-helper 2>/dev/null || true
@@ -78,29 +79,32 @@ if journalctl -u dbus.service --since "10 seconds ago" --no-pager 2>/dev/null \
         | grep -A2 "org.fwhelper.Daemon1.conf" >&2
 fi
 
-# Put the CLI on PATH via a shim that resolves the newest build at RUN time.
+# Put the CLI and the GUI on PATH via shims that resolve the newest build at RUN time.
 #
 # A plain symlink to target/release goes stale the moment you rebuild only debug,
 # and then behaves like an older version of the program, which looks exactly like a
 # bug in the daemon rather than a stale binary. Resolving per-invocation removes the
 # failure mode instead of narrowing it. Packaging (M7) installs a real binary.
+#
 # Remove first, ALWAYS. `cat >` follows symlinks, and older versions of this script
 # installed $CTL as a symlink to target/release/fw-helperctl. Writing through it
 # overwrote the real binary with this shim, which then exec'd itself forever at 100%
 # CPU. Worse, cargo hardlinks that path into target/release/deps, so the build
 # artifact was clobbered too and cargo considered it fresh and would not rebuild.
 # Measured 2026-08-21. Never write to a path in this script without unlinking it.
-rm -f "$CTL"
-cat > "$CTL" <<SHIM
+install_shim() {
+    local name=$1 dest=$2
+    rm -f "$dest"
+    cat > "$dest" <<SHIM
 #!/bin/sh
 # fw-helper development shim, installed by scripts/install-dev.sh
-R="$REPO/target/release/fw-helperctl"
-D="$REPO/target/debug/fw-helperctl"
+R="$REPO/target/release/$name"
+D="$REPO/target/debug/$name"
 # Belt and braces against the failure above: if a build path is somehow this shim,
 # exec'ing it would loop forever. Say so instead of spinning.
 for c in "\$R" "\$D"; do
     if [ -f "\$c" ] && head -c 2 "\$c" 2>/dev/null | grep -q '^#!'; then
-        echo "fw-helperctl: \$c is a script, not a build. Rebuild:" >&2
+        echo "$name: \$c is a script, not a build. Rebuild:" >&2
         echo "  rm -f \$c && cargo build --release --all" >&2
         exit 1
     fi
@@ -111,11 +115,17 @@ fi
 if [ -x "\$D" ]; then
     exec "\$D" "\$@"
 fi
-echo "fw-helperctl: no build found; run 'cargo build --all' in $REPO" >&2
+echo "$name: no build found; run 'cargo build --all' in $REPO" >&2
 exit 1
 SHIM
-chmod 755 "$CTL"
-echo "installed shim: $CTL (resolves newest build at run time)"
+    chmod 755 "$dest"
+    echo "installed shim: $dest (resolves newest build at run time)"
+}
+
+install_shim fw-helperctl "$CTL"
+# The GUI too, so the Cinnamon applet's "Open fw-helper" item finds it on PATH
+# without needing a build path typed into its settings.
+install_shim fw-helper "$GUI"
 
 install -m 644 -v "$REPO/data/org.fwhelper.policy" "$POLKIT"
 

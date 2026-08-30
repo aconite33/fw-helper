@@ -21,6 +21,7 @@ const Main = imports.ui.main;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
+const Util = imports.misc.util;
 const St = imports.gi.St;
 
 // Cinnamon's own multi-file applets (calendar, grouped-window-list) use require() for
@@ -153,7 +154,7 @@ FrameworkMonitor.prototype = {
                          "show-battery", "show-cpu", "show-mem", "show-disk",
                          "show-cores", "disk-bar-width", "graph-width", "compact",
                          "battery-width",
-                         "show-icon", "proc-count"]) {
+                         "show-icon", "proc-count", "gui-command"]) {
             this.settings.bind(key, key.replace(/-/g, "_"),
                 () => this._onSettingsChanged());
         }
@@ -185,6 +186,17 @@ FrameworkMonitor.prototype = {
         this._menuSection = new PopupMenu.PopupMenuSection();
         this._menuBox.add(this._menuSection.actor);
         this._rows = {};
+
+        // Added before anything else so it stays at the top: the dropdown is taller
+        // than the screen and scrolls, and a launcher at the bottom would need hunting
+        // for. _rows is still empty here, so the CPU section below adds no separator of
+        // its own and this one is not doubled.
+        this._launcher = new PopupMenu.PopupIconMenuItem(
+            "Open fw-helper", "utilities-system-monitor-symbolic", St.IconType.SYMBOLIC);
+        this._launcher.connect("activate", () => this._launchGui());
+        this._menuSection.addMenuItem(this._launcher);
+        this._menuSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._updateLauncher();
         // Processes are the expensive reading, so they are only gathered while the menu
         // is actually showing them - and gathered at once on opening rather than after
         // the next tick, so the list is never a blank first impression.
@@ -195,6 +207,7 @@ FrameworkMonitor.prototype = {
             let monitor = Main.layoutManager.primaryMonitor;
             let cap = Math.max(240, Math.round(monitor.height * 0.75));
             this._scroll.style = "max-height: " + cap + "px;";
+            this._updateLauncher();
             this._update();
         });
 
@@ -205,6 +218,37 @@ FrameworkMonitor.prototype = {
         // No deferred re-measure here. Cairo measures against a font face and size it
         // is given directly, so unlike a widget it does not need the theme to have
         // settled first - the answer is the same on the first tick as on the hundredth.
+    },
+
+    /* The GUI command, or null when it cannot be found.
+     *
+     * A bare name is looked up on PATH; anything containing a slash is taken as a path
+     * and tested directly, so a build tree works without installing. Returning null
+     * rather than spawning optimistically means the menu can say the binary is missing
+     * instead of the click appearing to do nothing.
+     */
+    _guiCommand: function () {
+        let command = (this.gui_command || "").trim() || "fw-helper";
+        let program = command.split(/\s+/)[0];
+        if (program.indexOf("/") !== -1) {
+            return GLib.file_test(program, GLib.FileTest.IS_EXECUTABLE) ? command : null;
+        }
+        return GLib.find_program_in_path(program) ? command : null;
+    },
+
+    _updateLauncher: function () {
+        let command = this._guiCommand();
+        this._launcher.setSensitive(command !== null);
+        this._launcher.label.set_text(command !== null
+            ? "Open fw-helper"
+            : "fw-helper not found \u2014 set its path in this applet's settings");
+    },
+
+    _launchGui: function () {
+        let command = this._guiCommand();
+        if (command === null) return;
+        Util.spawnCommandLine(command);
+        this.menu.close();
     },
 
     _resolve: function () {
