@@ -82,6 +82,20 @@ const TEXT_GAP = 8;
  * own slot instead of resizing the applet. */
 const TEXT_SIZE = 13;
 
+/* HiDPI. Cinnamon's stage is in device pixels and code is expected to multiply by
+ * global.ui_scale itself - which is why every size in this file was rendering at half
+ * its intended dimensions on a 192-DPI panel: a 40px panel is 80 device pixels tall,
+ * and a 13px font drawn into it reads as 6.5.
+ *
+ * Rather than scale each constant at the point of use, the Cairo context is scaled once
+ * per repaint. Every coordinate below is then in logical pixels and lands at the right
+ * physical size on any display.
+ */
+function uiScale() {
+    let scale = (typeof global !== "undefined") ? global.ui_scale : 1;
+    return (!scale || scale <= 0) ? 1 : scale;
+}
+
 function nowSeconds() {
     return GLib.get_monotonic_time() / 1000000;
 }
@@ -123,6 +137,7 @@ FrameworkMonitor.prototype = {
         this._fieldWidths = {};
         this._fields = [];
         this._debug = (GLib.getenv("FW_HELPER_APPLET_DEBUG") !== null);
+        this._scale = uiScale();
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
         this._graphArea.connect("repaint", (area) => this._drawPanel(area));
@@ -231,7 +246,9 @@ FrameworkMonitor.prototype = {
         this._measureFields();
         width += this._textWidth();
 
-        this._graphArea.set_width(Math.max(0, width));
+        // Reserved in device pixels; everything drawn into it is in logical ones.
+        this._scale = uiScale();
+        this._graphArea.set_width(Math.max(0, Math.ceil(width * this._scale)));
         this._graphArea.visible = width > 0;
 
         // History is one sample per pixel column, so a width change resizes it.
@@ -352,8 +369,11 @@ FrameworkMonitor.prototype = {
     _drawPanel: function (area) {
         let cr = area.get_context();
         try {
-            let [w, h] = area.get_surface_size();
-            if (w <= 0 || h <= 0) return;
+            let [surfaceW, surfaceH] = area.get_surface_size();
+            if (surfaceW <= 0 || surfaceH <= 0) return;
+            let scale = this._scale;
+            cr.scale(scale, scale);
+            let w = surfaceW / scale, h = surfaceH / scale;
             let fg = this._fg(area);
             let gh = Math.max(6, h - PANEL_PAD_Y * 2);
             let slot = this._slotWidth();
@@ -435,11 +455,12 @@ FrameworkMonitor.prototype = {
             let dot = null;
             if (color) {
                 dot = new St.DrawingArea({ style_class: "fw-helper-swatch" });
-                dot.set_width(10);
-                dot.set_height(10);
+                dot.set_width(Math.ceil(10 * this._scale));
+                dot.set_height(Math.ceil(10 * this._scale));
                 dot.connect("repaint", (a) => {
                     let cr = a.get_context();
                     try {
+                        cr.scale(this._scale, this._scale);
                         Draw.swatch(cr, 0, 1, 8, color);
                     } finally {
                         cr.$dispose();
@@ -473,13 +494,16 @@ FrameworkMonitor.prototype = {
             let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
             item.actor.add_style_class_name("fw-helper-row");
             let area = new St.DrawingArea({ style_class: "fw-helper-canvas" });
-            area.set_width(MENU_WIDTH);
-            area.set_height(height);
+            area.set_width(Math.ceil(MENU_WIDTH * this._scale));
+            area.set_height(Math.ceil(height * this._scale));
             area.connect("repaint", (a) => {
                 let cr = a.get_context();
                 try {
-                    let [w, h] = a.get_surface_size();
-                    this._rows[key].paint(cr, w, h, this._fg(a));
+                    let [surfaceW, surfaceH] = a.get_surface_size();
+                    let scale = this._scale;
+                    cr.scale(scale, scale);
+                    this._rows[key].paint(cr, surfaceW / scale, surfaceH / scale,
+                        this._fg(a));
                 } finally {
                     cr.$dispose();
                 }

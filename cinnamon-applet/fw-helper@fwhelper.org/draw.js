@@ -18,27 +18,42 @@ function clamp01(v) {
     return Math.max(0, Math.min(1, v));
 }
 
-/* HSV so a usage ramp can travel around the colour wheel. A straight RGB interpolation
- * from green to purple passes through a muddy grey at the midpoint, which is exactly
- * where a half-full disk would sit. */
-function hsv(h, s, v) {
-    h = ((h % 360) + 360) % 360;
-    let c = v * s;
-    let x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-    let m = v - c;
-    let rgb;
-    if (h < 60) rgb = [c, x, 0];
-    else if (h < 120) rgb = [x, c, 0];
-    else if (h < 180) rgb = [0, c, x];
-    else if (h < 240) rgb = [0, x, c];
-    else if (h < 300) rgb = [x, 0, c];
-    else rgb = [c, 0, x];
-    return [rgb[0] + m, rgb[1] + m, rgb[2] + m];
-}
+/* The usage ramp, as explicit stops.
+ *
+ * Blue, green, yellow, orange, red, purple. This is not a hue sweep and cannot be one:
+ * the hues run 240 -> 120 -> 60 -> 30 -> 0 and then wrap to 285, so interpolating the
+ * hue angle would travel the wrong way round the wheel and put cyan where yellow
+ * belongs. Interpolating RGB between adjacent stops keeps each named colour where it
+ * was put, and the stops are close enough together that the muddy midpoint an RGB
+ * interpolation can produce over a long span never appears.
+ *
+ * Purple past red is deliberate - it reads as "beyond full" rather than as another
+ * shade of warning, which is what a nearly-full disk deserves.
+ */
+const USAGE_STOPS = [
+    [0.00, [0.20, 0.48, 0.95]], // blue
+    [0.25, [0.24, 0.74, 0.36]], // green
+    [0.50, [0.95, 0.84, 0.22]], // yellow
+    [0.68, [0.97, 0.60, 0.16]], // orange
+    [0.86, [0.90, 0.25, 0.22]], // red
+    [1.00, [0.64, 0.29, 0.86]], // purple
+];
 
-/* Green when empty, purple when full, travelling through teal and blue. */
 function usageColor(t) {
-    return hsv(120 + clamp01(t) * 165, 0.62, 0.82);
+    t = clamp01(t);
+    for (let i = 1; i < USAGE_STOPS.length; i++) {
+        let [pos, color] = USAGE_STOPS[i];
+        if (t > pos && i < USAGE_STOPS.length - 1) continue;
+        let [prevPos, prevColor] = USAGE_STOPS[i - 1];
+        let span = pos - prevPos;
+        let k = span <= 0 ? 0 : (t - prevPos) / span;
+        return [
+            prevColor[0] + (color[0] - prevColor[0]) * k,
+            prevColor[1] + (color[1] - prevColor[1]) * k,
+            prevColor[2] + (color[2] - prevColor[2]) * k,
+        ];
+    }
+    return USAGE_STOPS[0][1];
 }
 
 function roundRect(cr, x, y, w, h, r) {
@@ -276,8 +291,8 @@ function usageBar(cr, x, y, w, h, value, fg, vertical) {
         : new Cairo.LinearGradient(x, y, x + w, y);
     // Sampled rather than two stops: the interpolation has to happen in HSV, and a
     // Cairo gradient can only interpolate the RGB it is given.
-    for (let i = 0; i <= 12; i++) {
-        let t = i / 12;
+    for (let i = 0; i <= 24; i++) {
+        let t = i / 24;
         let c = usageColor(t);
         g.addColorStopRGBA(t, c[0], c[1], c[2], 0.92);
     }
@@ -363,7 +378,7 @@ function bolt(cr, cx, cy, h, fg) {
 }
 
 module.exports = {
-    clamp01, hsv, usageColor, roundRect,
+    clamp01, usageColor, roundRect,
     text, centeredText, haloText, measure, label, spark, vbar, hbar, usageBar, ring, cores, swatch,
     battery, batteryColor, bolt,
 };
