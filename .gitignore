@@ -6,3 +6,7 @@ Cargo.lock
 
 # Built packages (scripts/build-deb.sh)
 *.deb
+
+# Compiled hardware probes (scripts/probe-*.c); build them where you run them
+/probe-ec-amd
+/probe-fan-amd

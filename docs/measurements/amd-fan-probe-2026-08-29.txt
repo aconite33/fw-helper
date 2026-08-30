@@ -1,0 +1,36 @@
+== baseline (EC owns the fan) ==
+    hwmon=0 ec_target=0
+
+== taking manual control at 40% duty ==
+  command accepted
+    manual40       t+1 s  hwmon=3034   ec_target=0
+    manual40       t+2 s  hwmon=3932   ec_target=0
+    manual40       t+3 s  hwmon=3996   ec_target=0
+    manual40       t+4 s  hwmon=3996   ec_target=0
+    manual40       t+5 s  hwmon=3963   ec_target=0
+    manual40       t+6 s  hwmon=4012   ec_target=0
+
+== raising to 70% duty ==
+    manual70       t+1 s  hwmon=5682   ec_target=0
+    manual70       t+2 s  hwmon=6182   ec_target=0
+    manual70       t+3 s  hwmon=6221   ec_target=0
+    manual70       t+4 s  hwmon=6144   ec_target=0
+    manual70       t+5 s  hwmon=6221   ec_target=0
+    manual70       t+6 s  hwmon=6105   ec_target=0
+
+== releasing to EC automatic ==
+  THERMAL_AUTO_FAN_CTRL issued
+    released       t+1 s  hwmon=5313   ec_target=0
+    released       t+2 s  hwmon=0      ec_target=0
+    released       t+3 s  hwmon=0      ec_target=0
+    released       t+4 s  hwmon=0      ec_target=0
+    released       t+5 s  hwmon=0      ec_target=0
+    released       t+6 s  hwmon=0      ec_target=0
+    released       t+7 s  hwmon=0      ec_target=0
+    released       t+8 s  hwmon=0      ec_target=0
+
+Interpretation:
+  - RPM rose with duty, then fell after release -> manual control works
+    AND the EC reclaims cleanly. Both halves are required.
+  - RPM stayed high after release -> DO NOT build fan control on this;
+    the release path is the whole safety story (ADR 0006).

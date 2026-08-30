@@ -1,0 +1,10 @@
+== EC features (0x000D) ==
+  flags[0]=0x0207E6AE flags[1]=0x00000207
+  EC_FEATURE_PWM_FAN (bit 2)         YES - fan duty control exists
+  EC_FEATURE_THERMAL (bit 10)        YES
+
+== Fan RPM via EC (0x0020) ==
+  target rpm = 0
+
+== Framework charge limit (0x3E03, ADR 0012) ==
+  max=100% min=0%   <- the limit that governs charging
