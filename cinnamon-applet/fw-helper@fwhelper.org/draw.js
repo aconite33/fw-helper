@@ -87,6 +87,33 @@ function centeredText(cr, cx, cy, str, size, color, alpha) {
     cr.newPath();
 }
 
+/* Text with a contrasting halo, for digits that sit on top of a coloured fill.
+ *
+ * The number inside a battery straddles the fill edge: part of it is over the fill and
+ * part over the empty track, so no single colour is legible against both. Outlining it
+ * in the inverse of the foreground works on either - a dark halo under light text on a
+ * dark panel, and the reverse on a light one.
+ */
+function haloText(cr, cx, cy, str, size, fg) {
+    cr.selectFontFace("Sans", 0, 1); // normal slant, bold weight
+    cr.setFontSize(size);
+    let ext = cr.textExtents(str);
+    let w = extent(ext, "width", "width");
+    let h = extent(ext, "height", "height");
+    let xb = extent(ext, "xBearing", "x_bearing");
+    let yb = extent(ext, "yBearing", "y_bearing");
+
+    cr.moveTo(cx - w / 2 - xb, cy - h / 2 - yb);
+    cr.textPath(str);
+    cr.setLineWidth(3);
+    cr.setLineJoin(1); // ROUND, so the halo has no spikes at the corners
+    cr.setSourceRGBA(1 - fg[0], 1 - fg[1], 1 - fg[2], 0.8);
+    cr.strokePreserve();
+    cr.setSourceRGBA(fg[0], fg[1], fg[2], 1.0);
+    cr.fill();
+    cr.newPath();
+}
+
 /* Filled area chart. History runs oldest-to-newest, left to right, values 0..1. */
 function spark(cr, x, y, w, h, history, color, fg) {
     cr.setSourceRGBA(fg[0], fg[1], fg[2], 0.10);
@@ -242,13 +269,15 @@ function battery(cr, x, y, w, h, level, charging, fg) {
     let filled = innerW * clamp01(level);
     if (filled > 0) {
         let color = batteryColor(level, charging);
-        cr.setSourceRGBA(color[0], color[1], color[2], 0.80);
+        // Kept below full opacity so the digits over it stay readable; the halo on the
+        // text does the rest of that work.
+        cr.setSourceRGBA(color[0], color[1], color[2], 0.70);
         roundRect(cr, x + inset, y + inset, Math.max(1.5, filled), h - inset * 2, 1.5);
         cr.fill();
     }
 
-    centeredText(cr, x + bodyW / 2, y + h / 2 + 0.5,
-        String(Math.round(clamp01(level) * 100)), h * 0.62, fg, 0.95);
+    haloText(cr, x + bodyW / 2, y + h / 2, String(Math.round(clamp01(level) * 100)),
+        h * 0.72, fg);
 }
 
 /* Green while there is plenty, warning colours as it runs out. Charging keeps green:
@@ -263,7 +292,7 @@ function batteryColor(level, charging) {
 /* Charging bolt, drawn beside the battery rather than inside it - two digits and a bolt
  * do not both fit legibly at panel size. */
 function bolt(cr, cx, cy, h, fg) {
-    let w = h * 0.5;
+    let w = h * 0.42;
     cr.moveTo(cx + w * 0.15, cy - h / 2);
     cr.lineTo(cx - w * 0.5, cy + h * 0.12);
     cr.lineTo(cx - w * 0.05, cy + h * 0.12);
@@ -277,6 +306,6 @@ function bolt(cr, cx, cy, h, fg) {
 
 module.exports = {
     clamp01, hsv, usageColor, roundRect,
-    text, centeredText, spark, vbar, hbar, usageBar, ring, cores, swatch,
+    text, centeredText, haloText, spark, vbar, hbar, usageBar, ring, cores, swatch,
     battery, batteryColor, bolt,
 };

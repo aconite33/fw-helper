@@ -17,6 +17,7 @@
 
 const Applet = imports.ui.applet;
 const GLib = imports.gi.GLib;
+const Main = imports.ui.main;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
@@ -35,8 +36,8 @@ const COLOR_BATTERY = [0.42, 0.76, 0.42];
 
 const PANEL_GAP = 4;
 const PANEL_PAD_Y = 3;
-const PANEL_BATTERY_WIDTH = 34;
-const PANEL_BOLT_WIDTH = 8;
+const PANEL_BATTERY_WIDTH = 42;
+const PANEL_BOLT_WIDTH = 10;
 /* Beyond this the panel is a disk manager rather than a readout; the dropdown still
  * lists every mount. */
 const PANEL_MAX_DISKS = 4;
@@ -128,12 +129,40 @@ FrameworkMonitor.prototype = {
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
+
+        // The dropdown is taller than a laptop screen once every sensor, disk and
+        // process has a row, and an over-tall popup does not scroll on its own - it
+        // just runs off the top, taking the CPU section and the first disk with it.
+        this._menuBox = new St.BoxLayout({ vertical: true });
+        this._scroll = new St.ScrollView({
+            x_fill: true, y_fill: true, y_align: St.Align.START,
+            style_class: "vfade",
+        });
+        this._scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
+        this._scroll.set_clip_to_allocation(true);
+        this._scroll.add_actor(this._menuBox);
+        this.menu.addActor(this._scroll);
+
+        // While a drag is in progress the menu must not treat the motion as a click
+        // outside itself and close.
+        let vscroll = this._scroll.get_vscroll_bar();
+        vscroll.connect("scroll-start", () => { this.menu.passEvents = true; });
+        vscroll.connect("scroll-stop", () => { this.menu.passEvents = false; });
+
+        this._menuSection = new PopupMenu.PopupMenuSection();
+        this._menuBox.add(this._menuSection.actor);
         this._rows = {};
         // Processes are the expensive reading, so they are only gathered while the menu
         // is actually showing them - and gathered at once on opening rather than after
         // the next tick, so the list is never a blank first impression.
         this.menu.connect("open-state-changed", (menu, open) => {
-            if (open) this._update();
+            if (!open) return;
+            // Measured against the monitor rather than fixed in CSS: the same applet
+            // runs on a 1504-tall laptop panel and on an external display.
+            let monitor = Main.layoutManager.primaryMonitor;
+            let cap = Math.max(240, Math.round(monitor.height * 0.75));
+            this._scroll.style = "max-height: " + cap + "px;";
+            this._update();
         });
 
         this._resolve();
@@ -290,7 +319,7 @@ FrameworkMonitor.prototype = {
                     Draw.bolt(cr, x + PANEL_BOLT_WIDTH / 2, h / 2, gh * 0.7, fg);
                     x += PANEL_BOLT_WIDTH;
                 }
-                let bh = Math.min(gh, 15);
+                let bh = Math.min(gh, 19);
                 Draw.battery(cr, x, (h - bh) / 2, PANEL_BATTERY_WIDTH, bh,
                     this._batteryLevel, this._batteryCharging, fg);
             }
@@ -305,18 +334,20 @@ FrameworkMonitor.prototype = {
     _section: function (key, title) {
         if (this._rows[key]) return;
         if (Object.keys(this._rows).length > 0) {
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            this._menuSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         }
         let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+        item.actor.add_style_class_name("fw-helper-row");
         let label = new St.Label({ text: title, style_class: "fw-helper-section" });
         item.addActor(label, { expand: true });
-        this.menu.addMenuItem(item);
+        this._menuSection.addMenuItem(item);
         this._rows[key] = true;
     },
 
     _row: function (key, label, value, color) {
         if (!this._rows[key]) {
             let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+            item.actor.add_style_class_name("fw-helper-row");
             let box = new St.BoxLayout();
             let dot = null;
             if (color) {
@@ -338,7 +369,7 @@ FrameworkMonitor.prototype = {
             let right = new St.Label({ text: "—", style_class: "fw-helper-value" });
             item.addActor(box, { expand: true });
             item.addActor(right, { align: St.Align.END });
-            this.menu.addMenuItem(item);
+            this._menuSection.addMenuItem(item);
             this._rows[key] = { item: item, left: left, right: right };
         }
         let row = this._rows[key];
@@ -357,6 +388,7 @@ FrameworkMonitor.prototype = {
     _canvas: function (key, height, paint) {
         if (!this._rows[key]) {
             let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+            item.actor.add_style_class_name("fw-helper-row");
             let area = new St.DrawingArea({ style_class: "fw-helper-canvas" });
             area.set_width(MENU_WIDTH);
             area.set_height(height);
@@ -370,7 +402,7 @@ FrameworkMonitor.prototype = {
                 }
             });
             item.addActor(area, { expand: true });
-            this.menu.addMenuItem(item);
+            this._menuSection.addMenuItem(item);
             this._rows[key] = { item: item, area: area, paint: paint };
         }
         this._rows[key].paint = paint;

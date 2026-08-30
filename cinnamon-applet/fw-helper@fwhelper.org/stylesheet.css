@@ -47,3 +47,13 @@
 .fw-helper-canvas {
     padding: 2px 0;
 }
+
+/* Cinnamon's default menu row is padded for a menu of a dozen entries, not the fifty
+ * this dropdown carries. Scoped to our own class rather than .popup-menu-item, because
+ * an applet stylesheet is loaded into the shared theme and a bare rule there would
+ * shrink every menu on the desktop. */
+.fw-helper-row {
+    padding-top: 1px;
+    padding-bottom: 1px;
+    min-height: 0;
+}
