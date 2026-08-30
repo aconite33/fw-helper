@@ -5,6 +5,8 @@
 //! daemon is installed, but then package power needs root, because `energy_uj` is
 //! 0400 (the PLATYPUS mitigation, ADR 0009).
 
+mod procs;
+
 use fw_helper_client::{connect, DaemonProxyBlocking, Snapshot, SUPPORTED_VERSION};
 use fw_helper_core::{Monitor, Sysfs};
 use std::thread::sleep;
@@ -16,6 +18,7 @@ fw-helperctl — Framework laptop firmware control
 USAGE:
     fw-helperctl status          capabilities and one telemetry sample
     fw-helperctl watch [secs]    live telemetry, 1 Hz (default 10s)
+    fw-helperctl power-top [N]   processes ranked by estimated power (default 5)
     fw-helperctl charge-limit N  set the battery charge limit (20-100)
     fw-helperctl fan N           pin the fan at duty N (0, or 30-255)
     fw-helperctl fan auto        hand the fan back to the EC
@@ -39,6 +42,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("status") | None => status(),
         Some("watch") => watch(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10)),
+        Some("power-top") => power_top(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5)),
         Some("charge-limit") => charge_limit(args.get(1).map(String::as_str)),
         Some("fan") => fan(args.get(1).map(String::as_str)),
         Some("power-limit") => power_limit(args.get(1).map(String::as_str)),
@@ -576,4 +580,96 @@ fn watch(secs: u64) {
             .unwrap_or_else(|| "-".into());
         println!("{i:>5}s  {power:>9}  {fan:>8}  {cpu:>9}");
     }
+}
+
+/// Rank processes by their estimated share of package power.
+///
+/// **This is an attribution, not a measurement, and the output says so.** RAPL counts
+/// joules for the whole package; nothing in Linux can tell you which process spent
+/// them. Each process is credited with package power in proportion to the CPU time it
+/// used over the sampling window.
+///
+/// The denominator is the whole machine, idle time included, so the shares deliberately
+/// do NOT sum to the package figure. What is left over is the draw that continues when
+/// nothing is running: memory controller, I/O, and the package floor, measured at 3.6 W
+/// idle against 32.6 W with all twelve cores busy on this board. Dividing all of it
+/// among whatever happens to be running would credit an idle machine's baseline to the
+/// first process that twitched.
+fn power_top(count: usize) {
+    const WINDOW: Duration = Duration::from_secs(2);
+
+    let daemon = connect().ok();
+    let watts = match &daemon {
+        Some((d, _)) => Snapshot::fetch(d).ok().and_then(|s| s.package_watts),
+        // Without the daemon this needs root. Reported below as a missing daemon rather
+        // than as a board that cannot measure power, because those need different fixes.
+        None => Monitor::new(Sysfs::default()).sample().package_watts,
+    };
+
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as f64)
+        .unwrap_or(1.0);
+
+    let Some(before_total) = procs::total_ticks() else {
+        eprintln!("cannot read /proc/stat");
+        std::process::exit(1);
+    };
+    let before = procs::sample();
+    sleep(WINDOW);
+    let Some(after_total) = procs::total_ticks() else {
+        eprintln!("cannot read /proc/stat");
+        std::process::exit(1);
+    };
+    let after = procs::sample();
+
+    let total_delta = after_total.saturating_sub(before_total);
+    let shares = procs::shares(&before, &after, total_delta, cores);
+    let busy: f64 = shares.iter().map(|s| s.of_machine).sum();
+
+    match watts {
+        Some(w) => {
+            println!("package power   {w:>7.2} W   measured");
+            println!(
+                "attributed      {:>7.2} W   to the processes below",
+                w * busy
+            );
+            println!(
+                "unattributed    {:>7.2} W   baseline, memory controller, I/O",
+                w * (1.0 - busy)
+            );
+        }
+        None => {
+            println!("package power   unavailable");
+            if daemon.is_none() {
+                println!("  fw-helperd is not running, and energy_uj needs root without it");
+            }
+        }
+    }
+    println!(
+        "machine busy    {:>7.1} %   across {cores:.0} cores",
+        busy * 100.0
+    );
+    println!();
+
+    println!("{:>8}  {:>7}  {:>7}  process", "est. W", "cpu", "pid");
+    for s in shares.iter().take(count) {
+        let est = match watts {
+            Some(w) => format!("{:.2}", w * s.of_machine),
+            None => "-".to_string(),
+        };
+        let name: String = s.name.chars().take(28).collect();
+        println!(
+            "{est:>8}  {:>6.1}%  {:>7}  {name}",
+            s.cpu_cores * 100.0,
+            s.pid
+        );
+    }
+    if shares.is_empty() {
+        println!("  (nothing used measurable CPU during the window)");
+    }
+
+    println!();
+    println!("Estimated from CPU time alone. GPU, disk and radio draw are not");
+    println!("attributable this way, and a process that wakes the CPU often costs more");
+    println!("than its CPU time suggests.");
 }

@@ -1,0 +1,11 @@
+== RAPL domains, 6s per phase, 12 CPUs ==
+
+  idle             package   3.609 W   core   0.003 W   core/package   0.1%
+  all 12 cores     package  32.607 W   core   7.799 W   core/package  23.9%
+  cpu0 only        package   9.437 W   core   6.695 W   core/package  70.9%
+  cpu1 only        package   7.434 W   core   0.014 W   core/package   0.2%
+
+How to read this:
+  - core rises with package on ALL phases     -> whole-CPU domain, usable as a total
+  - core rises only on "cpu0 only"            -> per-core MSR for CPU0; NOT a total
+  - core never rises                          -> domain is not wired up; ignore it
