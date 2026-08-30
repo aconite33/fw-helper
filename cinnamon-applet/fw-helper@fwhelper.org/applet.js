@@ -225,10 +225,14 @@ FrameworkMonitor.prototype = {
             width += PANEL_BATTERY_WIDTH + PANEL_BOLT_WIDTH + PANEL_GAP;
         }
 
-        this._graphArea.set_width(Math.max(0, width));
-        this._graphArea.visible = width > 0;
+        // Text slots are part of the same canvas, so they must be counted BEFORE the
+        // width is applied. Adding them afterwards leaves the area too narrow and the
+        // readings are drawn past its right edge, where they are clipped away entirely.
         this._measureFields();
         width += this._textWidth();
+
+        this._graphArea.set_width(Math.max(0, width));
+        this._graphArea.visible = width > 0;
 
         // History is one sample per pixel column, so a width change resizes it.
         let max = slot;
