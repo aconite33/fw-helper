@@ -1,24 +1,26 @@
 /*
  * Framework Monitor - a Cinnamon panel readout for the Framework Laptop 13.
  *
- * Reads sysfs directly rather than talking to fw-helperd. Every value shown here is
- * world-readable on this board - the cros_ec temperatures, fan1_input, and the battery's
- * current/voltage - so the applet needs no daemon, no D-Bus policy and no root, and it
- * keeps working when the daemon is stopped. If it ever needs to show something only the
- * daemon knows (a duty we are commanding, rather than an RPM firmware chose), that is
- * the point to add D-Bus, not before.
+ * Shows CPU temperature, fan speed, battery draw, CPU load, memory and disk usage.
  *
- * Two hardware facts drive the shape of this file, both learned the hard way elsewhere
- * in this project:
+ * Reads /proc and sysfs directly rather than talking to fw-helperd. Every value shown
+ * here is world-readable - the cros_ec temperatures, fan1_input, the battery's
+ * current/voltage, /proc/stat and /proc/meminfo - so the applet needs no daemon, no
+ * D-Bus policy and no root, and it keeps working when the daemon is stopped. If it ever
+ * needs to show something only the daemon knows (a duty we are commanding, rather than
+ * an RPM firmware chose), that is the point to add D-Bus, not before.
+ *
+ * Hardware facts that drive the shape of this file, learned the hard way elsewhere in
+ * this project:
  *
  *   - hwmon indices are NOT stable across boots. Every node is resolved by reading its
  *     `name` file, never by index, and re-resolved whenever a read fails.
  *   - Battery power is only meaningful while discharging. On mains, `current_now`
  *     describes what is going INTO the battery, which is not what the machine is using.
- *     Shown as "on AC" rather than as a number that means something else.
  */
 
 const Applet = imports.ui.applet;
+const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
@@ -27,8 +29,10 @@ const St = imports.gi.St;
 
 const HWMON = "/sys/class/hwmon";
 const POWER_SUPPLY = "/sys/class/power_supply";
+const KIB_PER_GIB = 1048576;
+const BYTES_PER_GIB = 1073741824;
 
-/* ---------- sysfs helpers ------------------------------------------------ */
+/* ---------- sysfs / proc helpers ----------------------------------------- */
 
 function readFile(path) {
     try {
@@ -143,6 +147,76 @@ function readBattery(batDir, acDir) {
     return out;
 }
 
+/* Cumulative CPU jiffies since boot. Load is a RATE, so a single sample says nothing -
+ * it has to be differenced against the previous one. */
+function readCpuTimes() {
+    let text = readFile("/proc/stat");
+    if (text === null) return null;
+    let line = text.split("\n")[0];
+    if (!line.startsWith("cpu ")) return null;
+    let fields = line.trim().split(/\s+/).slice(1).map(Number);
+    if (fields.length < 5 || fields.some(isNaN)) return null;
+    // idle + iowait: the machine is not doing work in either.
+    return {
+        idle: fields[3] + fields[4],
+        total: fields.reduce((a, b) => a + b, 0),
+    };
+}
+
+function readMemory() {
+    let text = readFile("/proc/meminfo");
+    if (text === null) return null;
+    let kv = {};
+    for (let line of text.split("\n")) {
+        let m = line.match(/^(\w+):\s+(\d+)/);
+        if (m) kv[m[1]] = parseInt(m[2], 10); // kB
+    }
+    if (!kv.MemTotal) return null;
+
+    // MemAvailable, not MemFree. Free excludes reclaimable page cache, so on any
+    // machine that has been up a while it reports nearly everything as "used" - which
+    // is true of the kernel's bookkeeping and useless as a description of pressure.
+    let available = (kv.MemAvailable !== undefined) ? kv.MemAvailable : kv.MemFree;
+    let used = kv.MemTotal - available;
+
+    let swapTotal = kv.SwapTotal || 0;
+    return {
+        totalGiB: kv.MemTotal / KIB_PER_GIB,
+        usedGiB: used / KIB_PER_GIB,
+        percent: (used / kv.MemTotal) * 100,
+        swapTotalGiB: swapTotal / KIB_PER_GIB,
+        swapUsedGiB: (swapTotal - (kv.SwapFree || 0)) / KIB_PER_GIB,
+    };
+}
+
+function readDisk(path) {
+    try {
+        let info = Gio.File.new_for_path(path)
+            .query_filesystem_info("filesystem::size,filesystem::free", null);
+        let size = info.get_attribute_uint64("filesystem::size");
+        let free = info.get_attribute_uint64("filesystem::free");
+        if (!size) return null;
+        let used = size - free;
+        return {
+            totalGiB: size / BYTES_PER_GIB,
+            usedGiB: used / BYTES_PER_GIB,
+            freeGiB: free / BYTES_PER_GIB,
+            // Against total, so this can read a percent or two below `df`, which
+            // computes against the space actually available to a non-root user.
+            percent: (used / size) * 100,
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+function readLoadAvg() {
+    let text = readFile("/proc/loadavg");
+    if (text === null) return null;
+    let f = text.split(/\s+/);
+    return (f.length >= 3) ? f.slice(0, 3).join("  ") : null;
+}
+
 /* ---------- applet ------------------------------------------------------- */
 
 function FrameworkMonitor(metadata, orientation, panelHeight, instanceId) {
@@ -161,6 +235,7 @@ FrameworkMonitor.prototype = {
 
         this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
         for (let key of ["interval", "show-temp", "show-fan", "show-power",
+                         "show-cpu", "show-mem", "show-disk", "disk-path",
                          "compact", "show-icon"]) {
             this.settings.bind(key, key.replace(/-/g, "_"),
                 () => this._onSettingsChanged());
@@ -172,6 +247,7 @@ FrameworkMonitor.prototype = {
         this.menuManager.addMenu(this.menu);
         this._menuRows = {};
 
+        this._prevCpu = null;
         this._resolve();
         this._update();
         this._restartTimer();
@@ -180,7 +256,7 @@ FrameworkMonitor.prototype = {
     /* Locate every node once, and again whenever a read fails. */
     _resolve: function () {
         this._ec = findHwmon("cros_ec");
-        this._cpu = findHwmon("k10temp") || findHwmon("coretemp");
+        this._cpuHwmon = findHwmon("k10temp") || findHwmon("coretemp");
         this._bat = findSupply("Battery");
         this._ac = findSupply("Mains");
     },
@@ -213,6 +289,22 @@ FrameworkMonitor.prototype = {
         });
     },
 
+    /* CPU busy percentage since the previous tick. Null on the first call, which has
+     * nothing to difference against. */
+    _cpuPercent: function () {
+        let now = readCpuTimes();
+        if (now === null) return null;
+        let prev = this._prevCpu;
+        this._prevCpu = now;
+        if (prev === null) return null;
+
+        let deltaTotal = now.total - prev.total;
+        let deltaIdle = now.idle - prev.idle;
+        if (deltaTotal <= 0) return null;
+        let busy = (1 - deltaIdle / deltaTotal) * 100;
+        return Math.max(0, Math.min(100, busy));
+    },
+
     _update: function () {
         let ecTemps = readSensors(this._ec);
         let fanRpm = this._ec ? readInt(this._ec + "/fan1_input") : null;
@@ -225,8 +317,11 @@ FrameworkMonitor.prototype = {
             fanRpm = this._ec ? readInt(this._ec + "/fan1_input") : null;
         }
 
-        let cpuTemps = readSensors(this._cpu);
+        let cpuTemps = readSensors(this._cpuHwmon);
         let battery = readBattery(this._bat, this._ac);
+        let cpu = this._cpuPercent();
+        let memory = readMemory();
+        let disk = readDisk(this.disk_path || "/");
 
         // Prefer the CPU die sensor (k10temp Tctl on AMD) over the EC's board sensors,
         // then anything the EC labels as cpu, then the hottest thing on the board.
@@ -241,11 +336,11 @@ FrameworkMonitor.prototype = {
             }
         }
 
-        this._updatePanel(cpuTemp, fanRpm, battery);
-        this._updateMenu(cpuTemps, ecTemps, fanRpm, battery);
+        this._updatePanel(cpuTemp, fanRpm, battery, cpu, memory, disk);
+        this._updateMenu(cpuTemps, ecTemps, fanRpm, battery, cpu, memory, disk);
     },
 
-    _updatePanel: function (cpuTemp, fanRpm, battery) {
+    _updatePanel: function (cpuTemp, fanRpm, battery, cpu, memory, disk) {
         let compact = this.compact;
         let parts = [];
 
@@ -273,15 +368,36 @@ FrameworkMonitor.prototype = {
                 ? Math.round(battery.watts) + "W"
                 : battery.watts.toFixed(1) + " W");
         }
+        // CPU, memory and disk are all percentages, so bare numbers would be three
+        // indistinguishable figures in a row. Each keeps a one-letter tag even in
+        // compact mode - it costs one character and is the difference between a
+        // readout and a puzzle.
+        if (this.show_cpu && cpu !== null) {
+            parts.push((compact ? "C" : "CPU ") + Math.round(cpu) + "%");
+        }
+        if (this.show_mem && memory !== null) {
+            parts.push((compact ? "M" : "RAM ") + Math.round(memory.percent) + "%");
+        }
+        if (this.show_disk && disk !== null) {
+            parts.push((compact ? "D" : "Disk ") + Math.round(disk.percent) + "%");
+        }
 
         // A middle dot groups the fields more tightly than whitespace can, and stays
         // legible where a double space just reads as a gap.
-        let separator = compact ? " · " : "  ";
+        let separator = compact ? " · " : "  ";
         this.set_applet_label(parts.length > 0 ? parts.join(separator) : "no sensors");
 
         let tip = [];
         if (cpuTemp !== null) tip.push("CPU " + cpuTemp.toFixed(1) + " °C");
         if (fanRpm !== null) tip.push("Fan " + fanRpm + " rpm");
+        if (cpu !== null) tip.push("Load " + cpu.toFixed(0) + "%");
+        if (memory !== null) {
+            tip.push("RAM " + memory.usedGiB.toFixed(1) + " / "
+                + memory.totalGiB.toFixed(1) + " GiB");
+        }
+        if (disk !== null) {
+            tip.push("Disk " + disk.freeGiB.toFixed(0) + " GiB free");
+        }
         if (battery.capacity !== null) tip.push("Battery " + battery.capacity + "%");
         if (battery.watts !== null) {
             tip.push("Draw " + battery.watts.toFixed(2) + " W");
@@ -292,7 +408,8 @@ FrameworkMonitor.prototype = {
     },
 
     /* Rows are created once and updated in place. Rebuilding the menu every tick would
-     * close it under the user's cursor while they are reading it. */
+     * close it under the user's cursor while they are reading it. Creation order is
+     * call order, so _updateMenu must call these in the order they should appear. */
     _menuRow: function (key, label) {
         if (this._menuRows[key]) return this._menuRows[key];
 
@@ -311,26 +428,54 @@ FrameworkMonitor.prototype = {
         let row = this._menuRow(key, label);
         row.left.set_text(label);
         row.right.set_text(value);
-        row.item.actor.visible = true;
     },
 
-    _updateMenu: function (cpuTemps, ecTemps, fanRpm, battery) {
-        if (!this._headerDone) {
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-            this._headerDone = true;
-        }
+    _separatorOnce: function (key) {
+        if (this._menuRows[key]) return;
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._menuRows[key] = true;
+    },
 
+    _updateMenu: function (cpuTemps, ecTemps, fanRpm, battery, cpu, memory, disk) {
         for (let t of cpuTemps) {
-            this._setRow("cpu:" + t.label, t.label, t.celsius.toFixed(1) + " °C");
+            this._setRow("cputemp:" + t.label, t.label, t.celsius.toFixed(1) + " °C");
         }
         for (let t of ecTemps) {
             let value = t.celsius.toFixed(1) + " °C";
             if (t.crit !== null) value += "   (crit " + t.crit.toFixed(0) + ")";
             this._setRow("ec:" + t.label, t.label, value);
         }
-
         if (fanRpm !== null) {
             this._setRow("fan", "fan", fanRpm === 0 ? "off" : fanRpm + " rpm");
+        }
+
+        if (cpu !== null || memory !== null || disk !== null) {
+            this._separatorOnce("sep:system");
+        }
+        if (cpu !== null) {
+            let value = cpu.toFixed(0) + "%";
+            let load = readLoadAvg();
+            if (load !== null) value += "   (load " + load + ")";
+            this._setRow("cpu", "cpu load", value);
+        }
+        if (memory !== null) {
+            this._setRow("mem", "memory",
+                memory.usedGiB.toFixed(1) + " / " + memory.totalGiB.toFixed(1)
+                + " GiB   (" + memory.percent.toFixed(0) + "%)");
+            if (memory.swapTotalGiB > 0) {
+                this._setRow("swap", "swap",
+                    memory.swapUsedGiB.toFixed(1) + " / "
+                    + memory.swapTotalGiB.toFixed(1) + " GiB");
+            }
+        }
+        if (disk !== null) {
+            this._setRow("disk", "disk " + (this.disk_path || "/"),
+                disk.usedGiB.toFixed(0) + " / " + disk.totalGiB.toFixed(0)
+                + " GiB   (" + disk.freeGiB.toFixed(0) + " GiB free)");
+        }
+
+        if (battery.capacity !== null || battery.watts !== null) {
+            this._separatorOnce("sep:battery");
         }
         if (battery.capacity !== null) {
             let value = battery.capacity + "%";

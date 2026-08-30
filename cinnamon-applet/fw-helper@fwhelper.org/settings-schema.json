@@ -7,13 +7,17 @@
         "type": "checkbox",
         "default": true,
         "description": "Compact readout",
-        "tooltip": "52° · 2.1k · 18W  instead of  52°C  2150 rpm  18.3 W"
+        "tooltip": "52° · 2.1k · 15W · C23% · M61% · D45%   instead of the long form"
     },
     "show-icon": {
         "type": "checkbox",
         "default": false,
         "description": "Show the icon",
         "tooltip": "The icon costs more panel width than any single reading."
+    },
+    "head-values": {
+        "type": "header",
+        "description": "Values shown in the panel"
     },
     "show-temp": {
         "type": "checkbox",
@@ -30,6 +34,28 @@
         "default": true,
         "description": "Power draw",
         "tooltip": "Only shown while on battery. Nothing reports whole-machine draw on mains."
+    },
+    "show-cpu": {
+        "type": "checkbox",
+        "default": true,
+        "description": "CPU load"
+    },
+    "show-mem": {
+        "type": "checkbox",
+        "default": true,
+        "description": "Memory usage"
+    },
+    "show-disk": {
+        "type": "checkbox",
+        "default": true,
+        "description": "Disk usage",
+        "tooltip": "Percentage is measured against the total, so it can read a point or two below df."
+    },
+    "disk-path": {
+        "type": "entry",
+        "default": "/",
+        "description": "Filesystem to report",
+        "tooltip": "Any path on the filesystem you want measured, for example /home"
     },
     "head-update": {
         "type": "header",
