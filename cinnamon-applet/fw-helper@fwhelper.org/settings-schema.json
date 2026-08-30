@@ -13,6 +13,12 @@
         "default": true,
         "description": "Memory usage  (sparkline)"
     },
+    "show-cores": {
+        "type": "checkbox",
+        "default": false,
+        "description": "Per-core bars",
+        "tooltip": "One column per core. Shows four cores pinned while eight idle, which a single average hides."
+    },
     "show-disk": {
         "type": "checkbox",
         "default": true,
@@ -70,6 +76,16 @@
     "head-display": {
         "type": "header",
         "description": "Other"
+    },
+    "proc-count": {
+        "type": "spinbutton",
+        "default": 5,
+        "min": 1,
+        "max": 12,
+        "step": 1,
+        "units": "processes",
+        "description": "Top processes listed",
+        "tooltip": "Only gathered while the dropdown is open - walking every process is the costly reading here."
     },
     "show-icon": {
         "type": "checkbox",

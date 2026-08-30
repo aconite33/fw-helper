@@ -1,12 +1,12 @@
 /* Condense the panel readout.
  *
  * Cinnamon's default applet label carries generous horizontal padding, which is right
- * for a one-word applet and wasteful for three numeric fields. Slightly smaller text
+ * for a one-word applet and wasteful for several numeric fields. Slightly smaller text
  * and tighter padding fit the whole readout in roughly the width the padding alone was
  * taking.
  *
- * Font size is relative so this still tracks the panel's own scaling rather than
- * pinning a pixel size that breaks on a HiDPI panel or a resized one.
+ * Sizes are relative so this tracks the panel's own scaling rather than pinning a pixel
+ * size that breaks on a HiDPI panel or a resized one.
  */
 
 .fw-helper-label {
@@ -20,4 +20,30 @@
 .fw-helper-graph {
     padding-left: 2px;
     padding-right: 2px;
+}
+
+/* Dropdown. Section titles recede, values lead - the same hierarchy the readings
+ * themselves have. */
+.fw-helper-section {
+    font-size: 0.8em;
+    font-weight: bold;
+    opacity: 0.55;
+    padding-top: 2px;
+}
+
+.fw-helper-key {
+    opacity: 0.75;
+    padding-left: 4px;
+}
+
+.fw-helper-value {
+    font-feature-settings: "tnum";
+}
+
+.fw-helper-swatch {
+    padding-right: 2px;
+}
+
+.fw-helper-canvas {
+    padding: 2px 0;
 }

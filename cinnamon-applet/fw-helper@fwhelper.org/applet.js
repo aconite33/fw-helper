@@ -1,302 +1,57 @@
 /*
  * Framework Monitor - a Cinnamon panel readout for the Framework Laptop 13.
  *
- * Rate-like values (CPU load, memory) are drawn as sparklines, because a single number
- * cannot show whether 40% is a spike settling or a climb starting. Point values that
- * only make sense exactly (CPU temperature, battery percentage, watts) stay as text -
- * a graph of those trades precision for a shape nobody needs. Disk gets a bar rather
- * than a sparkline: it barely moves, so its history is a flat line carrying no
- * information, while "how full" is the whole question.
+ * The panel keeps rate-like values as sparklines and point values as text: a single
+ * number cannot show whether 40% is a spike settling or a climb starting, while a graph
+ * of a temperature trades precision for a shape nobody needs.
  *
- * Reads /proc and sysfs directly rather than talking to fw-helperd. Every value shown
- * here is world-readable, so the applet needs no daemon, no D-Bus policy and no root,
- * and it keeps working when the daemon is stopped. If it ever needs to show something
- * only the daemon knows (a duty we are commanding, rather than an RPM firmware chose),
- * that is the point to add D-Bus, not before.
+ * The dropdown is the detailed view - ring gauges, a usage history chart, per-core
+ * bars, a details breakdown, and the processes actually responsible.
  *
- * Hardware facts that drive the shape of this file, learned the hard way elsewhere in
- * this project:
- *
- *   - hwmon indices are NOT stable across boots. Every node is resolved by reading its
- *     `name` file, never by index, and re-resolved whenever a read fails.
- *   - Battery power is only meaningful while discharging. On mains, `current_now`
- *     describes what is going INTO the battery, which is not what the machine is using.
+ * Reads /proc and sysfs directly rather than talking to fw-helperd (see read.js). Every
+ * value is world-readable, so this needs no daemon, no D-Bus policy and no root, and it
+ * keeps working when the daemon is stopped. If it ever needs something only the daemon
+ * knows - a fan duty we are commanding, rather than an RPM firmware chose - that is the
+ * point to add D-Bus, not before.
  */
 
 const Applet = imports.ui.applet;
-const Gio = imports.gi.Gio;
-const GLib = imports.gi.GLib;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
 const St = imports.gi.St;
 
-const HWMON = "/sys/class/hwmon";
-const POWER_SUPPLY = "/sys/class/power_supply";
-const KIB_PER_GIB = 1048576;
-const BYTES_PER_GIB = 1073741824;
+// Cinnamon's own multi-file applets (calendar, grouped-window-list) use require() for
+// siblings rather than the imports.* namespace.
+const Draw = require("./draw");
+const Read = require("./read");
 
-/* Distinct hues rather than shades of the theme foreground: the point of three graphs
- * side by side is telling them apart. Chosen mid-saturation so they hold up on both a
- * light and a dark panel, which a theme-derived colour cannot do for three series. */
-const COLOR_CPU = [0.36, 0.68, 0.96];
-const COLOR_MEM = [0.47, 0.80, 0.50];
+const COLOR_USER = [0.20, 0.52, 0.93];
+const COLOR_SYSTEM = [0.92, 0.34, 0.30];
+const COLOR_MEM = [0.36, 0.72, 0.46];
 const COLOR_DISK = [0.96, 0.71, 0.36];
+const COLOR_TEMP = [0.95, 0.55, 0.25];
+const COLOR_BATTERY = [0.42, 0.76, 0.42];
 
-const GRAPH_GAP = 4;
-const DISK_BAR_WIDTH = 9;
-const GRAPH_PAD_Y = 3;
+const PANEL_GAP = 4;
+const PANEL_DISK_WIDTH = 9;
+const PANEL_PAD_Y = 3;
 
-/* ---------- sysfs / proc helpers ----------------------------------------- */
+const MENU_WIDTH = 300;
+const CPU_PANEL_HEIGHT = 168;
+const MEM_PANEL_HEIGHT = 92;
+const BAR_PANEL_HEIGHT = 26;
 
-function readFile(path) {
-    try {
-        let [ok, contents] = GLib.file_get_contents(path);
-        if (!ok || contents === null) return null;
-        // GJS hands back a Uint8Array on current versions and a string on older ones.
-        let text = (contents instanceof Uint8Array)
-            ? new TextDecoder().decode(contents)
-            : String(contents);
-        return text.trim();
-    } catch (e) {
-        return null;
-    }
+/* Temperature has no natural 0..1 scale, so the gauge needs an explicit span. 30 C is
+ * about idle on this board and 100 C is Tjmax, where the CPU throttles itself. */
+const TEMP_MIN_C = 30;
+const TEMP_MAX_C = 100;
+
+/* Load average is unbounded; a full ring at one-per-core is the point where the machine
+ * is saturated, which is the reading that matters. */
+function loadFraction(load, coreCount) {
+    return Math.min(1, parseFloat(load) / Math.max(1, coreCount));
 }
-
-function readInt(path) {
-    let raw = readFile(path);
-    if (raw === null) return null;
-    let n = parseInt(raw, 10);
-    return isNaN(n) ? null : n;
-}
-
-function listDir(path) {
-    let out = [];
-    try {
-        let dir = GLib.Dir.open(path, 0);
-        let name;
-        while ((name = dir.read_name()) !== null) out.push(name);
-        dir.close();
-    } catch (e) {
-        // Directory absent: not an error, just a machine without this hardware.
-    }
-    return out;
-}
-
-/* Resolve an hwmon node by its name file. Never by index - the same node came up as
- * hwmon11 on one boot and hwmon9 on the next on the reference machine. */
-function findHwmon(wanted) {
-    for (let entry of listDir(HWMON)) {
-        if (!entry.startsWith("hwmon")) continue;
-        if (readFile(HWMON + "/" + entry + "/name") === wanted) {
-            return HWMON + "/" + entry;
-        }
-    }
-    return null;
-}
-
-/* Resolve a power supply by its `type`, not its name: this board calls the mains supply
- * ACAD, others call it AC or ADP1, and the battery is BAT0 as often as BAT1. */
-function findSupply(wantedType) {
-    for (let entry of listDir(POWER_SUPPLY)) {
-        if (readFile(POWER_SUPPLY + "/" + entry + "/type") === wantedType) {
-            return POWER_SUPPLY + "/" + entry;
-        }
-    }
-    return null;
-}
-
-/* ---------- drawing ------------------------------------------------------ */
-
-function clamp01(v) {
-    return Math.max(0, Math.min(1, v));
-}
-
-/* Filled area chart. History runs oldest-to-newest left-to-right, values 0..1. */
-function drawSpark(cr, x, y, w, h, history, color) {
-    cr.setSourceRGBA(color[0], color[1], color[2], 0.13);
-    cr.rectangle(x, y, w, h);
-    cr.fill();
-
-    if (history.length < 2) return;
-
-    let step = w / (history.length - 1);
-    let pointY = (i) => y + h - clamp01(history[i]) * h;
-
-    cr.moveTo(x, y + h);
-    for (let i = 0; i < history.length; i++) {
-        cr.lineTo(x + i * step, pointY(i));
-    }
-    cr.lineTo(x + (history.length - 1) * step, y + h);
-    cr.closePath();
-    cr.setSourceRGBA(color[0], color[1], color[2], 0.33);
-    cr.fill();
-
-    cr.moveTo(x, pointY(0));
-    for (let i = 1; i < history.length; i++) {
-        cr.lineTo(x + i * step, pointY(i));
-    }
-    cr.setSourceRGBA(color[0], color[1], color[2], 0.95);
-    cr.setLineWidth(1.5);
-    cr.stroke();
-}
-
-/* Vertical fill bar, for a value whose history carries nothing. */
-function drawBar(cr, x, y, w, h, value, color) {
-    cr.setSourceRGBA(color[0], color[1], color[2], 0.13);
-    cr.rectangle(x, y, w, h);
-    cr.fill();
-
-    if (value === null) return;
-    let filled = clamp01(value) * h;
-    cr.setSourceRGBA(color[0], color[1], color[2], 0.8);
-    cr.rectangle(x, y + h - filled, w, filled);
-    cr.fill();
-}
-
-/* ---------- readings ----------------------------------------------------- */
-
-function readSensors(dir) {
-    let out = [];
-    if (!dir) return out;
-    for (let i = 1; i <= 8; i++) {
-        let milli = readInt(dir + "/temp" + i + "_input");
-        if (milli === null) continue;
-        let crit = readInt(dir + "/temp" + i + "_crit");
-        out.push({
-            label: readFile(dir + "/temp" + i + "_label") || ("temp" + i),
-            celsius: milli / 1000,
-            crit: crit === null ? null : crit / 1000,
-        });
-    }
-    return out;
-}
-
-function readBattery(batDir, acDir) {
-    let out = {
-        status: null, capacity: null, watts: null, minutes: null, onAc: null,
-        nowMah: null, fullMah: null, designMah: null, healthPercent: null,
-        cycles: null, volts: null, technology: null, model: null,
-    };
-    if (acDir) {
-        let online = readInt(acDir + "/online");
-        if (online !== null) out.onAc = (online === 1);
-    }
-    if (!batDir) return out;
-
-    out.status = readFile(batDir + "/status");
-    out.capacity = readInt(batDir + "/capacity");
-    out.cycles = readInt(batDir + "/cycle_count");
-    out.technology = readFile(batDir + "/technology");
-    out.model = readFile(batDir + "/model_name");
-
-    let uv = readInt(batDir + "/voltage_now");
-    if (uv !== null) out.volts = uv / 1e6;
-
-    // Charge family (uAh). An energy-family battery reports uWh instead and has no
-    // charge_* at all, so these simply stay null there.
-    let now = readInt(batDir + "/charge_now");
-    let full = readInt(batDir + "/charge_full");
-    let design = readInt(batDir + "/charge_full_design");
-    if (now !== null) out.nowMah = now / 1000;
-    if (full !== null) out.fullMah = full / 1000;
-    if (design !== null) out.designMah = design / 1000;
-    // Health is what the pack can still hold against what it shipped able to hold.
-    if (full !== null && design) out.healthPercent = (full / design) * 100;
-
-    // Draw is only meaningful while discharging - see the header note.
-    if (out.status !== "Discharging") return out;
-
-    // Energy family first (power_now in uW); it is already watts and needs no
-    // multiplication. This board has no power_now and uses the charge family instead,
-    // so reading only the energy one would silently show nothing.
-    let uw = readInt(batDir + "/power_now");
-    if (uw !== null && uw > 0) {
-        out.watts = uw / 1e6;
-        let uwh = readInt(batDir + "/energy_now");
-        if (uwh !== null) out.minutes = Math.round(uwh * 60 / uw);
-        return out;
-    }
-
-    let ua = readInt(batDir + "/current_now");
-    if (ua !== null && uv !== null && ua > 0) {
-        out.watts = (ua / 1e6) * (uv / 1e6);
-        if (now !== null) out.minutes = Math.round(now * 60 / ua);
-    }
-    return out;
-}
-
-/* Cumulative CPU jiffies since boot. Load is a RATE, so a single sample says nothing -
- * it has to be differenced against the previous one. */
-function readCpuTimes() {
-    let text = readFile("/proc/stat");
-    if (text === null) return null;
-    let line = text.split("\n")[0];
-    if (!line.startsWith("cpu ")) return null;
-    let fields = line.trim().split(/\s+/).slice(1).map(Number);
-    if (fields.length < 5 || fields.some(isNaN)) return null;
-    // idle + iowait: the machine is not doing work in either.
-    return {
-        idle: fields[3] + fields[4],
-        total: fields.reduce((a, b) => a + b, 0),
-    };
-}
-
-function readMemory() {
-    let text = readFile("/proc/meminfo");
-    if (text === null) return null;
-    let kv = {};
-    for (let line of text.split("\n")) {
-        let m = line.match(/^(\w+):\s+(\d+)/);
-        if (m) kv[m[1]] = parseInt(m[2], 10); // kB
-    }
-    if (!kv.MemTotal) return null;
-
-    // MemAvailable, not MemFree. Free excludes reclaimable page cache, so on any
-    // machine that has been up a while it reports nearly everything as "used" - which
-    // is true of the kernel's bookkeeping and useless as a description of pressure.
-    let available = (kv.MemAvailable !== undefined) ? kv.MemAvailable : kv.MemFree;
-    let used = kv.MemTotal - available;
-
-    let swapTotal = kv.SwapTotal || 0;
-    return {
-        totalGiB: kv.MemTotal / KIB_PER_GIB,
-        usedGiB: used / KIB_PER_GIB,
-        percent: (used / kv.MemTotal) * 100,
-        swapTotalGiB: swapTotal / KIB_PER_GIB,
-        swapUsedGiB: (swapTotal - (kv.SwapFree || 0)) / KIB_PER_GIB,
-    };
-}
-
-function readDisk(path) {
-    try {
-        let info = Gio.File.new_for_path(path)
-            .query_filesystem_info("filesystem::size,filesystem::free", null);
-        let size = info.get_attribute_uint64("filesystem::size");
-        let free = info.get_attribute_uint64("filesystem::free");
-        if (!size) return null;
-        let used = size - free;
-        return {
-            totalGiB: size / BYTES_PER_GIB,
-            usedGiB: used / BYTES_PER_GIB,
-            freeGiB: free / BYTES_PER_GIB,
-            // Against total, so this can read a percent or two below `df`, which
-            // computes against the space actually available to a non-root user.
-            percent: (used / size) * 100,
-        };
-    } catch (e) {
-        return null;
-    }
-}
-
-function readLoadAvg() {
-    let text = readFile("/proc/loadavg");
-    if (text === null) return null;
-    let f = text.split(/\s+/);
-    return (f.length >= 3) ? f.slice(0, 3).join("  ") : null;
-}
-
-/* ---------- applet ------------------------------------------------------- */
 
 function FrameworkMonitor(metadata, orientation, panelHeight, instanceId) {
     this._init(metadata, orientation, panelHeight, instanceId);
@@ -309,25 +64,30 @@ FrameworkMonitor.prototype = {
         Applet.TextIconApplet.prototype._init.call(this, orientation, panelHeight, instanceId);
 
         this.set_applet_label("…");
-        // Trims the default applet padding and font size; see stylesheet.css.
         this._applet_label.add_style_class_name("fw-helper-label");
 
         this._cpuHistory = [];
         this._memHistory = [];
+        this._coreValues = [];
         this._diskValue = null;
         this._prevCpu = null;
+        this._prevCores = null;
+        this._procMap = null;
+        this._procList = [];
+        this._state = {};
 
         this._graphArea = new St.DrawingArea({ style_class: "fw-helper-graph" });
-        this._graphArea.connect("repaint", (area) => this._drawGraphs(area));
+        this._graphArea.connect("repaint", (area) => this._drawPanel(area));
         this.actor.add_actor(this._graphArea);
-        // TextIconApplet has already added the icon box and label, so the graphs would
-        // otherwise land after the numbers.
+        // TextIconApplet has already added the icon box and label, so without this the
+        // graphs would land after the numbers.
         this.actor.set_child_at_index(this._graphArea, 0);
 
         this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
         for (let key of ["interval", "show-temp", "show-fan", "show-power",
                          "show-battery", "show-cpu", "show-mem", "show-disk",
-                         "disk-path", "graph-width", "compact", "show-icon"]) {
+                         "show-cores", "disk-path", "graph-width", "compact",
+                         "show-icon", "proc-count"]) {
             this.settings.bind(key, key.replace(/-/g, "_"),
                 () => this._onSettingsChanged());
         }
@@ -336,19 +96,24 @@ FrameworkMonitor.prototype = {
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager.addMenu(this.menu);
-        this._menuRows = {};
+        this._rows = {};
+        // Processes are the expensive reading, so they are only gathered while the menu
+        // is actually showing them - and gathered at once on opening rather than after
+        // the next tick, so the list is never a blank first impression.
+        this.menu.connect("open-state-changed", (menu, open) => {
+            if (open) this._update();
+        });
 
         this._resolve();
         this._update();
         this._restartTimer();
     },
 
-    /* Locate every node once, and again whenever a read fails. */
     _resolve: function () {
-        this._ec = findHwmon("cros_ec");
-        this._cpuHwmon = findHwmon("k10temp") || findHwmon("coretemp");
-        this._bat = findSupply("Battery");
-        this._ac = findSupply("Mains");
+        this._ec = Read.hwmon("cros_ec");
+        this._cpuHwmon = Read.hwmon("k10temp") || Read.hwmon("coretemp");
+        this._bat = Read.supply("Battery");
+        this._ac = Read.supply("Mains");
     },
 
     _slotWidth: function () {
@@ -356,8 +121,8 @@ FrameworkMonitor.prototype = {
     },
 
     _applyAppearance: function () {
-        // The icon costs more panel width than any single reading, so it is optional
-        // and off by default - the numbers are the point of this applet.
+        // The icon costs more panel width than any single reading, and the numbers are
+        // the point of this applet.
         if (this.show_icon) {
             this.set_applet_icon_symbolic_name("temperature-symbolic");
         } else {
@@ -366,24 +131,25 @@ FrameworkMonitor.prototype = {
 
         let slot = this._slotWidth();
         let width = 0;
-        if (this.show_cpu) width += slot + GRAPH_GAP;
-        if (this.show_mem) width += slot + GRAPH_GAP;
-        if (this.show_disk) width += DISK_BAR_WIDTH + GRAPH_GAP;
+        if (this.show_cpu) width += slot + PANEL_GAP;
+        if (this.show_cores) width += this._coreBarsWidth() + PANEL_GAP;
+        if (this.show_mem) width += slot + PANEL_GAP;
+        if (this.show_disk) width += PANEL_DISK_WIDTH + PANEL_GAP;
 
         this._graphArea.set_width(Math.max(0, width));
         this._graphArea.visible = width > 0;
 
         // History is one sample per pixel column, so a width change resizes it.
-        this._trimHistory();
+        let max = slot;
+        for (let key of ["_cpuHistory", "_memHistory"]) {
+            if (this[key].length > max) this[key] = this[key].slice(this[key].length - max);
+        }
         this._graphArea.queue_repaint();
     },
 
-    _trimHistory: function () {
-        let max = this._slotWidth();
-        for (let key of ["_cpuHistory", "_memHistory"]) {
-            let h = this[key];
-            if (h.length > max) this[key] = h.slice(h.length - max);
-        }
+    _coreBarsWidth: function () {
+        let n = Math.max(1, this._coreValues.length);
+        return Math.min(64, n * 4);
     },
 
     _onSettingsChanged: function () {
@@ -400,31 +166,50 @@ FrameworkMonitor.prototype = {
         let seconds = Math.max(1, this.interval || 2);
         this._timer = Mainloop.timeout_add_seconds(seconds, () => {
             this._update();
-            return true; // keep repeating
+            return true;
         });
     },
 
-    _drawGraphs: function (area) {
+    _fg: function (area) {
+        try {
+            let c = area.get_theme_node().get_foreground_color();
+            return [c.red / 255, c.green / 255, c.blue / 255];
+        } catch (e) {
+            return [0.6, 0.6, 0.6];
+        }
+    },
+
+    /* ---------- panel ---------- */
+
+    _drawPanel: function (area) {
         let cr = area.get_context();
         try {
             let [w, h] = area.get_surface_size();
             if (w <= 0 || h <= 0) return;
-
-            let gh = Math.max(6, h - GRAPH_PAD_Y * 2);
+            let fg = this._fg(area);
+            let gh = Math.max(6, h - PANEL_PAD_Y * 2);
             let slot = this._slotWidth();
             let x = 0;
 
             if (this.show_cpu) {
-                drawSpark(cr, x, GRAPH_PAD_Y, slot, gh, this._cpuHistory, COLOR_CPU);
-                x += slot + GRAPH_GAP;
+                Draw.spark(cr, x, PANEL_PAD_Y, slot, gh, this._cpuHistory,
+                    COLOR_USER, fg);
+                x += slot + PANEL_GAP;
+            }
+            if (this.show_cores) {
+                let cw = this._coreBarsWidth();
+                Draw.cores(cr, x, PANEL_PAD_Y, cw, gh, this._coreValues,
+                    COLOR_USER, fg);
+                x += cw + PANEL_GAP;
             }
             if (this.show_mem) {
-                drawSpark(cr, x, GRAPH_PAD_Y, slot, gh, this._memHistory, COLOR_MEM);
-                x += slot + GRAPH_GAP;
+                Draw.spark(cr, x, PANEL_PAD_Y, slot, gh, this._memHistory,
+                    COLOR_MEM, fg);
+                x += slot + PANEL_GAP;
             }
             if (this.show_disk) {
-                drawBar(cr, x, GRAPH_PAD_Y, DISK_BAR_WIDTH, gh, this._diskValue,
-                    COLOR_DISK);
+                Draw.vbar(cr, x, PANEL_PAD_Y, PANEL_DISK_WIDTH, gh, this._diskValue,
+                    COLOR_DISK, fg);
             }
         } finally {
             // GJS will not collect the Cairo context on its own.
@@ -432,233 +217,384 @@ FrameworkMonitor.prototype = {
         }
     },
 
-    /* CPU busy percentage since the previous tick. Null on the first call, which has
-     * nothing to difference against. */
-    _cpuPercent: function () {
-        let now = readCpuTimes();
-        if (now === null) return null;
-        let prev = this._prevCpu;
-        this._prevCpu = now;
-        if (prev === null) return null;
+    /* ---------- menu scaffolding ---------- */
 
-        let deltaTotal = now.total - prev.total;
-        let deltaIdle = now.idle - prev.idle;
-        if (deltaTotal <= 0) return null;
-        return Math.max(0, Math.min(100, (1 - deltaIdle / deltaTotal) * 100));
+    _section: function (key, title) {
+        if (this._rows[key]) return;
+        if (Object.keys(this._rows).length > 0) {
+            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        }
+        let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+        let label = new St.Label({ text: title, style_class: "fw-helper-section" });
+        item.addActor(label, { expand: true });
+        this.menu.addMenuItem(item);
+        this._rows[key] = true;
+    },
+
+    _row: function (key, label, value, color) {
+        if (!this._rows[key]) {
+            let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+            let box = new St.BoxLayout();
+            let dot = null;
+            if (color) {
+                dot = new St.DrawingArea({ style_class: "fw-helper-swatch" });
+                dot.set_width(10);
+                dot.set_height(10);
+                dot.connect("repaint", (a) => {
+                    let cr = a.get_context();
+                    try {
+                        Draw.swatch(cr, 0, 1, 8, color);
+                    } finally {
+                        cr.$dispose();
+                    }
+                });
+                box.add_actor(dot);
+            }
+            let left = new St.Label({ text: label, style_class: "fw-helper-key" });
+            box.add_actor(left);
+            let right = new St.Label({ text: "—", style_class: "fw-helper-value" });
+            item.addActor(box, { expand: true });
+            item.addActor(right, { align: St.Align.END });
+            this.menu.addMenuItem(item);
+            this._rows[key] = { item: item, left: left, right: right };
+        }
+        let row = this._rows[key];
+        row.left.set_text(label);
+        row.right.set_text(value);
+        row.item.actor.visible = true;
+    },
+
+    _hideRow: function (key) {
+        if (this._rows[key] && this._rows[key].item) {
+            this._rows[key].item.actor.visible = false;
+        }
+    },
+
+    /* A drawn block inside the menu. `paint(cr, w, h, fg)` does the work. */
+    _canvas: function (key, height, paint) {
+        if (!this._rows[key]) {
+            let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+            let area = new St.DrawingArea({ style_class: "fw-helper-canvas" });
+            area.set_width(MENU_WIDTH);
+            area.set_height(height);
+            area.connect("repaint", (a) => {
+                let cr = a.get_context();
+                try {
+                    let [w, h] = a.get_surface_size();
+                    this._rows[key].paint(cr, w, h, this._fg(a));
+                } finally {
+                    cr.$dispose();
+                }
+            });
+            item.addActor(area, { expand: true });
+            this.menu.addMenuItem(item);
+            this._rows[key] = { item: item, area: area, paint: paint };
+        }
+        this._rows[key].paint = paint;
+        this._rows[key].area.queue_repaint();
+    },
+
+    /* ---------- update ---------- */
+
+    _update: function () {
+        let s = this._state;
+
+        s.ecTemps = Read.sensors(this._ec);
+        s.fanRpm = this._ec ? Read.int(this._ec + "/fan1_input") : null;
+        // A failed read usually means the hwmon index moved under us. Re-resolve once
+        // rather than showing dashes until the applet is reloaded.
+        if (s.ecTemps.length === 0 && s.fanRpm === null) {
+            this._resolve();
+            s.ecTemps = Read.sensors(this._ec);
+            s.fanRpm = this._ec ? Read.int(this._ec + "/fan1_input") : null;
+        }
+
+        s.cpuTemps = Read.sensors(this._cpuHwmon);
+        s.battery = Read.battery(this._bat, this._ac);
+        s.memory = Read.memory();
+        s.disk = Read.disk(this.disk_path || "/");
+        s.load = Read.loadAvg();
+        s.uptime = Read.uptime();
+
+        let times = Read.cpuTimes();
+        s.cpu = null;
+        if (times) {
+            s.cpu = Read.cpuDelta(this._prevCpu, times.all);
+            if (this._prevCores && times.cores.length === this._prevCores.length) {
+                this._coreValues = times.cores.map((c, i) => {
+                    let d = Read.cpuDelta(this._prevCores[i], c);
+                    return d === null ? 0 : d.busy;
+                });
+            }
+            this._prevCpu = times.all;
+            this._prevCores = times.cores;
+            s.coreCount = times.cores.length || 1;
+        }
+
+        if (s.cpu !== null) this._push("_cpuHistory", s.cpu.busy);
+        if (s.memory !== null) this._push("_memHistory", s.memory.percent / 100);
+        this._diskValue = s.disk === null ? null : s.disk.percent / 100;
+
+        // Only walk /proc while someone is looking at the result.
+        if (this.menu.isOpen && s.cpu !== null) {
+            let r = Read.processes(this._procMap, s.cpu.totalJiffies,
+                s.coreCount || 1, Math.max(1, this.proc_count || 5));
+            this._procMap = r.map;
+            this._procList = r.list;
+        }
+
+        s.cpuTemp = this._pickCpuTemp(s.cpuTemps, s.ecTemps);
+
+        this._graphArea.queue_repaint();
+        this._applyAppearance();
+        this._updatePanel(s);
+        if (this.menu.isOpen) this._updateMenu(s);
     },
 
     _push: function (key, value) {
         let h = this[key];
         h.push(value);
         let max = this._slotWidth();
-        if (h.length > max) h.shift();
+        while (h.length > max) h.shift();
     },
 
-    _update: function () {
-        let ecTemps = readSensors(this._ec);
-        let fanRpm = this._ec ? readInt(this._ec + "/fan1_input") : null;
-
-        // A failed read usually means the hwmon index moved under us. Re-resolve once
-        // and retry rather than showing dashes until the applet is reloaded.
-        if (ecTemps.length === 0 && fanRpm === null) {
-            this._resolve();
-            ecTemps = readSensors(this._ec);
-            fanRpm = this._ec ? readInt(this._ec + "/fan1_input") : null;
-        }
-
-        let cpuTemps = readSensors(this._cpuHwmon);
-        let battery = readBattery(this._bat, this._ac);
-        let cpu = this._cpuPercent();
-        let memory = readMemory();
-        let disk = readDisk(this.disk_path || "/");
-
-        if (cpu !== null) this._push("_cpuHistory", cpu / 100);
-        if (memory !== null) this._push("_memHistory", memory.percent / 100);
-        this._diskValue = disk === null ? null : disk.percent / 100;
-        this._graphArea.queue_repaint();
-
-        // Prefer the CPU die sensor (k10temp Tctl on AMD) over the EC's board sensors,
-        // then anything the EC labels as cpu, then the hottest thing on the board.
-        let cpuTemp = null;
-        if (cpuTemps.length > 0) {
-            cpuTemp = cpuTemps[0].celsius;
-        } else {
-            let named = ecTemps.filter((t) => t.label.indexOf("cpu") !== -1);
-            let pool = named.length > 0 ? named : ecTemps;
-            if (pool.length > 0) {
-                cpuTemp = Math.max.apply(null, pool.map((t) => t.celsius));
-            }
-        }
-
-        this._updatePanel(cpuTemp, fanRpm, battery, cpu, memory, disk);
-        this._updateMenu(cpuTemps, ecTemps, fanRpm, battery, cpu, memory, disk);
+    /* Prefer the CPU die sensor (k10temp Tctl on AMD) over the EC's board sensors, then
+     * anything the EC labels as cpu, then the hottest thing on the board. */
+    _pickCpuTemp: function (cpuTemps, ecTemps) {
+        if (cpuTemps.length > 0) return cpuTemps[0].celsius;
+        let named = ecTemps.filter((t) => t.label.indexOf("cpu") !== -1);
+        let pool = named.length > 0 ? named : ecTemps;
+        if (pool.length === 0) return null;
+        return Math.max.apply(null, pool.map((t) => t.celsius));
     },
 
-    _updatePanel: function (cpuTemp, fanRpm, battery, cpu, memory, disk) {
+    _updatePanel: function (s) {
         let compact = this.compact;
         let parts = [];
 
-        // Text is reserved for values that only mean anything exactly. Load and memory
-        // are in the graphs; putting them here too would just be noise.
-        if (this.show_temp && cpuTemp !== null) {
-            parts.push(Math.round(cpuTemp) + (compact ? "°" : "°C"));
+        if (this.show_temp && s.cpuTemp !== null) {
+            parts.push(Math.round(s.cpuTemp) + (compact ? "°" : "°C"));
         }
-        if (this.show_fan && fanRpm !== null) {
-            // A stopped fan is worth saying plainly rather than showing "0". On this
-            // board firmware keeps it off entirely at idle, so that is the normal
-            // state, not a fault.
-            if (fanRpm === 0) {
-                parts.push("off");
-            } else if (compact) {
-                parts.push(fanRpm >= 1000
-                    ? (fanRpm / 1000).toFixed(1) + "k"
-                    : String(fanRpm));
-            } else {
-                parts.push(fanRpm + " rpm");
-            }
+        if (this.show_fan && s.fanRpm !== null) {
+            // A stopped fan is worth saying plainly rather than showing "0": firmware
+            // keeps it off entirely at idle here, so that is normal, not a fault.
+            if (s.fanRpm === 0) parts.push("off");
+            else if (compact) {
+                parts.push(s.fanRpm >= 1000
+                    ? (s.fanRpm / 1000).toFixed(1) + "k" : String(s.fanRpm));
+            } else parts.push(s.fanRpm + " rpm");
         }
-        if (this.show_power && battery.watts !== null) {
+        if (this.show_power && s.battery.watts !== null) {
             parts.push(compact
-                ? Math.round(battery.watts) + "W"
-                : battery.watts.toFixed(1) + " W");
+                ? Math.round(s.battery.watts) + "W"
+                : s.battery.watts.toFixed(1) + " W");
         }
-        if (this.show_battery && battery.capacity !== null) {
-            // A leading + marks charging, so a rising percentage is not mistaken for a
+        if (this.show_battery && s.battery.capacity !== null) {
+            // A leading + marks charging, so a rising percentage is not read as a
             // draining one at a glance.
-            let mark = (battery.status === "Charging") ? "+" : "";
-            parts.push(mark + battery.capacity + "%");
+            let mark = (s.battery.status === "Charging") ? "+" : "";
+            parts.push(mark + s.battery.capacity + "%");
         }
 
-        let separator = compact ? " · " : "  ";
-        this.set_applet_label(parts.length > 0 ? parts.join(separator) : "");
+        this.set_applet_label(parts.join(compact ? " · " : "  "));
 
         let tip = [];
-        if (cpuTemp !== null) tip.push("CPU " + cpuTemp.toFixed(1) + " °C");
-        if (fanRpm !== null) tip.push("Fan " + fanRpm + " rpm");
-        if (cpu !== null) tip.push("Load " + cpu.toFixed(0) + "%");
-        if (memory !== null) {
-            tip.push("RAM " + memory.usedGiB.toFixed(1) + " / "
-                + memory.totalGiB.toFixed(1) + " GiB");
+        if (s.cpuTemp !== null) tip.push("CPU " + s.cpuTemp.toFixed(1) + " °C");
+        if (s.cpu !== null) tip.push("Load " + (s.cpu.busy * 100).toFixed(0) + "%");
+        if (s.fanRpm !== null) tip.push("Fan " + s.fanRpm + " rpm");
+        if (s.memory) {
+            tip.push("RAM " + s.memory.usedGiB.toFixed(1) + " / "
+                + s.memory.totalGiB.toFixed(1) + " GiB");
         }
-        if (disk !== null) tip.push("Disk " + disk.freeGiB.toFixed(0) + " GiB free");
-        if (battery.capacity !== null) {
-            tip.push("Battery " + battery.capacity + "%"
-                + (battery.status ? " (" + battery.status + ")" : ""));
-        }
-        if (battery.watts !== null) {
-            tip.push("Draw " + battery.watts.toFixed(2) + " W");
-        } else if (battery.onAc) {
-            tip.push("On AC");
+        if (s.disk) tip.push("Disk " + s.disk.freeGiB.toFixed(0) + " GiB free");
+        if (s.battery.capacity !== null) {
+            tip.push("Battery " + s.battery.capacity + "%"
+                + (s.battery.status ? " (" + s.battery.status + ")" : ""));
         }
         this.set_applet_tooltip(tip.join("\n"));
     },
 
-    /* Rows are created once and updated in place. Rebuilding the menu every tick would
-     * close it under the user's cursor while they are reading it. Creation order is
-     * call order, so _updateMenu must call these in the order they should appear. */
-    _menuRow: function (key, label) {
-        if (this._menuRows[key]) return this._menuRows[key];
+    /* ---------- menu ---------- */
 
-        let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-        let left = new St.Label({ text: label });
-        let right = new St.Label({ text: "—" });
-        item.addActor(left, { expand: true });
-        item.addActor(right, { align: St.Align.END });
-        this.menu.addMenuItem(item);
-
-        this._menuRows[key] = { item: item, left: left, right: right };
-        return this._menuRows[key];
+    _updateMenu: function (s) {
+        this._cpuSection(s);
+        this._memSection(s);
+        this._diskSection(s);
+        this._sensorSection(s);
+        this._batterySection(s);
+        this._processSection(s);
     },
 
-    _setRow: function (key, label, value) {
-        let row = this._menuRow(key, label);
-        row.left.set_text(label);
-        row.right.set_text(value);
-    },
+    _cpuSection: function (s) {
+        this._section("sec:cpu", "CPU");
 
-    _separatorOnce: function (key) {
-        if (this._menuRows[key]) return;
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._menuRows[key] = true;
-    },
+        let busy = s.cpu === null ? 0 : s.cpu.busy;
+        let user = s.cpu === null ? 0 : s.cpu.user;
+        let system = s.cpu === null ? 0 : s.cpu.system;
+        let temp = s.cpuTemp;
+        let load = s.load;
+        let coreCount = s.coreCount || 1;
+        let history = this._cpuHistory;
+        let cores = this._coreValues;
 
-    _updateMenu: function (cpuTemps, ecTemps, fanRpm, battery, cpu, memory, disk) {
-        for (let t of cpuTemps) {
-            this._setRow("cputemp:" + t.label, t.label, t.celsius.toFixed(1) + " °C");
+        this._canvas("cpu:canvas", CPU_PANEL_HEIGHT, (cr, w, h, fg) => {
+            let cy = 40;
+            // Temperature and load flank the usage ring, which is the one that carries
+            // two segments and therefore earns the extra size.
+            if (temp !== null) {
+                Draw.ring(cr, 52, cy, 24, 6, [{
+                    value: (temp - TEMP_MIN_C) / (TEMP_MAX_C - TEMP_MIN_C),
+                    color: COLOR_TEMP,
+                }], Math.round(temp) + "°", null, fg);
+                Draw.text(cr, 52, cy + 40, "temp", 10, fg, 0.5, "center");
+            }
+            Draw.ring(cr, w / 2, cy, 32, 8, [
+                { value: system, color: COLOR_SYSTEM },
+                { value: user, color: COLOR_USER },
+            ], Math.round(busy * 100) + "%", null, fg);
+            Draw.text(cr, w / 2, cy + 48, "usage", 10, fg, 0.5, "center");
+
+            if (load) {
+                Draw.ring(cr, w - 52, cy, 24, 6, [{
+                    value: loadFraction(load.one, coreCount),
+                    color: COLOR_USER,
+                }], load.one, null, fg);
+                Draw.text(cr, w - 52, cy + 40, "load", 10, fg, 0.5, "center");
+            }
+
+            Draw.text(cr, w / 2, 94, "Usage history", 10, fg, 0.5, "center");
+            Draw.spark(cr, 10, 100, w - 20, 40, history, COLOR_USER, fg);
+            if (cores.length > 0) {
+                Draw.cores(cr, 10, 144, w - 20, 16, cores, COLOR_USER, fg);
+            }
+        });
+
+        if (s.cpu !== null) {
+            this._row("cpu:user", "User", (user * 100).toFixed(1) + "%", COLOR_USER);
+            this._row("cpu:system", "System", (system * 100).toFixed(1) + "%",
+                COLOR_SYSTEM);
+            this._row("cpu:idle", "Idle", ((1 - busy) * 100).toFixed(1) + "%");
         }
-        for (let t of ecTemps) {
+        if (s.load) {
+            this._row("cpu:load", "Load average",
+                s.load.one + "   " + s.load.five + "   " + s.load.fifteen);
+        }
+        if (s.uptime) this._row("cpu:uptime", "Uptime", s.uptime);
+    },
+
+    _memSection: function (s) {
+        if (!s.memory) return;
+        this._section("sec:mem", "Memory");
+        let m = s.memory;
+        let history = this._memHistory;
+
+        this._canvas("mem:canvas", MEM_PANEL_HEIGHT, (cr, w, h, fg) => {
+            Draw.ring(cr, 46, 44, 28, 7,
+                [{ value: m.percent / 100, color: COLOR_MEM }],
+                Math.round(m.percent) + "%", null, fg);
+            Draw.text(cr, w / 2 + 40, 20, "Usage history", 10, fg, 0.5, "center");
+            Draw.spark(cr, 92, 28, w - 102, 48, history, COLOR_MEM, fg);
+        });
+
+        this._row("mem:used", "Used", m.usedGiB.toFixed(2) + " GiB", COLOR_MEM);
+        this._row("mem:cached", "Cached", m.cachedGiB.toFixed(2) + " GiB");
+        this._row("mem:free", "Available", m.availableGiB.toFixed(2) + " GiB");
+        this._row("mem:total", "Total", m.totalGiB.toFixed(2) + " GiB");
+        if (m.swapTotalGiB > 0) {
+            this._row("mem:swap", "Swap",
+                m.swapUsedGiB.toFixed(2) + " / " + m.swapTotalGiB.toFixed(2) + " GiB");
+        }
+    },
+
+    _diskSection: function (s) {
+        if (!s.disk) return;
+        this._section("sec:disk", "Disk");
+        let d = s.disk;
+        this._canvas("disk:canvas", BAR_PANEL_HEIGHT, (cr, w, h, fg) => {
+            Draw.hbar(cr, 10, 8, w - 20, 10, d.percent / 100, COLOR_DISK, fg);
+        });
+        this._row("disk:used", this.disk_path || "/",
+            d.usedGiB.toFixed(0) + " of " + d.totalGiB.toFixed(0) + " GiB   ("
+            + d.percent.toFixed(0) + "%)", COLOR_DISK);
+        this._row("disk:free", "Free", d.freeGiB.toFixed(0) + " GiB");
+    },
+
+    _sensorSection: function (s) {
+        if (s.ecTemps.length === 0 && s.fanRpm === null) return;
+        this._section("sec:sensors", "Sensors");
+        for (let t of s.cpuTemps) {
+            this._row("t:" + t.label, t.label, t.celsius.toFixed(1) + " °C");
+        }
+        for (let t of s.ecTemps) {
             let value = t.celsius.toFixed(1) + " °C";
             if (t.crit !== null) value += "   (crit " + t.crit.toFixed(0) + ")";
-            this._setRow("ec:" + t.label, t.label, value);
+            this._row("t:ec:" + t.label, t.label, value);
         }
-        if (fanRpm !== null) {
-            this._setRow("fan", "fan", fanRpm === 0 ? "off" : fanRpm + " rpm");
+        if (s.fanRpm !== null) {
+            this._row("fan", "fan", s.fanRpm === 0 ? "off" : s.fanRpm + " rpm");
         }
+    },
 
-        if (cpu !== null || memory !== null || disk !== null) {
-            this._separatorOnce("sep:system");
-        }
-        if (cpu !== null) {
-            let value = cpu.toFixed(0) + "%";
-            let load = readLoadAvg();
-            if (load !== null) value += "   (load " + load + ")";
-            this._setRow("cpu", "cpu load", value);
-        }
-        if (memory !== null) {
-            this._setRow("mem", "memory",
-                memory.usedGiB.toFixed(1) + " / " + memory.totalGiB.toFixed(1)
-                + " GiB   (" + memory.percent.toFixed(0) + "%)");
-            if (memory.swapTotalGiB > 0) {
-                this._setRow("swap", "swap",
-                    memory.swapUsedGiB.toFixed(1) + " / "
-                    + memory.swapTotalGiB.toFixed(1) + " GiB");
-            }
-        }
-        if (disk !== null) {
-            this._setRow("disk", "disk " + (this.disk_path || "/"),
-                disk.usedGiB.toFixed(0) + " / " + disk.totalGiB.toFixed(0)
-                + " GiB   (" + disk.freeGiB.toFixed(0) + " GiB free)");
-        }
+    _batterySection: function (s) {
+        let b = s.battery;
+        if (b.capacity === null) return;
+        this._section("sec:battery", "Battery");
 
-        if (battery.capacity !== null || battery.watts !== null) {
-            this._separatorOnce("sep:battery");
-        }
-        if (battery.capacity !== null) {
-            let value = battery.capacity + "%";
-            if (battery.status) value += "  ·  " + battery.status;
-            this._setRow("battery", "battery", value);
-        }
-        // Charge held against charge the pack can hold - the pair that says how much
-        // running time is left in absolute terms, which a percentage cannot.
-        if (battery.nowMah !== null && battery.fullMah !== null) {
-            this._setRow("charge", "charge",
-                Math.round(battery.nowMah) + " / " + Math.round(battery.fullMah)
-                + " mAh");
+        let level = b.capacity / 100;
+        let charging = (b.status === "Charging");
+        this._canvas("bat:canvas", BAR_PANEL_HEIGHT, (cr, w, h, fg) => {
+            Draw.hbar(cr, 10, 8, w - 20, 10, level,
+                charging ? COLOR_USER : COLOR_BATTERY, fg);
+        });
+
+        this._row("bat:level", "Level", b.capacity + "%   ·   " + (b.status || "—"),
+            charging ? COLOR_USER : COLOR_BATTERY);
+        // Charge held against charge the pack can hold: what a percentage cannot say,
+        // which is how much running time is left in absolute terms.
+        if (b.nowMah !== null && b.fullMah !== null) {
+            this._row("bat:charge", "Charge",
+                Math.round(b.nowMah) + " of " + Math.round(b.fullMah) + " mAh");
         }
         // And capacity against what it shipped with, which is the ageing story.
-        if (battery.healthPercent !== null) {
-            this._setRow("health", "health",
-                battery.healthPercent.toFixed(1) + "% of "
-                + Math.round(battery.designMah) + " mAh design");
+        if (b.healthPercent !== null) {
+            this._row("bat:health", "Health",
+                b.healthPercent.toFixed(1) + "%   ("
+                + Math.round(b.designMah) + " mAh design)");
         }
-        if (battery.cycles !== null) {
-            this._setRow("cycles", "charge cycles", String(battery.cycles));
-        }
-        if (battery.volts !== null) {
-            this._setRow("volts", "voltage", battery.volts.toFixed(2) + " V");
-        }
-        if (battery.watts !== null) {
-            let value = battery.watts.toFixed(2) + " W";
-            if (battery.minutes !== null) {
-                let h = Math.floor(battery.minutes / 60);
-                let m = battery.minutes % 60;
-                value += "  ·  " + h + "h " + (m < 10 ? "0" : "") + m + "m left";
+        if (b.cycles !== null) this._row("bat:cycles", "Cycles", String(b.cycles));
+        if (b.volts !== null) this._row("bat:volts", "Voltage", b.volts.toFixed(2) + " V");
+
+        if (b.watts !== null) {
+            let value = b.watts.toFixed(2) + " W";
+            if (b.minutes !== null) {
+                let hrs = Math.floor(b.minutes / 60);
+                let mins = b.minutes % 60;
+                value += "   ·   " + hrs + "h " + (mins < 10 ? "0" : "") + mins + "m left";
             }
-            this._setRow("draw", "system draw", value);
-        } else if (battery.onAc) {
-            // Say why there is no number rather than showing a dash. Nothing reports
+            this._row("bat:draw", "System draw", value);
+        } else if (b.onAc) {
+            // Say why there is no number rather than showing a dash: nothing reports
             // whole-machine draw on mains.
-            this._setRow("draw", "system draw", "on AC — not reported");
+            this._row("bat:draw", "System draw", "on AC — not reported");
+        } else {
+            this._hideRow("bat:draw");
+        }
+    },
+
+    _processSection: function (s) {
+        if (this._procList.length === 0) return;
+        this._section("sec:proc", "Top processes");
+        let limit = Math.max(1, this.proc_count || 5);
+        for (let i = 0; i < limit; i++) {
+            let key = "proc:" + i;
+            let p = this._procList[i];
+            if (!p) {
+                this._hideRow(key);
+                continue;
+            }
+            let name = p.name.length > 22 ? p.name.substring(0, 21) + "…" : p.name;
+            this._row(key, name,
+                p.cpu.toFixed(1) + "%   " + p.rssGiB.toFixed(2) + " GiB");
         }
     },
 
