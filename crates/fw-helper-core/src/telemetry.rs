@@ -75,13 +75,27 @@ impl Telemetry {
 }
 
 /// Polls hardware and produces [`Telemetry`].
+/// Package-power samples averaged into one block before the floor considers them.
+///
+/// At roughly 1 Hz this is half a minute. Individual samples are far too noisy to take
+/// a minimum of: measured on an idle machine, consecutive readings ranged 1.6 W to
+/// 5.5 W around a true idle draw near 3.6 W. A running minimum over that lands on the
+/// low tail of the noise rather than on the baseline, and no amount of outlier
+/// rejection fixes it, because the low samples are real - they are just not the
+/// average. Averaging first removes the noise instead of trying to filter it.
+const FLOOR_WINDOW: usize = 30;
+
 pub struct Monitor {
     fs: Sysfs,
     caps: Capabilities,
     energy: Option<EnergySampler>,
     watts_floor: Option<f64>,
-    /// A reading below the floor waits here for a second one to confirm it.
+    /// A block below the floor waits here for a second one to confirm it.
     pending_low: Option<f64>,
+    /// Samples accumulating toward the next block average. Blocks do not overlap, so
+    /// two consecutive lows are two independent quiet periods rather than one period
+    /// counted twice by a sliding window.
+    window: Vec<f64>,
 }
 
 impl Monitor {
@@ -98,21 +112,39 @@ impl Monitor {
             energy,
             watts_floor: None,
             pending_low: None,
+            window: Vec::with_capacity(FLOOR_WINDOW),
         }
     }
 
-    /// Track the lowest package power seen, as the machine's idle floor.
+    /// Feed one package-power reading toward the floor.
     ///
-    /// The floor only ever falls, and it takes **two consecutive** readings below the
-    /// current value to move it. That second reading is the whole point. The fan floor
-    /// in this project learned the same lesson the expensive way: a value that only
-    /// rises within a bucket let one bad sample stick permanently, and a table came back
+    /// Readings are averaged in non-overlapping blocks of [`FLOOR_WINDOW`] before the
+    /// floor sees them; see that constant for why a minimum of raw samples cannot work.
+    fn observe_sample(&mut self, watts: f64) {
+        if !watts.is_finite() || watts <= 0.05 {
+            return;
+        }
+        self.window.push(watts);
+        if self.window.len() < FLOOR_WINDOW {
+            return;
+        }
+        let mean = self.window.iter().sum::<f64>() / self.window.len() as f64;
+        self.window.clear();
+        self.observe_floor(mean);
+    }
+
+    /// Track the lowest block average seen, as the machine's idle floor.
+    ///
+    /// The floor only ever falls, and it takes **two consecutive** block averages below
+    /// the current value to move it. That second block is the whole point. The fan floor
+    /// in this project learned the same lesson the expensive way: a value that only rose
+    /// within a bucket let one bad sample stick permanently, and a table came back
     /// claiming 5200 rpm at a temperature where its neighbours said 2000. A minimum that
-    /// accepts any single low sample has exactly that shape, and a floor pinned too low
+    /// accepts any single low reading has exactly that shape, and a floor pinned too low
     /// would over-attribute power to processes for the rest of the daemon's life.
     ///
-    /// Readings at or below 0.05 W are refused outright: a running package cannot draw
-    /// nothing, so such a sample is a wrapped or mis-scaled counter rather than an
+    /// Values at or below 0.05 W are refused outright: a running package cannot draw
+    /// nothing, so such a reading is a wrapped or mis-scaled counter rather than an
     /// unusually quiet machine.
     fn observe_floor(&mut self, watts: f64) {
         if !watts.is_finite() || watts <= 0.05 {
@@ -178,7 +210,7 @@ impl Monitor {
             }
         }
         if let Some(w) = t.package_watts {
-            self.observe_floor(w);
+            self.observe_sample(w);
         }
         t.package_watts_floor = self.watts_floor;
 
@@ -446,5 +478,82 @@ mod floor_tests {
             m.observe_floor(bad);
         }
         assert_eq!(m.watts_floor, Some(5.0));
+    }
+}
+
+#[cfg(test)]
+mod floor_window_tests {
+    use super::*;
+
+    fn monitor() -> Monitor {
+        Monitor::new(Sysfs::new("/nonexistent-for-floor-tests"))
+    }
+
+    fn feed(m: &mut Monitor, watts: f64, times: usize) {
+        for _ in 0..times {
+            m.observe_sample(watts);
+        }
+    }
+
+    /// The floor is a mean of thirty samples, so it carries the accumulated rounding of
+    /// thirty additions. Comparing it exactly tests the FPU, not the tracker.
+    fn assert_floor(m: &Monitor, expected: f64) {
+        let got = m.watts_floor.expect("expected a floor");
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "floor {got} should be about {expected}"
+        );
+    }
+
+    #[test]
+    fn a_partial_block_never_reaches_the_floor() {
+        let mut m = monitor();
+        feed(&mut m, 4.0, FLOOR_WINDOW - 1);
+        assert_eq!(m.watts_floor, None, "floor moved before a block completed");
+    }
+
+    #[test]
+    fn the_floor_follows_the_block_average_not_the_low_samples() {
+        // The measurement that motivated this: an idle machine's 1 Hz readings ranged
+        // 1.6 to 5.5 W around a true draw near 3.6 W. A minimum of raw samples lands on
+        // the low tail; a minimum of block averages lands on the baseline.
+        let mut m = monitor();
+        let noisy = [1.6, 5.5, 2.7, 4.4, 3.9, 1.9, 5.1, 3.0, 4.3, 2.5];
+        let mean = noisy.iter().sum::<f64>() / noisy.len() as f64;
+        for _ in 0..(FLOOR_WINDOW / noisy.len()) {
+            for w in noisy {
+                m.observe_sample(w);
+            }
+        }
+        let floor = m.watts_floor.expect("a full block should set the floor");
+        assert!(
+            (floor - mean).abs() < 0.01,
+            "floor {floor} should be the block mean {mean}, not a low sample"
+        );
+        assert!(
+            floor > 3.0,
+            "floor {floor} landed on the noise, not the baseline"
+        );
+    }
+
+    #[test]
+    fn one_quiet_block_does_not_move_an_established_floor() {
+        let mut m = monitor();
+        feed(&mut m, 6.0, FLOOR_WINDOW);
+        assert_floor(&m, 6.0);
+        feed(&mut m, 0.5, FLOOR_WINDOW); // one quiet block: unconfirmed
+        assert_floor(&m, 6.0);
+        feed(&mut m, 6.0, FLOOR_WINDOW); // back to normal, the low block is forgotten
+        feed(&mut m, 0.5, FLOOR_WINDOW);
+        assert_floor(&m, 6.0);
+    }
+
+    #[test]
+    fn two_quiet_blocks_establish_a_lower_floor() {
+        let mut m = monitor();
+        feed(&mut m, 9.0, FLOOR_WINDOW);
+        feed(&mut m, 3.6, FLOOR_WINDOW);
+        feed(&mut m, 3.9, FLOOR_WINDOW);
+        assert_floor(&m, 3.9); // the higher of the confirmed pair
     }
 }
