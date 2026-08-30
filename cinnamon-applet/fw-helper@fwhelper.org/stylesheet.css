@@ -14,3 +14,10 @@
     padding-left: 3px;
     padding-right: 3px;
 }
+
+/* The drawing area sets its own width from the enabled graphs; this only keeps it from
+ * butting against the panel edge and its neighbouring applet. */
+.fw-helper-graph {
+    padding-left: 2px;
+    padding-right: 2px;
+}
