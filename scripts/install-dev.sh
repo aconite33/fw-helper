@@ -16,10 +16,25 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "ERROR: run with sudo" >&2; exit 1; }
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-POLICY=/etc/dbus-1/system.d/org.fwhelper.Daemon1.conf
+# Layout differs by distribution, so both of these are detected rather than assumed.
+#
+# dbus-daemon reads /etc/dbus-1/system.d as well as its own share directory, but Debian
+# ships that directory and Arch does not - so it is created rather than required. /etc is
+# the right home for a local install either way; the share directory belongs to packages.
+DBUS_DIR=/etc/dbus-1/system.d
+POLICY=$DBUS_DIR/org.fwhelper.Daemon1.conf
 UNIT=/etc/systemd/system/fw-helperd.service
-BIN=/usr/libexec/fw-helperd
-RESTORE=/usr/libexec/fw-helper-restore-fan
+
+# /usr/libexec does not exist on Arch, which puts helper binaries under /usr/lib. The
+# unit ships with /usr/libexec paths and is rewritten at install time to match whichever
+# is in use, rather than creating a directory the distribution deliberately omits.
+if [[ -d /usr/libexec ]]; then
+    LIBEXEC=/usr/libexec
+else
+    LIBEXEC=/usr/lib/fw-helper
+fi
+BIN=$LIBEXEC/fw-helperd
+RESTORE=$LIBEXEC/fw-helper-restore-fan
 CTL=/usr/local/bin/fw-helperctl
 GUI=/usr/local/bin/fw-helper
 POLKIT=/usr/share/polkit-1/actions/org.fwhelper.policy
@@ -51,7 +66,10 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -fv "$POLICY" "$UNIT" "$BIN" "$RESTORE" "$CTL" "$GUI" "$POLKIT" "$MODPROBE" \
         /etc/fw-helper/example-profile.conf
     # Leave $PROFILES and anything in it: those are the user's, not ours.
-    rmdir --ignore-fail-on-non-empty "$PROFILES" /etc/fw-helper 2>/dev/null || true
+    # Only ever remove directories this script may have created, and only when empty.
+    rmdir --ignore-fail-on-non-empty "$PROFILES" /etc/fw-helper "$DBUS_DIR" \
+        /etc/dbus-1 2>/dev/null || true
+    [[ "$LIBEXEC" == /usr/lib/fw-helper ]] && rmdir "$LIBEXEC" 2>/dev/null || true
     systemctl daemon-reload
     systemctl reload dbus 2>/dev/null || true
     echo "removed."
@@ -67,7 +85,7 @@ if ! python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse(sys.argv[1])"
     exit 1
 fi
 
-install -m 644 -v "$REPO/data/org.fwhelper.Daemon1.conf" "$POLICY"
+install -D -m 644 -v "$REPO/data/org.fwhelper.Daemon1.conf" "$POLICY"
 # The bus only reads system.d at startup or on reload.
 systemctl reload dbus 2>/dev/null || echo "note: could not reload dbus; a reboot will pick it up"
 
@@ -144,9 +162,16 @@ if [[ "${1:-}" == "--systemd" ]]; then
     # so refuse to install a unit that cannot run it.
     [[ -x "$REPO/target/release/fw-helper-restore-fan" ]] || {
         echo "ERROR: build first: cargo build --release -p fw-helper-restore-fan" >&2; exit 1; }
-    install -m 755 -v "$REPO/target/release/fw-helperd" "$BIN"
-    install -m 755 -v "$REPO/target/release/fw-helper-restore-fan" "$RESTORE"
-    install -m 644 -v "$REPO/data/fw-helperd.service" "$UNIT"
+    install -D -m 755 -v "$REPO/target/release/fw-helperd" "$BIN"
+    install -D -m 755 -v "$REPO/target/release/fw-helper-restore-fan" "$RESTORE"
+    # Point the unit at wherever the binaries actually went. rm first: `>` follows
+    # symlinks, which this script has been bitten by before.
+    rm -f "$UNIT"
+    sed -e "s|/usr/libexec/fw-helperd|$BIN|g" \
+        -e "s|/usr/libexec/fw-helper-restore-fan|$RESTORE|g" \
+        "$REPO/data/fw-helperd.service" > "$UNIT"
+    chmod 644 "$UNIT"
+    echo "installed unit: $UNIT (ExecStart=$BIN)"
     systemctl daemon-reload
     # enable, then RESTART. `enable --now` only starts a unit that is not already
     # running, so on every install after the first it would leave the previous process
