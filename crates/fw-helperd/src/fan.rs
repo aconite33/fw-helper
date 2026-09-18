@@ -202,6 +202,25 @@ impl From<FanError> for LeaseError {
     }
 }
 
+/// Withdraw fan control on a board whose fan has not been measured, whatever the
+/// interface says.
+///
+/// The interface question - is there a `pwm1`, does the EC advertise fan PWM - is answered
+/// elsewhere, and on a board with `pwm1` core answers yes. But [`FanLease::write`] refuses
+/// any board without a profile, so without this an unmeasured board *with* `pwm1` would
+/// report fan control as available and then refuse every use of it: a control that lies.
+/// The capability and the refusal have to be decided by the same rule.
+pub fn require_measured(cap: fw_helper_core::Cap, board: Board) -> fw_helper_core::Cap {
+    if cap.is_available() && board.profile().is_none() {
+        return fw_helper_core::Cap::No(format!(
+            "{board}: the fan can be driven, but it has not been measured, so no firmware \
+             floor can be trusted to stay above firmware. scripts/probe-fan-amd.c and \
+             scripts/probe-fan-curve.sh measure one"
+        ));
+    }
+    cap
+}
+
 /// Above this the fan is turning, whatever it was asked for. Well below the slowest
 /// running speed measured on any board (967 rpm, sustained at 10%) and well above the
 /// noise a stopped fan reports.
@@ -808,6 +827,102 @@ mod tests {
         let hw = root.join("sys/class/hwmon/hwmon8");
         fs::write(hw.join("fan1_input"), format!("{input}\n")).unwrap();
         fs::write(hw.join("fan1_target"), format!("{target}\n")).unwrap();
+    }
+
+    /// The Intel Pro exactly as the daemon builds it: identified from DMI, and handed an
+    /// EC transport - the daemon passes one on every board, since it cannot know in
+    /// advance which interface a board will turn out to have.
+    fn intel_board_with_ec() -> (PathBuf, Arc<crate::ec::fake::FakeEc>, FanLease) {
+        let root = fixture("intel-with-ec");
+        let dmi = root.join("sys/class/dmi/id");
+        fs::create_dir_all(&dmi).unwrap();
+        fs::write(dmi.join("board_name"), "FRANMJCP07\n").unwrap();
+        let sysfs = Sysfs::new(&root);
+        let board = fw_helper_core::board::identify(&sysfs);
+        assert!(matches!(board, Board::Measured(_)), "{board}");
+        let ec = Arc::new(crate::ec::fake::FakeEc::new(0, 100));
+        let transport: Arc<dyn EcTransport> = ec.clone();
+        let lease = FanLease::for_board(sysfs, board, Some(transport));
+        (root, ec, lease)
+    }
+
+    #[test]
+    fn the_intel_board_is_driven_through_pwm1_even_with_an_ec_available() {
+        // Sysfs first (ADR 0004): pwm1 can be read back, the EC path cannot. The EC backend
+        // must never take over a board that has pwm1 just because a transport exists.
+        let (root, ec, lease) = intel_board_with_ec();
+        assert!(
+            lease.mode_is_observable(),
+            "Intel reads its mode from pwm1_enable"
+        );
+        lease.set_duty(180, th(IDLE_C)).unwrap();
+        assert_eq!(
+            enable(&root),
+            "1",
+            "manual control was not taken through sysfs"
+        );
+        assert!(
+            ec.sent.lock().unwrap().is_empty(),
+            "the EC was sent a command on a board with pwm1"
+        );
+        lease.release_now();
+        assert_eq!(enable(&root), "2");
+        assert!(ec.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_intel_board_keeps_its_own_floor_and_sensor() {
+        let (_root, _ec, lease) = intel_board_with_ec();
+        assert_eq!(lease.control_sensor(), Some("peci-temp"));
+        assert!(
+            lease.firmware_curve_hysteretic(),
+            "Intel keeps its verified treatment"
+        );
+        // Its floor still comes from the Intel tables: at 64.8 C the Intel EC runs 2925
+        // rpm, which needs duty ~85 on that fan, not the AMD figure.
+        let floor = lease.floor_duty(64.8);
+        let intel =
+            FirmwareFloor::for_board(&fw_helper_core::board::INTEL_CORE_ULTRA_3).floor_duty(64.8);
+        assert_eq!(floor, intel);
+    }
+
+    #[test]
+    fn startup_reclaim_on_intel_still_asks_before_releasing() {
+        // The unconditional release is for boards with no mode register. Intel has one,
+        // so it keeps upstream's behaviour: read, and release only a fan left manual.
+        let (root, ec, lease) = intel_board_with_ec();
+        lease.reclaim_at_startup();
+        assert_eq!(enable(&root), "2");
+        assert!(
+            ec.sent.lock().unwrap().is_empty(),
+            "Intel reclaim went to the EC"
+        );
+    }
+
+    #[test]
+    fn capability_and_refusal_agree_on_an_unmeasured_board() {
+        use fw_helper_core::board::identify_name;
+        use fw_helper_core::Cap;
+        // An unmeasured board whose interface says yes must not be offered fan control,
+        // because write() will refuse it.
+        match require_measured(Cap::Yes, identify_name("FRANXXXX01")) {
+            Cap::No(reason) => assert!(reason.contains("not been measured"), "{reason}"),
+            Cap::Yes => panic!("offered fan control that write() will refuse"),
+        }
+        // A measured board keeps what the interface said, both ways.
+        assert_eq!(
+            require_measured(Cap::Yes, identify_name("FRANMJCP07")),
+            Cap::Yes
+        );
+        assert_eq!(
+            require_measured(Cap::Yes, identify_name("FRANMGCP09")),
+            Cap::Yes
+        );
+        let no = Cap::No("no cros_ec hwmon".into());
+        assert_eq!(
+            require_measured(no.clone(), identify_name("FRANMJCP07")),
+            no
+        );
     }
 
     #[test]

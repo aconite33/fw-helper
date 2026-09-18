@@ -59,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !caps.fan_control.is_available() && ec::CrosEc::default().exists() {
         caps.fan_control = ec::fan_capability(&*cros_ec, board);
     }
+    // Whatever the interface, an unmeasured board is not offered what write() refuses.
+    caps.fan_control = fan::require_measured(caps.fan_control, board);
 
     eprintln!("fw-helperd starting ({})", build_stamp());
     eprintln!("  board              {board}");
