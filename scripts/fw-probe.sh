@@ -47,9 +47,12 @@ if [[ -n "$EC_HWMON" ]]; then
     echo
     for i in 1 2 3 4 5 6 7 8; do
         [[ -f "$EC_HWMON/temp${i}_input" ]] || continue
+        # awk, not bc: bc is not installed by default on Arch, and the old
+        # `bc ... || echo 0` fallback reported 0.00 C for every sensor on every AMD
+        # board surveyed rather than failing - a wrong reading dressed as a real one.
         printf '  temp%-2s %-22s %6.2f C   (max %s crit %s)\n' \
             "$i" "$(rd "$EC_HWMON/temp${i}_label")" \
-            "$(echo "$(rd "$EC_HWMON/temp${i}_input")/1000" | bc -l 2>/dev/null || echo 0)" \
+            "$(awk -v m="$(rd "$EC_HWMON/temp${i}_input")" 'BEGIN{print m/1000}')" \
             "$(rd "$EC_HWMON/temp${i}_max")" "$(rd "$EC_HWMON/temp${i}_crit")"
     done
 else
