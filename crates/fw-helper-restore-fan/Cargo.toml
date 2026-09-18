@@ -6,8 +6,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-# Deliberately depends on nothing but the (itself dependency-free) hardware layer.
-# This binary runs when the daemon is broken, so its own failure modes must be
-# boring: no async runtime, no D-Bus, no config, no allocation it can avoid.
+# Deliberately depends on almost nothing. This binary runs when the daemon is broken,
+# so its own failure modes must be boring: no async runtime, no D-Bus, no config, no
+# allocation it can avoid.
+#
+# libc is the one exception, accepted in ADR 0013. On the AMD boards the fan can only be
+# handed back with an ioctl on /dev/cros_ec - there is no pwm1_enable to write - and a
+# crash-path binary that cannot release the fan on half the supported boards is worse
+# than one with a second dependency. The ioctl is issued here rather than borrowed from
+# the daemon, because depending on the daemon crate would tie this binary to the thing
+# it exists to back up.
 [dependencies]
 fw-helper-core = { path = "../fw-helper-core" }
+libc = "0.2"
