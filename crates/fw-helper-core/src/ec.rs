@@ -53,6 +53,20 @@ pub mod fan {
     /// A duty of 255 sent to this command is not "maximum", it is out of range.
     pub const MAX_DUTY: u8 = 100;
 
+    /// Convert this project's 0-255 duty to the percent the EC wants.
+    ///
+    /// The 0-255 scale is the domain's, not the hardware's. The Intel board's `pwm1`
+    /// takes 0-255 but the EC behind it stores whole percent, which is why that path
+    /// needs a tolerance when it reads a duty back: write 180, read 181. So converting
+    /// here loses nothing that was not already lost - the resolution was never real.
+    ///
+    /// Rounds to nearest rather than truncating. Truncation would put 255 at 100% but
+    /// drag every other value down by up to a percent, and near the stiction point a
+    /// percent is the difference between a fan that starts and one that does not.
+    pub fn duty_to_percent(duty: u8) -> u8 {
+        (((duty as u32) * 100 + 127) / 255) as u8
+    }
+
     /// Encode a duty request.
     ///
     /// The EC's wire format is little-endian regardless of host, so this is explicit
@@ -210,6 +224,34 @@ mod tests {
         // Version 0 of AUTO_FAN_CTRL takes no parameters. Sending bytes it does not
         // expect risks the EC reading them as a fan index.
         assert!(fan::auto_request().is_empty());
+    }
+
+    #[test]
+    fn duty_converts_to_percent_at_the_boundaries() {
+        assert_eq!(fan::duty_to_percent(0), 0);
+        assert_eq!(fan::duty_to_percent(255), 100);
+    }
+
+    #[test]
+    fn duty_conversion_rounds_rather_than_truncates() {
+        // 33/255 is 12.94%. Truncating gives 12, which is below the 11% break-away plus
+        // its margin - the fan would be commanded a duty that cannot reliably start it.
+        assert_eq!(fan::duty_to_percent(33), 13);
+        // 28/255 is 10.98%, the measured break-away itself.
+        assert_eq!(fan::duty_to_percent(28), 11);
+        // And the stall point below it, which must not round up into "turning".
+        assert_eq!(fan::duty_to_percent(26), 10);
+    }
+
+    #[test]
+    fn the_conversion_is_monotonic() {
+        // A curve that rises must never command a lower percent than the point below it.
+        let mut previous = 0;
+        for duty in 0..=255u8 {
+            let percent = fan::duty_to_percent(duty);
+            assert!(percent >= previous, "duty {duty} went backwards");
+            previous = percent;
+        }
     }
 
     #[test]

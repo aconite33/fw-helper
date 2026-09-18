@@ -369,6 +369,94 @@ impl<'a> FanControl<'a> {
     }
 }
 
+/// How the daemon reaches the fan, whichever interface this board provides.
+///
+/// Two implementations exist and they are not equivalent. [`FanControl`] drives
+/// `pwm1`/`pwm1_enable` in sysfs and can read back everything it writes. The AMD board
+/// has neither attribute and is driven by raw EC commands, which accept a duty and
+/// report nothing at all (ADR 0013).
+///
+/// The difference is in the contract rather than hidden behind it, because pretending
+/// otherwise is what would make the safety story fictional:
+///
+/// - [`duty`](Self::duty) returns `Option`, and `None` means *this board cannot say* —
+///   not *the fan is off*. A caller that treats those alike stops enforcing the floor.
+/// - [`mode_is_observable`](Self::mode_is_observable) says whether
+///   [`mode`](Self::mode) reflects hardware or merely what we last commanded. The
+///   watchdog and the startup reclaim both exist to catch a fan held by a process that
+///   is no longer managing it, and in-process state is precisely what cannot be trusted
+///   there.
+pub trait FanBackend: Send + Sync {
+    fn is_supported(&self) -> bool;
+
+    /// Whether the fan is under manual control.
+    ///
+    /// On a backend where [`mode_is_observable`](Self::mode_is_observable) is false this
+    /// is a belief, not an observation, and survives nothing that kills the process.
+    fn mode(&self) -> Result<FanMode, FanError>;
+
+    /// Whether [`mode`](Self::mode) is read from hardware.
+    fn mode_is_observable(&self) -> bool;
+
+    /// The duty the hardware reports, or `None` where it reports none.
+    fn duty(&self) -> Result<Option<u8>, FanError>;
+
+    fn rpm(&self) -> Option<u64>;
+
+    /// Take manual control at `duty`, returning what the hardware settled on.
+    fn take_manual(&self, duty: u8) -> Result<u8, FanError>;
+
+    /// Change duty while already holding the fan.
+    fn set_duty(&self, duty: u8) -> Result<u8, FanError>;
+
+    /// Hand the fan back, verifying where the board allows it.
+    fn release(&self) -> Result<(), FanError>;
+
+    /// Hand the fan back without failing, for panic and signal paths. Returns whether
+    /// the release is believed to have taken.
+    fn release_best_effort(&self) -> bool;
+}
+
+impl FanBackend for FanControl<'_> {
+    fn is_supported(&self) -> bool {
+        FanControl::is_supported(self)
+    }
+
+    fn mode(&self) -> Result<FanMode, FanError> {
+        FanControl::mode(self)
+    }
+
+    /// True: this backend reads `pwm1_enable`, so it can tell a fan someone else is
+    /// holding from one we never took.
+    fn mode_is_observable(&self) -> bool {
+        true
+    }
+
+    fn duty(&self) -> Result<Option<u8>, FanError> {
+        FanControl::duty(self).map(Some)
+    }
+
+    fn rpm(&self) -> Option<u64> {
+        FanControl::rpm(self)
+    }
+
+    fn take_manual(&self, duty: u8) -> Result<u8, FanError> {
+        FanControl::take_manual(self, duty)
+    }
+
+    fn set_duty(&self, duty: u8) -> Result<u8, FanError> {
+        FanControl::set_duty(self, duty)
+    }
+
+    fn release(&self) -> Result<(), FanError> {
+        FanControl::release(self)
+    }
+
+    fn release_best_effort(&self) -> bool {
+        FanControl::release_best_effort(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
