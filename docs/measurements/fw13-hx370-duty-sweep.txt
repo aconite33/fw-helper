@@ -1,0 +1,35 @@
+== duty -> RPM sweep ==
+  settling 7s per point, descending; keep the machine IDLE
+  start temp 50.9 C
+
+  duty%    rpm        temp C
+  100      7927       49.9
+  90       7336       49.9
+  80       6826       48.9
+  70       6182       48.9
+  60       5585       47.9
+  50       4890       47.9
+  45       4509       46.9
+  40       4079       47.9
+  35       3614       47.9
+  30       3181       47.9
+  25       2664       47.9
+  20       2155       47.9
+  18       1916       48.9
+  16       1697       48.9
+  14       1478       49.9
+  12       1242       49.9
+  10       987        50.9
+  8        0          49.9
+  6        0          48.9
+  4        0          47.9
+  0        0          46.9
+
+  releasing to EC automatic
+  after release: rpm=0
+
+Read the table for two things:
+  - STICTION: the duty where RPM first reads 0 on the way down.
+    Any duty at or below that is a stopped fan, not a slow one.
+  - CURVATURE: do not fit a line. The Intel board's curve was concave,
+    and a linear fit put the firmware floor BELOW firmware.

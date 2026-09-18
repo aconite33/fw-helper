@@ -40,12 +40,21 @@ pub mod fan {
     /// `EC_CMD_THERMAL_AUTO_FAN_CTRL`. v0 takes no parameters. Hands the fan back to
     /// firmware, and is the command every release path in the daemon depends on.
     pub const AUTO_FAN_CTRL: u32 = 0x0052;
-    /// `EC_CMD_PWM_GET_FAN_TARGET_RPM`.
+    /// `EC_CMD_PWM_GET_FAN_TARGET_RPM` — firmware's own target RPM.
     ///
-    /// **Measured to return 0 on this board**, under manual control and after release
-    /// alike. It is the Intel board's `fan1_target` trap arriving through a different
-    /// interface. Defined here so the number is written down once, with the reason not
-    /// to use it; read `fan1_input` for actual RPM.
+    /// **No use as feedback on our writes**: under manual control it stays frozen at
+    /// whatever firmware last wanted, the Intel board's `fan1_target` trap by another
+    /// route. Read `fan1_input` to see what a written duty did.
+    ///
+    /// **Valuable while the EC owns the fan**, at least on `lilac-4.0.2`: measured
+    /// 2026-09-18 it reported firmware's intent live and ahead of the fan itself — 2265 rpm
+    /// requested before the fan had moved, and up to ~300 rpm ahead of `fan1_input`
+    /// through a ramp. That is exactly what the firmware floor wants to know, and reading
+    /// the lagging speed instead under-reads it. `cros_ec` hwmon exposes the same value
+    /// unprivileged as `fan1_target`, so the daemon need not issue this command at all.
+    ///
+    /// On `lilac-3.0.5` it read 0, but only ever while firmware wanted the fan off, so
+    /// whether it was live there is unknown rather than disproved.
     pub const GET_FAN_TARGET_RPM: u32 = 0x0020;
 
     /// Full duty on this interface. **Duty is a percentage here, not an 8-bit count** —

@@ -196,3 +196,29 @@ is silent. It costs about 235 rpm of minimum speed. **Re-measure from cold befor
   and 92 cooling at the same 61.9 °C). This decides where a custom curve wins, and is
   unmeasured.
 - **Break-away from cold**, per the margin note above.
+
+## Update 2026-09-18 — second board, and point 3 is better than written
+
+Verified on a second AMD board, `FRANMGCP09` (Ryzen AI 9 HX 370) running EC firmware
+**`lilac-4.0.2`**, a new major version:
+
+- The duty and release commands work unchanged, and the EC reclaims the fan cleanly.
+- The fan is the same part: duty→RPM within ~1% of `FRANMGCP05` at every point, and
+  break-away at **11% on both**. `STICTION_DUTY = 13%` stands for both boards.
+
+And point 3 above — *firmware's own duty cannot be observed* — understated what is
+available. On `lilac-4.0.2`, `fan1_target` (and the target-RPM command behind it) reports
+**firmware's own target RPM while the EC owns the fan**, unprivileged, and leads the actual
+speed by up to ~300 rpm through a ramp. The floor should learn from that rather than from
+`fan1_input`: it is firmware's intent rather than the lagging speed, and the lag is in the
+unsafe direction — reading the speed under-reads what firmware wants.
+
+It is still RPM rather than duty, so one table inversion remains. It is still no substitute
+for the missing mode register: it goes on reporting firmware's last target while we hold the
+fan, so it cannot say who owns it. Points 1 and 2 are unaffected.
+
+The earlier conclusion that the command "returns 0 and is useless" came from `lilac-3.0.5`
+observations taken only while firmware wanted the fan off. That test could not tell a dead
+register from a zero target. Whether it is live on `lilac-3` is unknown, and the code must
+not assume either way: a target that stays at 0 while `fan1_input` is non-zero under EC
+control is the signal that a board's register is dead.

@@ -78,6 +78,10 @@ Four things worth carrying into the design:
 - **`EC_CMD_PWM_GET_FAN_TARGET_RPM` returned 0 throughout, under manual control and after
   release.** This is the Intel board's `fan1_target` trap arriving through a different
   interface. It is not a usable feedback signal — read `fan1_input`.
+  *Corrected 2026-09-18:* it is no use as feedback on **our** writes, which still holds —
+  but it was never observed while firmware was spinning the fan, so "0" here could not
+  distinguish a dead register from a zero target. On `lilac-4.0.2` it reports firmware's
+  own target live. See [the second board](#fan1_target-is-live--and-a-correction-to-the-section-above).
 - **This fan is roughly 20% faster than the Pro's at the same duty**: 70% → 6221 rpm here
   against 5201 rpm at the Intel board's equivalent duty 180/255 (71%). Every fan constant in
   the codebase is now known-wrong for this board, not merely presumed wrong.
@@ -130,6 +134,12 @@ ignore sysfs for this.
 ## Confirmed absent
 
 ### No usable RAPL — M4 cannot port
+
+*Partly corrected 2026-08-30:* power **limits** are unavailable as stated below, but package
+**energy** is not — `intel-rapl:0`'s counter advances as root, 3.6 W idle to 32.6 W with all
+twelve cores busy. `energy_uj` below reads "permission-denied" because the survey ran
+unprivileged. The `core` domain `intel-rapl:0:0` is **not** a total: it tracks CPU0 alone
+(6.70 W loading CPU0, 0.014 W loading CPU1). `docs/measurements/amd-rapl-domains.txt`.
 
 - `intel-rapl:0` exists but reads **`enabled=0`**, and `energy_uj` is permission-denied.
 - **There is no `intel-rapl-mmio:0` zone at all** — the zone the Intel fork drives for PL1.
@@ -250,3 +260,78 @@ be assumed:
 - **Peak temperature in ordinary use**, and therefore any threshold derived from it.
 - **Whether the charge limit actually stops charging.**
 - **Whether profiles measurably move power**, which is now the only power control.
+
+---
+
+# Second board: `FRANMGCP09`, Ryzen AI 9 HX 370
+
+Surveyed 2026-09-18. Same product family as the board above — DMI still reports
+`Laptop 13 (AMD Ryzen AI 300 Series)`, not a "Pro" — with a higher-spec CPU, a newer
+mainboard revision and a **new EC firmware major version**.
+
+| | `FRANMGCP05` (above) | `FRANMGCP09` |
+|---|---|---|
+| CPU | Ryzen AI 5 340, 6c/12t | **Ryzen AI 9 HX 370, 12c/24t** |
+| BIOS | 03.05 | 04.02 |
+| EC firmware | `lilac-3.0.5` | **`lilac-4.0.2`** |
+| Battery | NVT `FRANGWA`, 3915 mAh design | **ATC `FRANEDA`, 4640 mAh design** |
+| Kernel | 7.1.11 | 7.2.6 |
+
+Interface shape is unchanged: `cros_ec` hwmon exposes no `pwm1`/`pwm1_enable`, there is
+no `intel-rapl-mmio:0` zone, no power-profiles-daemon, and the same four EC sensors.
+
+## EC commands still work on `lilac-4`
+
+The EC major version changed, so nothing verified against `lilac-3` was assumed:
+
+- **Charge limit `0x3E03` answers** — the daemon reads it (100%) and re-applies it at boot.
+  Efficacy — whether charging actually *stops* — is untested on either AMD board.
+- **Fan duty `0x0024` and release `0x0052` work**, and the EC reclaims cleanly. On a warm
+  machine the release ramps down to firmware's own target (5313 → 2249 rpm over 6 s)
+  rather than dropping to zero.
+
+## The fan is the same fan
+
+| Duty % | 100 | 70 | 50 | 30 | 20 | 12 | 10 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| `FRANMGCP05` | 7864 | 6261 | 4890 | 3160 | 2155 | 1221 | 967 | 0 |
+| `FRANMGCP09` | 7927 | 6182 | 4890 | 3181 | 2155 | 1242 | 987 | 0 |
+
+Within about 1% at every point. Stall is between 8% and 10% on both, and **break-away is
+11% on both** (1098 and 1105 rpm). The two AMD boards can share one duty→RPM table and one
+`STICTION_DUTY`.
+
+## `fan1_target` is live — and a correction to the section above
+
+On `lilac-4.0.2`, `fan1_target` in sysfs (and `EC_CMD_PWM_GET_FAN_TARGET_RPM` behind it)
+reports **firmware's own target RPM while the EC owns the fan**, readable unprivileged.
+Measured under a 24-thread load, 2026-09-18:
+
+| t | CPU (`cpu@4c`) | `fan1_input` | `fan1_target` |
+|---|---|---|---|
+| +5 s | 70 °C | 0 | 0 |
+| +10 s | 68 °C | 0 | **2265** |
+| +20 s | 74 °C | 3510 | 3549 |
+| +55 s | 79 °C | 5886 | **6200** |
+| cooling +10 s | 61 °C | 5886 | 5744 |
+| cooling +20 s | 54 °C | 3737 | 3797 |
+
+The target **leads** the actual speed — firmware decided on 2265 rpm before the fan had
+moved, and during the ramp actual trailed intent by up to ~300 rpm.
+
+**This corrects the earlier claim that the target command is useless.** On `lilac-3.0.5`
+it read 0 throughout — but it was only ever observed while firmware wanted the fan off or
+while we held it manually, so the test could not tell a dead register from a zero target.
+That board's register may have worked all along; it was never observed under load. What
+*does* still hold on both is narrower: under manual control the target stays frozen at
+firmware's last value, so it is **no use as feedback on our own writes**.
+
+Why it matters: ADR 0011's floor wants to know what firmware would do. Inverting
+`fan1_input` answers with the lagging *speed*, and during a ramp that under-reads
+firmware's intent by hundreds of rpm — putting the floor below firmware, the one unsafe
+direction. `fan1_target` is the intent itself.
+
+Firmware's curve on this board, from the same run: silent heating past 70 °C, starting
+at about 68 °C and topping out at **6200 rpm** at 79 °C, and hysteretic on the way down —
+at 61 °C it wanted 5744 rpm cooling against nothing at 70 °C heating. Full 24-thread load
+held **79 °C**.
