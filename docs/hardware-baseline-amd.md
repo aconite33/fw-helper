@@ -335,3 +335,54 @@ Firmware's curve on this board, from the same run: silent heating past 70 °C, s
 at about 68 °C and topping out at **6200 rpm** at 79 °C, and hysteretic on the way down —
 at 61 °C it wanted 5744 rpm cooling against nothing at 70 °C heating. Full 24-thread load
 held **79 °C**.
+
+## Firmware follows the board thermistor, and is not hysteretic against it
+
+Recorded 2026-09-18 with `scripts/probe-fan-curve.sh`: 100 s of 24-thread load then 120 s
+of cooling, every sensor and `fan1_target` every 2 s.
+`docs/measurements/fw13-hx370-fan-curve.txt`.
+
+**`cpu@4c` is the die.** It tracks `k10temp` `Tctl` within about a degree throughout
+(71.8 vs 72.5, 82.8 vs 83.0, 66.8 vs 67.2 °C). It is the AMD counterpart of the Intel
+board's `peci-temp`.
+
+**Firmware's target is a function of `cpu_f75303@4d`**, the board thermistor near the
+CPU — and against that sensor it is **identical heating and cooling**:
+
+| `cpu_f75303@4d` | 53.9 | 54.9 | 56.9 | 57.9 | 60.9 | 62.9 | 64.8 | 66.8 |
+|---|---|---|---|---|---|---|---|---|
+| heating, rpm | 2928 | 3135 | 3549 | 3797 | 4419 | 4874 | 5288 | 5744 |
+| cooling, rpm | 2928 | 3135 | 3549 | 3797 | 4419 | 4874 | 5288 | 5744 |
+
+Against the die the same data looks strongly hysteretic: at a die temperature of 71.8 °C
+firmware asked for **2928** rpm heating and **5288** cooling. That is not firmware
+remembering which way it was going. The die heats and cools in seconds; the thermistor
+lags it by tens of seconds; firmware reads the thermistor.
+
+The curve, cooling branch, every point recorded:
+
+| board °C | ≤49.9 | 50.9 | 51.9 | 52.9 | 53.9 | 55.9 | 57.9 | 59.9 | 61.9 | 63.9 | 65.8 | 67.8 | ≥68.8 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| rpm | 0 | 2265 | 2472 | 2679 | 2928 | 3342 | 3797 | 4212 | 4667 | 5081 | 5537 | 5951 | 6200 |
+
+Off below about 50 °C, 2265 rpm on, then roughly 207 rpm per degree to a 6200 rpm cap.
+Full 24-thread load settled at a die temperature of 83 °C with the thermistor at 74 °C.
+
+### What this changes
+
+- **The daemon's control sensor is right, by accident.** `control_temp()` takes the first
+  label containing `cpu`, which is `cpu_f75303@4d` — the sensor firmware follows. It is
+  now right by evidence, and should be named rather than fallen into.
+- **"Never quieter than firmware" needs no branch on this board.** Firmware's floor is a
+  known function of the control sensor, and `fan1_target` reports it live besides. ADR
+  0011's ascending-branch learning and the direction hysteresis in `floor.rs` exist to
+  untangle a curve that, measured against the right sensor, is not tangled.
+- **The Intel cold-start model is unsafe here.** It predicts 2925 rpm at 64.8 °C; this
+  firmware wants 5288. A floor built from the Intel tables sits roughly 2000 rpm below
+  firmware across the middle of the range.
+
+**An open question for the Intel board**, not a claim about it: its baseline records 20 °C
+of hysteresis measured against `peci-temp`, the die sensor — and notes that firmware "is
+likely triggering on something other than instantaneous `peci-temp`". This measurement is
+what that suspicion would look like if it were true. Recording the Intel board's curve
+against its board thermistors would settle it.
