@@ -23,13 +23,16 @@
 //!   real deficit hide inside the tolerance, which hardware caught and unit tests did
 //!   not.
 
+use crate::ec::{EcFan, EcTransport};
+use fw_helper_core::board::{Board, BoardProfile};
 use fw_helper_core::fan::DUTY_TOLERANCE;
 use fw_helper_core::{
-    BatteryGuard, Ceiling, Curve, CurveEngine, FanControl, FanError, FanMode, FirmwareFloor, Sysfs,
+    BatteryGuard, Ceiling, Curve, CurveEngine, FanBackend, FanControl, FanError, FanMode,
+    FirmwareFloor, Sysfs,
 };
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub enum LeaseError {
@@ -46,6 +49,9 @@ pub enum LeaseError {
         celsius: f64,
         guard: BatteryGuard,
     },
+    /// Nothing measured describes this board's fan, so there is no floor that can be
+    /// trusted to stay above firmware. Guessing is how the floor ends up below it.
+    UnmeasuredBoard,
     Fan(FanError),
 }
 
@@ -70,6 +76,12 @@ impl fmt::Display for LeaseError {
                  it cannot throttle to protect itself, so the fan is not configurable \
                  until it cools (ADR 0011)"
             ),
+            Self::UnmeasuredBoard => write!(
+                f,
+                "this board's fan has not been measured, so there is no firmware floor \
+                 that can be trusted to stay above firmware; leaving the fan to the EC. \
+                 scripts/probe-fan-amd.c and scripts/probe-fan-curve.sh measure one"
+            ),
             Self::Fan(e) => write!(f, "{e}"),
         }
     }
@@ -91,9 +103,17 @@ pub struct Thermal {
 }
 
 impl Thermal {
-    /// Read the decision inputs out of a telemetry sample.
-    pub fn from_telemetry(t: &fw_helper_core::Telemetry) -> Self {
-        let control = t.control_temp();
+    /// Read the decision inputs out of a telemetry sample, following `sensor` when the
+    /// board names one.
+    ///
+    /// The floor promises never to be quieter than firmware, and that comparison only
+    /// means something on the sensor firmware itself reads. The fallback chain happens
+    /// to land on it for both measured boards, but only because of the order the EC
+    /// lists its sensors in - which is an implementation detail, not a measurement.
+    pub fn from_telemetry_for(t: &fw_helper_core::Telemetry, sensor: Option<&str>) -> Self {
+        let control = sensor
+            .and_then(|label| t.temps.iter().find(|r| r.label == label))
+            .or_else(|| t.control_temp());
         let battery = t.battery_temp();
         Self {
             celsius: control.map(|c| c.celsius),
@@ -182,8 +202,27 @@ impl From<FanError> for LeaseError {
     }
 }
 
+/// Above this the fan is turning, whatever it was asked for. Well below the slowest
+/// running speed measured on any board (967 rpm, sustained at 10%) and well above the
+/// noise a stopped fan reports.
+const FAN_SPINNING_RPM: u64 = 500;
+
 pub struct FanLease {
     fs: Sysfs,
+    /// The EC, for boards whose `cros_ec` hwmon has no `pwm1` (ADR 0013). `None` means
+    /// the sysfs path is the only one tried.
+    ec: Option<Arc<dyn EcTransport>>,
+    /// Whether the EC backend believes it holds the fan. There is no register to read
+    /// on those boards, so this is the only answer there is, and it lives here rather
+    /// than in the backend because the backend is rebuilt for every operation.
+    ///
+    /// Separate from `held` on purpose. `release_now` clears `held` whether or not the
+    /// release worked; this is cleared only by a release the EC accepted, so the
+    /// watchdog keeps retrying after a failed one instead of concluding it is done.
+    ec_manual: AtomicBool,
+    /// What this board is, as measured. Decides the floor's tables and the sensor it
+    /// follows, and whether manual control is allowed at all.
+    board: Board,
     /// Whether *this process* believes it holds manual control. Used for logging and
     /// for deciding whether a shutdown is worth announcing — never as a precondition
     /// for releasing.
@@ -224,17 +263,54 @@ pub struct FanLease {
 }
 
 impl FanLease {
+    /// A lease for the Intel board over sysfs, which is what every existing test in this
+    /// module was written against. The daemon uses [`FanLease::for_board`].
+    #[cfg(test)]
     pub fn new(fs: Sysfs) -> Self {
+        use fw_helper_core::board::INTEL_CORE_ULTRA_3;
+        Self::for_board(fs, Board::Measured(&INTEL_CORE_ULTRA_3), None)
+    }
+
+    pub fn for_board(fs: Sysfs, board: Board, ec: Option<Arc<dyn EcTransport>>) -> Self {
+        let floor = match board.profile() {
+            Some(profile) => FirmwareFloor::for_board(profile),
+            // Never consulted: `write` refuses before any floor is needed. Built only
+            // so the lease can exist, because its release paths must work on any board.
+            None => FirmwareFloor::new(),
+        };
         Self {
             fs,
+            ec,
+            ec_manual: AtomicBool::new(false),
+            board,
             held: AtomicBool::new(false),
             requested: AtomicU8::new(0),
             applied: AtomicU8::new(0),
             restore_pending: AtomicBool::new(false),
             restore_duty: AtomicU8::new(0),
             curve: Mutex::new(None),
-            floor: Mutex::new(FirmwareFloor::new()),
+            floor: Mutex::new(floor),
         }
+    }
+
+    fn profile(&self) -> Option<&'static BoardProfile> {
+        self.board.profile()
+    }
+
+    /// The sensor firmware's fan follows on this board, if measured.
+    pub fn control_sensor(&self) -> Option<&'static str> {
+        self.profile().map(|p| p.control_sensor)
+    }
+
+    /// Thermal inputs for a fan decision, on the sensor firmware follows here.
+    pub fn thermal(&self, sample: &fw_helper_core::Telemetry) -> Thermal {
+        Thermal::from_telemetry_for(sample, self.control_sensor())
+    }
+
+    /// Whether firmware's curve depends on direction on this board. When it does not,
+    /// a cooling observation is as good as a heating one.
+    pub fn firmware_curve_hysteretic(&self) -> bool {
+        self.profile().is_none_or(|p| p.firmware_curve_hysteretic)
     }
 
     /// Record the duty firmware chose at this temperature.
@@ -282,8 +358,32 @@ impl FanLease {
             .unwrap_or(u8::MAX)
     }
 
-    fn control(&self) -> Result<FanControl<'_>, FanError> {
-        FanControl::probe(&self.fs)
+    /// The fan, through whichever interface this board provides.
+    ///
+    /// Sysfs first (ADR 0004): where `pwm1_enable` exists it can be read back, which is
+    /// strictly more than the EC path offers. Built fresh every time, as before - the
+    /// release paths have to work when in-process state is what cannot be trusted.
+    fn control(&self) -> Result<Box<dyn FanBackend + '_>, FanError> {
+        if let Ok(sysfs) = FanControl::probe(&self.fs) {
+            return Ok(Box::new(sysfs));
+        }
+        if let Some(ec) = &self.ec {
+            let fan = EcFan::new(&**ec, &self.fs, &self.ec_manual);
+            if fan.is_supported() {
+                return Ok(Box::new(fan));
+            }
+        }
+        Err(FanError::Unsupported)
+    }
+
+    /// Whether [`Self::mode`] is read from hardware on this board.
+    ///
+    /// True when there is no fan control at all: then nothing can be holding the fan,
+    /// so there is nothing to release unconditionally.
+    pub fn mode_is_observable(&self) -> bool {
+        self.control()
+            .map(|c| c.mode_is_observable())
+            .unwrap_or(true)
     }
 
     pub fn held(&self) -> bool {
@@ -294,8 +394,36 @@ impl FanLease {
         self.control().ok()?.mode().ok()
     }
 
+    /// The duty the hardware reports, or `None` where it reports none - which is not
+    /// the same as zero, and must not be read as one.
     pub fn duty(&self) -> Option<u8> {
-        self.control().ok()?.duty().ok()
+        self.control().ok()?.duty().ok().flatten()
+    }
+
+    /// The duty firmware is choosing right now, for the floor to learn from. Call only
+    /// while the EC owns the fan.
+    ///
+    /// Where the board reports a duty (`pwm1` on Intel), that is firmware's own. Where it
+    /// does not, firmware's **target** rpm is read from `fan1_target` and turned into a
+    /// duty through this board's fan table - the target rather than the speed, because
+    /// the speed lags the target by up to ~300 rpm through a ramp, and that lag reads as
+    /// firmware wanting less than it does.
+    pub fn firmware_duty(&self) -> Option<u8> {
+        if let Some(duty) = self.duty() {
+            return Some(duty);
+        }
+        let hwmon = self.fs.find_hwmon(fw_helper_core::paths::EC_HWMON_NAME)?;
+        let target = self.fs.read_u64(&format!("{hwmon}/fan1_target")).ok()?;
+        let actual = self.fs.read_u64(&format!("{hwmon}/fan1_input")).ok()?;
+        // A dead register reads 0 whatever firmware is doing. Learning from it would
+        // teach the floor that firmware is silent while the fan is plainly spinning -
+        // and let us hold it silent. `fan1_target` is known live on EC lilac-4.0.2 and
+        // unknown on lilac-3, so this is checked every time rather than assumed.
+        if target == 0 && actual > FAN_SPINNING_RPM {
+            return None;
+        }
+        let rpm = u16::try_from(target).unwrap_or(u16::MAX);
+        self.floor.lock().ok().map(|f| f.duty_for_rpm(rpm))
     }
 
     /// Reclaim the fan at startup if it was left under manual control.
@@ -306,6 +434,18 @@ impl FanLease {
     /// gone wrong", which makes every start a free check on whether the restore paths
     /// are actually working.
     pub fn reclaim_at_startup(&self) {
+        // A new process has no memory of what the last one did, and on a board with no
+        // mode register there is nothing to ask. Releasing is idempotent - handing the
+        // fan to an EC that already has it changes nothing - so release rather than try
+        // to answer a question that has no answer here (ADR 0013, point 2).
+        if !self.mode_is_observable() {
+            if self.release_now() {
+                eprintln!("fan: no mode register on this board; returned the fan to the EC unconditionally");
+            } else {
+                eprintln!("WARNING: could not return the fan to EC control at startup");
+            }
+            return;
+        }
         match self.mode() {
             Some(FanMode::Auto) | None => {}
             Some(other) => {
@@ -416,7 +556,11 @@ impl FanLease {
         let floor = self.floor_duty(celsius).max(thermal.battery_floor());
         let target = requested.max(floor);
 
-        let current = self.duty()?;
+        // `None` where the board reports no duty. This used to be `self.duty()?`, which
+        // on such a board returned before writing - every tick - so the floor was never
+        // enforced at all and nothing logged it (ADR 0013).
+        let current = self.duty();
+        let previous = self.applied.load(Ordering::SeqCst);
         // Two separate questions, and conflating them is what caused the defect
         // described on `applied`:
         //
@@ -424,14 +568,21 @@ impl FanLease {
         //    is still below the floor.
         // 2. Has something moved the fan out from under us? That comparison is against
         //    what the hardware reports, and only there does quantization slack belong.
-        let decision_changed = target != self.applied.load(Ordering::SeqCst);
-        let drifted = current.abs_diff(target) > DUTY_TOLERANCE;
+        //    Where nothing is reported, drift cannot be detected, only prevented - so
+        //    the duty is re-asserted every tick instead (ADR 0013, point 1).
+        let decision_changed = target != previous;
+        let drifted = match current {
+            Some(duty) => duty.abs_diff(target) > DUTY_TOLERANCE,
+            None => true,
+        };
         if !decision_changed && !drifted {
             return None;
         }
         match self.write(target) {
+            // A routine re-assertion on a board that cannot report drift is not news.
+            Ok(_) if !decision_changed && current.is_none() => None,
             Ok(settled) => Some(Enforced::Corrected {
-                from: current,
+                from: current.unwrap_or(previous),
                 to: settled,
                 floor,
                 celsius,
@@ -442,6 +593,12 @@ impl FanLease {
 
     /// Take the fan if we do not have it, then write `duty`.
     fn write(&self, duty: u8) -> Result<u8, LeaseError> {
+        // Every path that takes or changes the fan comes through here, so this is the
+        // one place an unmeasured board is refused - the floor that would bound it is
+        // not known to stay above firmware.
+        if self.profile().is_none() {
+            return Err(LeaseError::UnmeasuredBoard);
+        }
         let fan = self.control()?;
         // Trust the hardware over our own flag: if something else handed the fan back
         // to the EC, take it again rather than issue a write that would be rejected.
@@ -621,6 +778,139 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// An AMD Ryzen AI 300 board as measured: `cros_ec` hwmon with fan speed, target and
+    /// the board thermistor firmware follows - and no `pwm1` or `pwm1_enable` at all.
+    fn amd_board(board_name: &str) -> (PathBuf, Arc<crate::ec::fake::FakeEc>, FanLease) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("fw-helperd-amd-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let hw = root.join("sys/class/hwmon/hwmon8");
+        fs::create_dir_all(&hw).unwrap();
+        fs::write(hw.join("name"), "cros_ec\n").unwrap();
+        fs::write(hw.join("fan1_input"), "0\n").unwrap();
+        fs::write(hw.join("fan1_target"), "0\n").unwrap();
+        fs::write(hw.join("temp2_input"), "45850\n").unwrap();
+        fs::write(hw.join("temp2_label"), "cpu_f75303@4d\n").unwrap();
+        let dmi = root.join("sys/class/dmi/id");
+        fs::create_dir_all(&dmi).unwrap();
+        fs::write(dmi.join("board_name"), format!("{board_name}\n")).unwrap();
+
+        let sysfs = Sysfs::new(&root);
+        let board = fw_helper_core::board::identify(&sysfs);
+        let ec = Arc::new(crate::ec::fake::FakeEc::new(0, 100));
+        let transport: Arc<dyn EcTransport> = ec.clone();
+        let lease = FanLease::for_board(sysfs, board, Some(transport));
+        (root, ec, lease)
+    }
+
+    fn set_rpm(root: &Path, input: u64, target: u64) {
+        let hw = root.join("sys/class/hwmon/hwmon8");
+        fs::write(hw.join("fan1_input"), format!("{input}\n")).unwrap();
+        fs::write(hw.join("fan1_target"), format!("{target}\n")).unwrap();
+    }
+
+    #[test]
+    fn an_amd_board_drives_the_fan_through_the_ec() {
+        let (_root, ec, lease) = amd_board("FRANMGCP09");
+        let applied = lease.set_duty(128, th(IDLE_C)).unwrap();
+        assert!(lease.held());
+        assert_eq!(ec.fan_percent(), Some(50), "128/255 goes to the EC as 50%");
+        assert_eq!(applied.settled, 128);
+    }
+
+    #[test]
+    fn startup_reclaim_releases_unconditionally_without_a_mode_register() {
+        // A previous instance died holding the fan. This process remembers nothing, and
+        // there is no register to ask - so it must release without asking, or the fan
+        // stays at whatever the dead process last chose.
+        let (_root, ec, lease) = amd_board("FRANMGCP09");
+        ec.hold_fan(15);
+        assert!(!lease.mode_is_observable());
+        lease.reclaim_at_startup();
+        assert_eq!(ec.fan_percent(), None, "the stranded fan was not reclaimed");
+    }
+
+    #[test]
+    fn the_floor_is_enforced_where_no_duty_can_be_read_back() {
+        // Regression: this used to be `self.duty()?`, which on a board with no duty
+        // register returned before writing, every tick - the floor was never enforced
+        // and nothing said so.
+        let (_root, ec, lease) = amd_board("FRANMGCP09");
+        lease.set_duty(0, th(40.0)).unwrap(); // silence, allowed while firmware is silent
+        assert_eq!(ec.fan_percent(), Some(0));
+
+        // Firmware follows the thermistor at 62.9 C with 4874 rpm. Silence is no longer
+        // on offer, and the floor has to say so through the EC.
+        let enforced = lease.enforce_floor(th(62.9));
+        assert!(
+            matches!(enforced, Some(Enforced::Corrected { .. })),
+            "floor not enforced: {enforced:?}"
+        );
+        let percent = ec.fan_percent().unwrap();
+        let rpm_at = |p: u8| {
+            let duty = fw_helper_core::ec::fan::percent_to_duty(p);
+            FirmwareFloor::for_board(&fw_helper_core::board::AMD_RYZEN_AI_300).duty_for_rpm(4874)
+                <= duty
+        };
+        assert!(rpm_at(percent), "{percent}% is below firmware's 4874 rpm");
+    }
+
+    #[test]
+    fn a_held_fan_is_re_asserted_quietly_every_tick() {
+        // With nothing to read back, drift cannot be detected - only prevented. The
+        // re-assertion is a real write but not news, so it is not reported.
+        let (_root, ec, lease) = amd_board("FRANMGCP09");
+        lease.set_duty(200, th(IDLE_C)).unwrap();
+        let before = ec.sent.lock().unwrap().len();
+        assert!(
+            lease.enforce_floor(th(IDLE_C)).is_none(),
+            "re-assertion reported as news"
+        );
+        let after = ec.sent.lock().unwrap().len();
+        assert_eq!(after, before + 1, "the duty was not re-asserted");
+    }
+
+    #[test]
+    fn an_unmeasured_board_is_refused_the_fan() {
+        let (_root, ec, lease) = amd_board("FRANXXXX01");
+        assert!(matches!(
+            lease.set_duty(128, th(IDLE_C)),
+            Err(LeaseError::UnmeasuredBoard)
+        ));
+        assert_eq!(ec.fan_percent(), None);
+        assert!(!lease.held());
+        // And its release paths still work: an unmeasured board is not an excuse to
+        // leave a stranded fan where it is.
+        ec.hold_fan(20);
+        lease.reclaim_at_startup();
+        assert_eq!(ec.fan_percent(), None);
+    }
+
+    #[test]
+    fn firmware_is_learned_from_its_target_through_this_boards_fan() {
+        let (root, _ec, lease) = amd_board("FRANMGCP09");
+        set_rpm(&root, 4636, 4874); // the fan lagging firmware's target, as measured
+        let expected =
+            FirmwareFloor::for_board(&fw_helper_core::board::AMD_RYZEN_AI_300).duty_for_rpm(4874);
+        assert_eq!(
+            lease.firmware_duty(),
+            Some(expected),
+            "must use the target, not the lag"
+        );
+    }
+
+    #[test]
+    fn a_dead_target_register_teaches_the_floor_nothing() {
+        // On EC lilac-3 whether fan1_target is live is unknown. A dead one reads 0 while
+        // the fan spins, and learning from it would teach "firmware is silent here".
+        let (root, _ec, lease) = amd_board("FRANMGCP05");
+        set_rpm(&root, 3000, 0);
+        assert_eq!(lease.firmware_duty(), None);
+        // A real zero - fan stopped, firmware asking for nothing - is still learned.
+        set_rpm(&root, 0, 0);
+        assert_eq!(lease.firmware_duty(), Some(0));
+    }
 
     /// Idle on the reference machine. The EC runs the fan at 0 rpm here, so the floor
     /// is 0 and the user may ask for silence.

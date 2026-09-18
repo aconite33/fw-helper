@@ -44,7 +44,7 @@ pub struct BoardProfile {
 /// `peci-temp`, the die sensor. On the AMD boards the same shape turned out to be thermal
 /// lag between the die and the thermistor firmware actually reads - whether that is also
 /// true here is unmeasured, so this keeps the hysteretic treatment it was verified with.
-pub const INTEL_CORE_ULTRA_3: BoardProfile = BoardProfile {
+pub static INTEL_CORE_ULTRA_3: BoardProfile = BoardProfile {
     name: "Framework 13 Pro (Intel Core Ultra Series 3)",
     measured_on: &["FRANMJCP07"],
     family_prefix: "FRANMJCP",
@@ -92,7 +92,7 @@ pub const INTEL_CORE_ULTRA_3: BoardProfile = BoardProfile {
 /// firmware is off at 49.9 °C and at 2265 rpm by 50.9, and the sensor reads in whole
 /// degrees, so the floor jumps straight to 2265 above 49.9 rather than interpolating
 /// through speeds firmware never uses.
-pub const AMD_RYZEN_AI_300: BoardProfile = BoardProfile {
+pub static AMD_RYZEN_AI_300: BoardProfile = BoardProfile {
     name: "Framework 13 (AMD Ryzen AI 300)",
     measured_on: &["FRANMGCP05", "FRANMGCP09"],
     family_prefix: "FRANMGCP",
@@ -137,7 +137,11 @@ pub const AMD_RYZEN_AI_300: BoardProfile = BoardProfile {
 };
 
 /// Every profile, in the order they are tried.
-pub const PROFILES: [&BoardProfile; 2] = [&INTEL_CORE_ULTRA_3, &AMD_RYZEN_AI_300];
+///
+/// Profiles are `static`, not `const`, so each has exactly one address. A `const` is
+/// copied at every use, and two copies of the same profile compare unequal by address -
+/// which made "is this the same board?" answer no for the same board.
+pub static PROFILES: [&BoardProfile; 2] = [&INTEL_CORE_ULTRA_3, &AMD_RYZEN_AI_300];
 
 /// What is known about the board this is running on.
 #[derive(Debug, Clone, Copy)]

@@ -107,10 +107,10 @@ impl Daemon {
     /// telemetry the daemon publishes.
     fn thermal(&self) -> crate::fan::Thermal {
         match self.latest.lock() {
-            Ok(t) => crate::fan::Thermal::from_telemetry(&t),
+            Ok(t) => self.fan.thermal(&t),
             // A poisoned lock must not become "no sensor", which would read as a
             // reason to refuse rather than a reason to be careful.
-            Err(e) => crate::fan::Thermal::from_telemetry(&e.into_inner().clone()),
+            Err(e) => self.fan.thermal(&e.into_inner().clone()),
         }
     }
 
@@ -185,11 +185,18 @@ impl Daemon {
     /// Lives here because the state file is one file with one owner: writing it from
     /// the poll loop directly would race the charge-limit write and silently drop one.
     pub fn save_floor(&self, observations: Vec<(f64, u8)>) {
+        let board = self
+            .fs
+            .read_string(fw_helper_core::board::DMI_BOARD_NAME)
+            .ok()
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
         if let Ok(mut state) = self.state.lock() {
-            if state.floor == observations {
+            if state.floor == observations && state.floor_board == board {
                 return;
             }
             state.floor = observations;
+            state.floor_board = board;
             state.save();
         }
     }
@@ -896,6 +903,7 @@ mod tests {
             profile_on_ac: None,
             profile_on_battery: None,
             floor: Vec::new(),
+            floor_board: None,
         };
         let lease = Arc::new(crate::fan::FanLease::new(fs_.clone()));
         let wd = crate::watchdog::Watchdog::new(Arc::clone(&lease));

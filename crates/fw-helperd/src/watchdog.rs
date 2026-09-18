@@ -92,6 +92,16 @@ impl Watchdog {
         // nothing at risk, and a wedged daemon that never took the fan is not this
         // module's problem.
         if self.lease.mode() != Some(FanMode::Manual) {
+            // Unless nothing can prove it. On a board with no mode register "not held"
+            // is this process's belief, not an observation (ADR 0013, point 2). The belief
+            // is sound here - it lives in the same process - but a bug that desynchronised
+            // it would leave the fan held with nobody watching, and the release is
+            // idempotent and cheap. So release anyway, and say nothing: this is not an
+            // intervention, and reporting one would claim the daemon died holding a fan
+            // it may never have taken.
+            if !self.lease.mode_is_observable() {
+                let _ = self.lease.release_now();
+            }
             return false;
         }
 

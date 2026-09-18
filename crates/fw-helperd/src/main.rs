@@ -52,18 +52,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fw_helper_core::Cap::No(format!("no {}; is cros_ec_chardev loaded?", ec::DEVICE))
     };
 
+    // Which board this is decides the fan's floor and whether manual control is offered
+    // at all. On a board with no pwm1, core's sysfs-only verdict is replaced by the EC's,
+    // exactly as for the charge limit above.
+    let board = fw_helper_core::board::identify(&fs);
+    if !caps.fan_control.is_available() && ec::CrosEc::default().exists() {
+        caps.fan_control = ec::fan_capability(&*cros_ec, board);
+    }
+
     eprintln!("fw-helperd starting ({})", build_stamp());
+    eprintln!("  board              {board}");
     for (name, cap) in caps.summary() {
         eprintln!("  {name:<18} {cap}");
-    }
-    if !caps.package_power.is_available() {
-        eprintln!("note: package power needs root; running unprivileged?");
     }
 
     // Before anything else: if a previous instance died holding manual fan control,
     // take it back. This runs even when fan control is unsupported, where it is a
     // no-op, because the cost of asking is one read.
-    let lease = Arc::new(fan::FanLease::new(fs.clone()));
+    let lease = Arc::new(fan::FanLease::for_board(
+        fs.clone(),
+        board,
+        Some(Arc::clone(&cros_ec)),
+    ));
     lease.reclaim_at_startup();
     install_panic_hook(Arc::clone(&lease));
 
@@ -74,8 +84,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("persisted charge limit: {limit}%");
     }
     if !state.floor.is_empty() {
-        let n = lease.restore_floor(state.floor.clone());
-        eprintln!("restored {n} firmware fan floor observations");
+        if state::floor_applies(state.floor_board.as_deref(), board) {
+            let n = lease.restore_floor(state.floor.clone());
+            eprintln!("restored {n} firmware fan floor observations");
+        } else {
+            // The state file moves with the disk; the fan and firmware it describes do
+            // not. Relearning costs some quiet. Keeping it could bound this board's fan
+            // by another board's firmware.
+            eprintln!(
+                "discarded {} firmware fan floor observations learned on {}, which is \
+                 not this board ({board})",
+                state.floor.len(),
+                state
+                    .floor_board
+                    .as_deref()
+                    .unwrap_or("an unrecorded board")
+            );
+        }
     }
     // Started before the bus name is claimed: from the moment a client can ask for
     // manual fan control, the thing that takes it back must already be running.
@@ -197,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the floor and ceiling reflect the machine as it is now rather than as it was when
 /// it went down.
 fn restore_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry) {
-    match lease.restore_after_resume(fan::Thermal::from_telemetry(sample)) {
+    match lease.restore_after_resume(lease.thermal(sample)) {
         None => {}
         Some(Ok(applied)) if applied.clamped() => eprintln!(
             "fan: restored after resume at duty {}/255, raised from the requested {} \
@@ -376,7 +401,7 @@ struct Govern {
 ///   is chosen and becomes stuck-low as soon as the machine is loaded.
 fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: &mut Govern) {
     let previous_duty = state.duty;
-    let thermal = fan::Thermal::from_telemetry(sample);
+    let thermal = lease.thermal(sample);
     let celsius = thermal.celsius;
 
     // Rising or steady. Firmware's descending branch is hysteresis rather than a
@@ -394,9 +419,14 @@ fn govern_fan(lease: &fan::FanLease, sample: &fw_helper_core::Telemetry, state: 
     state.celsius = celsius;
 
     if !lease.held() {
-        // pwm1 reports firmware's OWN duty while the EC owns the fan, so this reads
-        // the real curve rather than inferring it from RPM through two tables.
-        if let (Some(c), Some(duty)) = (celsius, lease.duty()) {
+        // Firmware's own choice while the EC owns the fan: `pwm1` where the board has it,
+        // and firmware's target rpm through this board's fan table where it does not.
+        //
+        // Where firmware's curve does not depend on direction - on the AMD boards it is
+        // identical heating and cooling, against the sensor it actually reads - a cooling
+        // observation is as good a record of it as a heating one.
+        let rising = rising || !lease.firmware_curve_hysteretic();
+        if let (Some(c), Some(duty)) = (celsius, lease.firmware_duty()) {
             // Credit the whole span since the last sample, not just this point: the die
             // sensor climbs ~4 C/s under load, so consecutive 1 Hz samples skip whole
             // buckets and endpoint-only recording learns almost nothing per event.
@@ -657,7 +687,7 @@ async fn poll_loop(ctx: Poll) {
                     eprintln!("re-applying persisted profile {name}");
                     power_corrections = 0;
                     applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
-                    let thermal = fan::Thermal::from_telemetry(&sample);
+                    let thermal = lease.thermal(&sample);
                     if let Err(e) =
                         apply_profile(&p, true, &axis, &lease, &fs, &*cros_ec, thermal).await
                     {
@@ -713,7 +743,7 @@ async fn poll_loop(ctx: Poll) {
                             eprintln!("switched to {source}; applying profile {name}");
                             power_corrections = 0;
                             applied_ppd.store(ppd_code(p.ppd), Ordering::SeqCst);
-                            let thermal = fan::Thermal::from_telemetry(&sample);
+                            let thermal = lease.thermal(&sample);
                             if let Err(e) =
                                 apply_profile(&p, true, &axis, &lease, &fs, &*cros_ec, thermal)
                                     .await
@@ -750,7 +780,7 @@ async fn poll_loop(ctx: Poll) {
                     p.name
                 );
                 power_corrections = 0;
-                let thermal = fan::Thermal::from_telemetry(&sample);
+                let thermal = lease.thermal(&sample);
                 if let Err(e) =
                     apply_profile(&p, false, &axis, &lease, &fs, &*cros_ec, thermal).await
                 {

@@ -109,6 +109,33 @@ pub mod fan {
     }
 }
 
+/// What the EC says it can do.
+///
+/// Asked before offering fan control on a board with no `pwm1`: without
+/// `EC_FEATURE_PWM_FAN` the duty command would be refused, and a capability that
+/// reports "available" and then fails on first use is a control that lies.
+///
+/// Verified against `torvalds/linux` `include/linux/platform_data/cros_ec_commands.h`.
+pub mod features {
+    /// `EC_CMD_GET_FEATURES`. No parameters; answers `{ uint32_t flags[2]; }`.
+    pub const GET_FEATURES: u32 = 0x000D;
+    /// Bytes in the answer.
+    pub const RESPONSE_LEN: usize = 8;
+    /// `EC_FEATURE_PWM_FAN`: a bit index across `flags[0..2]`.
+    pub const PWM_FAN: u32 = 2;
+
+    /// Whether `feature` is set in a `GET_FEATURES` answer. `None` if the answer is too
+    /// short to say - which must not be read as "absent", any more than as "present".
+    pub fn has(response: &[u8], feature: u32) -> Option<bool> {
+        if response.len() < RESPONSE_LEN {
+            return None;
+        }
+        let word = (feature / 32) as usize;
+        let bytes: [u8; 4] = response[word * 4..word * 4 + 4].try_into().ok()?;
+        Some(u32::from_le_bytes(bytes) & (1 << (feature % 32)) != 0)
+    }
+}
+
 /// Bytes in a charge-limit request: `modes`, `max_percentage`, `min_percentage`.
 pub const REQUEST_LEN: usize = 3;
 /// Bytes the EC returns for a `Get`: `max_percentage`, `min_percentage`.
@@ -260,6 +287,29 @@ mod tests {
         assert_eq!(fan::duty_to_percent(28), 11);
         // And the stall point below it, which must not round up into "turning".
         assert_eq!(fan::duty_to_percent(26), 10);
+    }
+
+    #[test]
+    fn feature_ids_are_the_ones_verified_against_the_kernel_header() {
+        assert_eq!(features::GET_FEATURES, 0x000D);
+        assert_eq!(features::PWM_FAN, 2);
+    }
+
+    #[test]
+    fn reads_the_pwm_fan_bit_from_the_measured_answer() {
+        // flags[0]=0x0207E6AE flags[1]=0x00000207, measured on FRANMGCP05. Bit 2 set.
+        let mut answer = 0x0207_E6AE_u32.to_le_bytes().to_vec();
+        answer.extend_from_slice(&0x0000_0207_u32.to_le_bytes());
+        assert_eq!(features::has(&answer, features::PWM_FAN), Some(true));
+        // Bit 0, EC_FEATURE_LIMITED, is clear on that board: a full command set.
+        assert_eq!(features::has(&answer, 0), Some(false));
+        // And a bit in the second word.
+        assert_eq!(features::has(&answer, 32), Some(true));
+    }
+
+    #[test]
+    fn a_short_feature_answer_says_nothing() {
+        assert_eq!(features::has(&[0xFF; 4], features::PWM_FAN), None);
     }
 
     #[test]

@@ -10,12 +10,14 @@
 
 use fw_helper_core::charge::{MAX_LIMIT, MIN_LIMIT};
 use fw_helper_core::ec::{self, ChargeLimits};
-use fw_helper_core::{Cap, Sysfs};
+use fw_helper_core::fan::MIN_TAKEOVER_DUTY;
+use fw_helper_core::{Cap, FanBackend, FanError, FanMode, Sysfs};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const DEVICE: &str = "/dev/cros_ec";
 
@@ -298,6 +300,167 @@ pub fn charge_capability(ec: &dyn EcTransport) -> Cap {
     }
 }
 
+/// Fan control over raw EC commands, for boards whose `cros_ec` hwmon has no `pwm1`
+/// (ADR 0013).
+///
+/// Built fresh for every operation, like its sysfs counterpart: the release paths have
+/// to work when in-process state is exactly what cannot be trusted, so nothing here
+/// caches a file handle or a verdict. The one piece of state - whether we believe we
+/// hold the fan - lives in the caller's `AtomicBool` so it survives that rebuilding,
+/// and is read without a lock so the panic path can use it.
+pub struct EcFan<'a> {
+    ec: &'a dyn EcTransport,
+    fs: &'a Sysfs,
+    manual: &'a AtomicBool,
+}
+
+impl<'a> EcFan<'a> {
+    pub fn new(ec: &'a dyn EcTransport, fs: &'a Sysfs, manual: &'a AtomicBool) -> Self {
+        Self { ec, fs, manual }
+    }
+
+    fn hwmon(&self) -> Option<String> {
+        self.fs.find_hwmon(fw_helper_core::paths::EC_HWMON_NAME)
+    }
+
+    /// Send one duty, returning what the EC holds afterwards.
+    fn send(&self, duty: u8) -> Result<u8, FanError> {
+        if duty > 0 && duty < MIN_TAKEOVER_DUTY {
+            return Err(FanError::DutyCannotTurnFan(duty));
+        }
+        let percent = ec::fan::duty_to_percent(duty);
+        self.ec
+            .command(
+                ec::fan::SET_FAN_DUTY,
+                0,
+                &ec::fan::set_duty_request(percent),
+                0,
+            )
+            .map_err(|e| FanError::Ec(e.to_string()))?;
+        Ok(ec::fan::percent_to_duty(percent))
+    }
+
+    /// `send`, releasing the fan if it fails. The takeover has already happened by the
+    /// time a duty write can fail, so an error must not leave us holding the fan.
+    fn send_guarded(&self, duty: u8) -> Result<u8, FanError> {
+        match self.send(duty) {
+            Ok(settled) => Ok(settled),
+            Err(e) => {
+                if !FanBackend::release_best_effort(self) {
+                    return Err(FanError::EcNotReleased(format!(
+                        "after a failed duty write: {e}"
+                    )));
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+impl FanBackend for EcFan<'_> {
+    fn is_supported(&self) -> bool {
+        self.hwmon().is_some()
+    }
+
+    /// What we last did, not what the hardware says - there is nothing to read.
+    fn mode(&self) -> Result<FanMode, FanError> {
+        Ok(if self.manual.load(Ordering::SeqCst) {
+            FanMode::Manual
+        } else {
+            FanMode::Auto
+        })
+    }
+
+    /// False: see [`FanBackend::mode_is_observable`]. The callers that most need to
+    /// know who holds the fan - the watchdog and the startup reclaim - release
+    /// unconditionally on this backend instead of asking (ADR 0013, point 2).
+    fn mode_is_observable(&self) -> bool {
+        false
+    }
+
+    /// `None`: these boards report no duty at all. Not zero - a caller that reads this
+    /// as an idle fan stops enforcing the floor.
+    fn duty(&self) -> Result<Option<u8>, FanError> {
+        Ok(None)
+    }
+
+    fn rpm(&self) -> Option<u64> {
+        let hwmon = self.hwmon()?;
+        self.fs.read_u64(&format!("{hwmon}/fan1_input")).ok()
+    }
+
+    /// There is no separate mode switch here: the duty command itself takes the fan
+    /// from firmware. So the belief is recorded *before* sending, not after - if the
+    /// process dies between the two, a release path that thinks it holds nothing still
+    /// releases, because releasing is unconditional on this backend anyway, but the
+    /// shutdown log will not claim the fan was never taken.
+    fn take_manual(&self, duty: u8) -> Result<u8, FanError> {
+        if duty > 0 && duty < MIN_TAKEOVER_DUTY {
+            return Err(FanError::DutyCannotTurnFan(duty));
+        }
+        if !self.is_supported() {
+            return Err(FanError::Unsupported);
+        }
+        self.manual.store(true, Ordering::SeqCst);
+        self.send_guarded(duty)
+    }
+
+    fn set_duty(&self, duty: u8) -> Result<u8, FanError> {
+        if !self.manual.load(Ordering::SeqCst) {
+            // Same refusal as the sysfs path. On this EC the duty command would in fact
+            // take the fan, so allowing it here would turn "change the duty" into an
+            // unannounced takeover.
+            return Err(FanError::NotUnderManualControl(FanMode::Auto));
+        }
+        self.send_guarded(duty)
+    }
+
+    /// Confirmed only as far as this board allows: the EC accepted the command. There is
+    /// no mode register to read back, so a release the EC acknowledges but does not act
+    /// on would go unnoticed - one of the three guarantees ADR 0013 records as weaker.
+    fn release(&self) -> Result<(), FanError> {
+        self.ec
+            .command(ec::fan::AUTO_FAN_CTRL, 0, &ec::fan::auto_request(), 0)
+            .map_err(|e| FanError::EcNotReleased(e.to_string()))?;
+        self.manual.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn release_best_effort(&self) -> bool {
+        FanBackend::release(self).is_ok()
+    }
+}
+
+/// Whether fan control over EC commands can be offered, asked of the EC itself.
+///
+/// Called only for boards whose sysfs has no `pwm1`; core's sysfs-only probe has already
+/// said no there, and this replaces that verdict the same way `charge_capability` does.
+/// Two conditions, and the reasons say which failed, because they are fixed differently:
+/// the EC has to advertise fan PWM, and the board's fan has to have been measured.
+pub fn fan_capability(ec: &dyn EcTransport, board: fw_helper_core::board::Board) -> Cap {
+    let answer = match ec.command(
+        ec::features::GET_FEATURES,
+        0,
+        &[],
+        ec::features::RESPONSE_LEN,
+    ) {
+        Ok(answer) => answer,
+        Err(e) => return Cap::No(format!("cannot ask the EC for its features: {e}")),
+    };
+    match ec::features::has(&answer, ec::features::PWM_FAN) {
+        Some(true) => {}
+        Some(false) => return Cap::No("the EC does not advertise fan PWM control".into()),
+        None => return Cap::No("the EC's feature answer was too short to read".into()),
+    }
+    if board.profile().is_none() {
+        return Cap::No(format!(
+            "{board}: the EC can drive the fan, but this board's fan is unmeasured, so \
+             no firmware floor can be trusted; see scripts/probe-fan-amd.c"
+        ));
+    }
+    Cap::Yes
+}
+
 /// A transport that answers from memory, for tests in this crate.
 ///
 /// Exists because the charge limit no longer has a sysfs path a fixture tree can
@@ -312,6 +475,11 @@ pub(crate) mod fake {
         pub sent: Mutex<Vec<(u32, Vec<u8>, usize)>>,
         limits: Mutex<ChargeLimits>,
         alive: bool,
+        /// The fan as the EC holds it: `None` while firmware owns it, otherwise the
+        /// percent last commanded.
+        fan: Mutex<Option<u8>>,
+        /// Refuse releases, to exercise the path where nothing is managing the fan.
+        pub refuse_release: std::sync::atomic::AtomicBool,
     }
 
     impl FakeEc {
@@ -320,7 +488,19 @@ pub(crate) mod fake {
                 sent: Mutex::new(Vec::new()),
                 limits: Mutex::new(ChargeLimits { min, max }),
                 alive: true,
+                fan: Mutex::new(None),
+                refuse_release: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        /// The percent the fan is held at, or `None` if firmware owns it.
+        pub(crate) fn fan_percent(&self) -> Option<u8> {
+            *self.fan.lock().unwrap()
+        }
+
+        /// Leave the fan held, as a process that died without releasing it would.
+        pub(crate) fn hold_fan(&self, percent: u8) {
+            *self.fan.lock().unwrap() = Some(percent);
         }
 
         /// An EC that refuses every command — a board without the custom command.
@@ -351,6 +531,36 @@ pub(crate) mod fake {
                 .lock()
                 .unwrap()
                 .push((command, out.to_vec(), insize));
+            // Dispatch on the command first. The fan's release carries no payload at
+            // all, so matching on a payload byte would index past the end of it.
+            if command == ec::fan::SET_FAN_DUTY {
+                let bytes: [u8; 4] = out.try_into().map_err(|_| EcError::Rejected(3))?;
+                let percent = u32::from_le_bytes(bytes);
+                if percent > u32::from(ec::fan::MAX_DUTY) {
+                    return Err(EcError::Rejected(3)); // EC_RES_INVALID_PARAM
+                }
+                *self.fan.lock().unwrap() = Some(percent as u8);
+                return Ok(Vec::new());
+            }
+            if command == ec::fan::AUTO_FAN_CTRL {
+                if self
+                    .refuse_release
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(EcError::Rejected(1));
+                }
+                *self.fan.lock().unwrap() = None;
+                return Ok(Vec::new());
+            }
+            if command == ec::features::GET_FEATURES {
+                // As measured on FRANMGCP05: PWM_FAN set, LIMITED clear.
+                let mut answer = 0x0207_E6AE_u32.to_le_bytes().to_vec();
+                answer.extend_from_slice(&0x0000_0207_u32.to_le_bytes());
+                return Ok(answer);
+            }
+            if command != ec::CHARGE_LIMIT_CONTROL {
+                return Err(EcError::Rejected(1)); // EC_RES_INVALID_COMMAND
+            }
             match out[0] {
                 x if x == ec::mode::GET => {
                     let l = *self.limits.lock().unwrap();
@@ -373,6 +583,166 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakeEc;
     use super::*;
+
+    /// A sysfs root with a cros_ec hwmon node, as the AMD boards present it: fan speed
+    /// and target, and deliberately no pwm1 or pwm1_enable.
+    fn amd_hwmon(tag: &str, rpm: u64) -> (std::path::PathBuf, Sysfs) {
+        let root =
+            std::env::temp_dir().join(format!("fw-helperd-ecfan-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let hw = root.join("sys/class/hwmon/hwmon8");
+        std::fs::create_dir_all(&hw).unwrap();
+        std::fs::write(hw.join("name"), "cros_ec\n").unwrap();
+        std::fs::write(hw.join("fan1_input"), format!("{rpm}\n")).unwrap();
+        std::fs::write(hw.join("fan1_target"), "0\n").unwrap();
+        let fs = Sysfs::new(&root);
+        (root, fs)
+    }
+
+    #[test]
+    fn fan_control_is_offered_only_on_a_measured_board_whose_ec_can_do_it() {
+        use fw_helper_core::board::{identify_name, Board};
+        let ec = FakeEc::new(0, 100);
+        assert_eq!(fan_capability(&ec, identify_name("FRANMGCP09")), Cap::Yes);
+
+        match fan_capability(&ec, Board::Unknown) {
+            Cap::No(reason) => assert!(reason.contains("unmeasured"), "{reason}"),
+            Cap::Yes => panic!("an unmeasured board must not get fan control"),
+        }
+        match fan_capability(&FakeEc::dead(), identify_name("FRANMGCP09")) {
+            Cap::No(reason) => assert!(reason.contains("features"), "{reason}"),
+            Cap::Yes => panic!("an EC that will not answer must not get fan control"),
+        }
+    }
+
+    #[test]
+    fn taking_the_fan_sends_the_duty_as_a_percent() {
+        let (_root, fs) = amd_hwmon("take", 0);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        let settled = fan.take_manual(255).unwrap();
+        assert_eq!(ec.fan_percent(), Some(100), "255 must reach the EC as 100%");
+        assert_eq!(settled, 255);
+        assert!(manual.load(Ordering::SeqCst));
+        assert_eq!(fan.mode().unwrap(), FanMode::Manual);
+    }
+
+    #[test]
+    fn a_duty_that_cannot_start_the_fan_never_reaches_the_ec() {
+        // Measured on both AMD boards: 10% sustains rotation but will not start the
+        // fan from rest. A command that the EC would accept and the fan would ignore is
+        // a control that lies, so it is refused before anything is sent.
+        let (_root, fs) = amd_hwmon("stiction", 0);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        assert!(matches!(
+            fan.take_manual(MIN_TAKEOVER_DUTY - 1),
+            Err(FanError::DutyCannotTurnFan(_))
+        ));
+        assert!(ec.sent.lock().unwrap().is_empty());
+        assert!(
+            !manual.load(Ordering::SeqCst),
+            "refusal must not record a takeover"
+        );
+    }
+
+    #[test]
+    fn changing_duty_without_holding_the_fan_is_refused() {
+        // On this EC the duty command would take the fan itself, so allowing it would
+        // turn "change the duty" into an unannounced takeover.
+        let (_root, fs) = amd_hwmon("notheld", 0);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        assert!(matches!(
+            fan.set_duty(128),
+            Err(FanError::NotUnderManualControl(_))
+        ));
+        assert_eq!(ec.fan_percent(), None);
+    }
+
+    #[test]
+    fn release_hands_the_fan_back_and_clears_the_belief() {
+        let (_root, fs) = amd_hwmon("release", 0);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        fan.take_manual(128).unwrap();
+        fan.release().unwrap();
+        assert_eq!(ec.fan_percent(), None);
+        assert_eq!(fan.mode().unwrap(), FanMode::Auto);
+        // Releasing sends an empty payload - v0 of the command takes none.
+        let sent = ec.sent.lock().unwrap();
+        let last = sent.last().unwrap();
+        assert_eq!(last.0, ec::fan::AUTO_FAN_CTRL);
+        assert!(last.1.is_empty());
+    }
+
+    #[test]
+    fn release_is_safe_to_repeat() {
+        // Every release path releases unconditionally on this backend, so repeating it
+        // must be harmless - including when we never held the fan at all.
+        let (_root, fs) = amd_hwmon("repeat", 0);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        assert!(fan.release_best_effort());
+        assert!(fan.release_best_effort());
+        assert_eq!(ec.fan_percent(), None);
+    }
+
+    #[test]
+    fn a_refused_release_is_loud_and_keeps_the_belief() {
+        // The one failure with no clean recovery. The error must say what to run, and
+        // the belief must stay "manual" - nothing has shown the fan is safe.
+        let (_root, fs) = amd_hwmon("refused", 0);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        fan.take_manual(128).unwrap();
+        ec.refuse_release.store(true, Ordering::SeqCst);
+        let err = fan.release().unwrap_err();
+        assert!(matches!(err, FanError::EcNotReleased(_)));
+        assert!(err.to_string().contains("fw-helper-restore-fan"), "{err}");
+        assert!(manual.load(Ordering::SeqCst));
+        assert!(!fan.release_best_effort());
+    }
+
+    #[test]
+    fn this_backend_admits_what_it_cannot_see() {
+        // ADR 0013: no duty register and no mode register. Both have to be visible in
+        // the contract, or callers treat "unknown" as "zero" and "belief" as "fact".
+        let (_root, fs) = amd_hwmon("admits", 3210);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+
+        assert_eq!(fan.duty().unwrap(), None);
+        assert!(!fan.mode_is_observable());
+        assert_eq!(fan.rpm(), Some(3210), "RPM is the one feedback there is");
+    }
+
+    #[test]
+    fn a_board_without_the_hwmon_node_is_unsupported() {
+        let root =
+            std::env::temp_dir().join(format!("fw-helperd-ecfan-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = Sysfs::new(&root);
+        let ec = FakeEc::new(0, 100);
+        let manual = AtomicBool::new(false);
+        let fan = EcFan::new(&ec, &fs, &manual);
+        assert!(matches!(fan.take_manual(128), Err(FanError::Unsupported)));
+        assert!(!manual.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn ioctl_number_matches_what_the_hardware_probe_used() {

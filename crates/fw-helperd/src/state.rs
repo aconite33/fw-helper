@@ -34,6 +34,33 @@ pub struct State {
     pub profile_on_battery: Option<String>,
     /// Observed firmware fan duty by temperature, as `(celsius, duty)`.
     pub floor: Vec<(f64, u8)>,
+    /// DMI board name the floor was learned on.
+    ///
+    /// A learned floor describes one board's firmware and one board's fan. The state
+    /// file outlives the hardware - it moves with the disk - so without this a floor
+    /// learned on one board would bound the fan on the next.
+    pub floor_board: Option<String>,
+}
+
+/// Whether a stored floor may be used on `current`.
+///
+/// Carried across boards only when both resolve to the same profile: the two AMD boards
+/// share a fan and a firmware curve, so a floor from one is a floor for the other.
+///
+/// A floor with no board recorded predates the field. Builds before it could learn a
+/// floor only where `pwm1` reports firmware's duty - the Intel board - so such a floor is
+/// kept there and dropped anywhere else.
+pub fn floor_applies(floor_board: Option<&str>, current: fw_helper_core::board::Board) -> bool {
+    use fw_helper_core::board::{identify_name, INTEL_CORE_ULTRA_3};
+    let Some(current) = current.profile() else {
+        return false;
+    };
+    match floor_board {
+        Some(name) => identify_name(name)
+            .profile()
+            .is_some_and(|learned| learned.name == current.name),
+        None => current.name == INTEL_CORE_ULTRA_3.name,
+    }
 }
 
 fn path() -> PathBuf {
@@ -78,6 +105,9 @@ impl State {
                     s.profile_on_battery = Some(value.trim().to_string()).filter(|v| !v.is_empty())
                 }
                 "fan_floor" => s.floor = parse_floor(value),
+                "fan_floor_board" => {
+                    s.floor_board = Some(value.trim().to_string()).filter(|v| !v.is_empty())
+                }
                 _ => {}
             }
         }
@@ -114,6 +144,9 @@ impl State {
                 .map(|(c, d)| format!("{c:.0}:{d}"))
                 .collect();
             out.push_str(&format!("fan_floor={}\n", pairs.join(",")));
+            if let Some(board) = &self.floor_board {
+                out.push_str(&format!("fan_floor_board={board}\n"));
+            }
         }
         if let Err(e) = fs::write(path(), out) {
             eprintln!("cannot write state: {e}");
@@ -123,7 +156,51 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_floor;
+    use super::{floor_applies, parse_floor};
+    use fw_helper_core::board::{identify_name, Board};
+
+    #[test]
+    fn a_floor_follows_its_own_board() {
+        assert!(floor_applies(
+            Some("FRANMGCP09"),
+            identify_name("FRANMGCP09")
+        ));
+    }
+
+    #[test]
+    fn a_floor_carries_between_boards_that_share_a_fan() {
+        // Both AMD boards: same fan to within 1%, same firmware curve.
+        assert!(floor_applies(
+            Some("FRANMGCP05"),
+            identify_name("FRANMGCP09")
+        ));
+    }
+
+    #[test]
+    fn a_floor_does_not_cross_to_a_different_board() {
+        // The disk moved from an Intel machine to an AMD one, or back. Either way the
+        // stored floor describes firmware and a fan that are no longer there.
+        assert!(!floor_applies(
+            Some("FRANMJCP07"),
+            identify_name("FRANMGCP09")
+        ));
+        assert!(!floor_applies(
+            Some("FRANMGCP09"),
+            identify_name("FRANMJCP07")
+        ));
+    }
+
+    #[test]
+    fn an_unrecorded_floor_is_kept_only_where_old_builds_could_learn_one() {
+        assert!(floor_applies(None, identify_name("FRANMJCP07")));
+        assert!(!floor_applies(None, identify_name("FRANMGCP09")));
+    }
+
+    #[test]
+    fn no_floor_applies_to_an_unmeasured_board() {
+        assert!(!floor_applies(Some("FRANMGCP09"), Board::Unknown));
+        assert!(!floor_applies(None, Board::Unknown));
+    }
 
     #[test]
     fn parses_a_floor_list() {
