@@ -1,0 +1,36 @@
+Charge limit efficacy, FRANMGCP09 (Ryzen AI 9 HX 370), BIOS 04.02, EC lilac-4.0.2
+2026-09-18
+
+Limit set to 80% through fw-helperctl (EC command 0x3E03). The battery charged
+on AC from below 80%; the user watched it reach 80% and stop. Read afterwards:
+
+  ACAD online=1                      (on AC throughout)
+  BAT1 status=Not charging
+  BAT1 capacity=80
+  BAT1 charge_now=3593000 / charge_full=4490000   = 80.02%
+  fw-helperctl status: battery 80% (Not charging), charge limit 80%
+
+Sampled every 10 s for 90 s after that:
+
+    0s  Not charging  cap=80  charge_now=3593000  current_now=364000  voltage=16827000
+   10s  Not charging  cap=80  charge_now=3593000  current_now=180000  voltage=16822000
+   20s  Not charging  cap=80  charge_now=3593000  current_now=88000   voltage=16811000
+   30s  Not charging  cap=80  charge_now=3593000  current_now=40000   voltage=16803000
+   40s  Not charging  cap=80  charge_now=3593000  current_now=7000    voltage=16800000
+   50s  Not charging  cap=80  charge_now=3593000  current_now=6000    voltage=16797000
+   60s  Not charging  cap=80  charge_now=3593000  current_now=6000    voltage=16796000
+   70s  Not charging  cap=80  charge_now=3593000  current_now=5000    voltage=16794000
+   80s  Not charging  cap=80  charge_now=3593000  current_now=4000    voltage=16792000
+   90s  Not charging  cap=80  charge_now=3593000  current_now=5000    voltage=16786000
+
+Verdict: charging stops at the limit. charge_now does not move, and the
+voltage relaxes, as a cell does once current stops.
+
+Difference from the Intel board: there current_now read 0 at the stop. Here
+the first read, seconds after the stop, was 553 mA, and it decayed to ~5 mA
+over ~40 s. On this board current_now lags behind status, so a single read
+of current_now right after the stop can look like charging continues.
+Judge by charge_now or by status, not current_now.
+
+Not run: scripts/q2-charge-limit-efficacy.sh. This was an observed charge,
+not the scripted test. Not yet tested on FRANMGCP05.

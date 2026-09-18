@@ -49,7 +49,7 @@ For the Intel Pro, see [Which boards](#which-boards) — it keeps upstream's fea
 | Capability detection | **Working** — every knob reports available, or why not |
 | Performance profiles | **Working** — writes `platform_profile` directly, since there is no PPD here to defer to |
 | GUI | **Working**, including the fan controls and curve editor. The power-limit control stays inert, with its reason shown |
-| Battery charge limit | **Mechanism confirmed, efficacy unproven.** Framework's EC command `0x3E03` answers on this firmware ([ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)), but nothing has yet watched a charge actually *stop* at the limit. Upstream's hardest-won lesson is that read-back is not efficacy |
+| Battery charge limit | **Working.** Framework's EC command `0x3E03` ([ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)). On `FRANMGCP09`, charging from below on AC stopped at exactly 80%: `Not charging`, `charge_now` flat ([measurement](docs/measurements/charge-limit-hx370.txt)). Not yet run on `FRANMGCP05` |
 | Fan control | **Working.** Driven over EC commands, bounded by a firmware floor built from this board's own measured fan and firmware curve. `kill -9` recovery verified: fan back with the EC within 1.29 s through the crash path alone ([ADR 0013](docs/adr/0013-fan-control-via-ec-commands.md)) |
 | Power limits | **No mechanism exists.** No RAPL, and Framework's EC command set has no PPT or SOC power command. On AMD the limits move through `amd-pmf`'s profiles, so that is where power control lives |
 | Undervolting | Not attempted |
@@ -125,7 +125,7 @@ Intel tables on the AMD fan would put the firmware floor up to **2553 rpm below 
 | Fan control | EC commands, no read-back | `pwm1` sysfs, read back |
 | Firmware follows | `cpu_f75303@4d`, not hysteretic against it | `peci-temp`, treated as hysteretic |
 | Power limits | none — profiles only | PL1 via RAPL |
-| Charge limit | EC `0x3E03`; stops charging **unverified** | EC `0x3E03`; verified |
+| Charge limit | EC `0x3E03`; stops charging, verified on `FRANMGCP09` | EC `0x3E03`; verified |
 | Crash recovery | `kill -9` verified, 1.29 s | verified upstream, 0.27 s |
 
 **On the Intel Pro, the fork behaves as upstream does** — it drives the fan through `pwm1`,

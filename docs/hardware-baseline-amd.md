@@ -127,6 +127,15 @@ command with the same wire format. ADR 0012 should port with no change beyond th
 Intel fork's hardest-won lesson is that read-back is not efficacy, and
 `scripts/q2-charge-limit-efficacy.sh` is the check that counts.
 
+**Update 2026-09-18: charging stops, on `FRANMGCP09`.** With the limit set to 80, the
+battery charged on AC from below and stopped at 80%. It read `Not charging`, and
+`charge_now` stayed at 3 593 000 of 4 490 000 (80.02%) for 90 s. One difference from Intel:
+`current_now` read 553 mA just after the stop and took about 40 s to decay to ~5 mA, so on
+this board go by `charge_now` or `status`, not a single `current_now` read. This was an
+observed charge, not a run of the scripted test. See
+[`measurements/charge-limit-hx370.txt`](measurements/charge-limit-hx370.txt). Not yet
+tested on `FRANMGCP05`.
+
 `cros_charge_control` is loaded but `BAT1/extensions/` is empty and there is no
 `charge_control_end_threshold` — same posture as the Intel board, and the same reason to
 ignore sysfs for this.
@@ -258,7 +267,8 @@ be assumed:
   must be reconstructed by inverting the duty→RPM table — the interpolation error the Intel
   fork had escaped.
 - **Peak temperature in ordinary use**, and therefore any threshold derived from it.
-- **Whether the charge limit actually stops charging.**
+- ~~**Whether the charge limit actually stops charging.**~~ It does, on `FRANMGCP09`; see
+  the update above.
 - **Whether profiles measurably move power**, which is now the only power control.
 
 ---
@@ -285,7 +295,8 @@ no `intel-rapl-mmio:0` zone, no power-profiles-daemon, and the same four EC sens
 The EC major version changed, so nothing verified against `lilac-3` was assumed:
 
 - **Charge limit `0x3E03` answers** — the daemon reads it (100%) and re-applies it at boot.
-  Efficacy — whether charging actually *stops* — is untested on either AMD board.
+  **It stops charging:** held at 80.02% on AC, `Not charging`, `charge_now` flat for 90 s
+  ([measurement](measurements/charge-limit-hx370.txt)).
 - **Fan duty `0x0024` and release `0x0052` work**, and the EC reclaims cleanly. On a warm
   machine the release ramps down to firmware's own target (5313 → 2249 rpm over 6 s)
   rather than dropping to zero.
