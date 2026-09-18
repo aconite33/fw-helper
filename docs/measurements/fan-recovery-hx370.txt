@@ -1,0 +1,87 @@
+== baseline ==
+  board        FRANMGCP09
+  fan          0 rpm   firmware target 0 rpm
+    + fan control        available
+
+== take manual control at duty 180 ==
+  fan pinned at duty 181/255 (71%)
+    (asked for 180; the EC stores whole percent)
+    'fw-helperctl fan auto' returns control to the EC
+  t+1s  fan 0 rpm
+  t+2s  fan 5682 rpm
+  t+3s  fan 6182 rpm
+  t+4s  fan 6182 rpm
+  t+5s  fan 6182 rpm
+  t+6s  fan 6221 rpm
+
+== SIGKILL fw-helperd (pid 60079) - none of its own release paths can run ==
+  + 0.26s  fan  6221 rpm   target 0
+  + 0.52s  fan  6221 rpm   target 0
+  + 0.77s  fan  6221 rpm   target 0
+  + 1.03s  fan  6221 rpm   target 0
+  + 1.29s  fan     0 rpm   target 0
+  + 1.55s  fan     0 rpm   target 0
+  + 1.81s  fan     0 rpm   target 0
+  + 2.07s  fan     0 rpm   target 0
+  + 2.33s  fan     0 rpm   target 0
+  + 2.59s  fan     0 rpm   target 0
+  + 2.85s  fan     0 rpm   target 0
+  + 3.11s  fan     0 rpm   target 0
+  + 3.37s  fan     0 rpm   target 0
+  + 3.63s  fan     0 rpm   target 0
+  + 3.89s  fan     0 rpm   target 0
+  + 4.15s  fan     0 rpm   target 0
+  + 4.41s  fan     0 rpm   target 0
+  + 4.67s  fan     0 rpm   target 0
+  + 4.93s  fan     0 rpm   target 0
+  + 5.19s  fan     0 rpm   target 0
+  + 5.45s  fan     0 rpm   target 0
+  + 5.71s  fan     0 rpm   target 0
+  + 5.97s  fan     0 rpm   target 0
+  + 6.23s  fan     0 rpm   target 0
+  + 6.48s  fan     0 rpm   target 0
+  + 6.74s  fan     0 rpm   target 0
+  + 7.00s  fan     0 rpm   target 0
+  + 7.26s  fan     0 rpm   target 0
+  + 7.52s  fan     0 rpm   target 0
+  + 7.78s  fan     0 rpm   target 0
+  + 8.04s  fan     0 rpm   target 0
+  + 8.30s  fan     0 rpm   target 0
+  + 8.56s  fan     0 rpm   target 0
+  + 8.82s  fan     0 rpm   target 0
+  + 9.07s  fan     0 rpm   target 0
+  + 9.33s  fan     0 rpm   target 0
+  + 9.59s  fan     0 rpm   target 0
+  + 9.85s  fan     0 rpm   target 0
+  +10.11s  fan     0 rpm   target 0
+  +10.37s  fan     0 rpm   target 0
+  +10.63s  fan     0 rpm   target 0
+  +10.89s  fan     0 rpm   target 0
+  +11.15s  fan     0 rpm   target 0
+  +11.41s  fan     0 rpm   target 0
+  +11.67s  fan     0 rpm   target 0
+  +11.93s  fan     0 rpm   target 0
+  +12.19s  fan     0 rpm   target 0
+  +12.45s  fan     0 rpm   target 0
+  +12.71s  fan     0 rpm   target 0
+  +12.96s  fan     0 rpm   target 0
+  +13.22s  fan     0 rpm   target 0
+  +13.48s  fan     0 rpm   target 0
+  +13.74s  fan     0 rpm   target 0
+  +14.00s  fan     0 rpm   target 0
+  +14.26s  fan     0 rpm   target 0
+  +14.52s  fan     0 rpm   target 0
+  +14.77s  fan     0 rpm   target 0
+  +15.03s  fan     0 rpm   target 0
+  +15.29s  fan     0 rpm   target 0
+  +15.55s  fan     0 rpm   target 0
+
+== what brought it back ==
+  fw-helper-restore-fan: fan handed to the EC (no mode register to check)
+  fw-helperd starting (binary 1 minutes old)
+    board              Framework 13 (AMD Ryzen AI 300) (measured)
+    fan control        available
+  fan: no mode register on this board; returned the fan to the EC unconditionally
+
+== verdict ==
+  PASS: fan began spinning down 1.29s after SIGKILL, now 0 rpm

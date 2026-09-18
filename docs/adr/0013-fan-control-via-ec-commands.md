@@ -222,3 +222,33 @@ observations taken only while firmware wanted the fan off. That test could not t
 register from a zero target. Whether it is live on `lilac-3` is unknown, and the code must
 not assume either way: a target that stays at 0 while `fan1_input` is non-zero under EC
 control is the signal that a board's register is dead.
+
+## Update 2026-09-18 — implemented, and the `kill -9` gate passes
+
+Implemented as described above: a `FanBackend` trait with sysfs and EC implementations,
+board profiles keyed by DMI name, `STICTION_DUTY = 33` (13%), the floor learning from
+`fan1_target`, unconditional startup reclaim, and `fw-helper-restore-fan` issuing the EC
+release itself.
+
+**`kill -9` recovery verified on `FRANMGCP09`**, EC `lilac-4.0.2`, with
+`scripts/verify-fan-recovery.sh`. Fan held at duty 181/255 (71%), 6221 rpm, on an idle
+machine where firmware wanted it off; the daemon SIGKILLed so none of its own release paths
+could run:
+
+```
++1.03 s   6221 rpm
++1.29 s      0 rpm
+```
+
+The journal shows both remaining layers acting in order - `fw-helper-restore-fan` as
+`ExecStopPost`, then the restarted daemon's unconditional reclaim. Recovery within 1.29 s,
+against 0.27 s on the Intel board; the difference is systemd reaping the process and
+starting `ExecStopPost`. The tachometer reads 0 within one 0.26 s sample of the release,
+which no fan physically does, so the EC evidently stops reporting a speed when it stops
+driving the fan: "released by 1.29 s" is the measurement, not "stopped in 0.26 s".
+
+The crash-path EC release also ran unplanned during installation - as the old daemon's
+`ExecStopPost` - and the EC accepted it.
+
+**Still unverified on hardware:** suspend and resume while holding the fan, the floor
+overriding a quiet curve live under load, and break-away from a cold fan.
