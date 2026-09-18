@@ -76,6 +76,16 @@ pub mod fan {
         (((duty as u32) * 100 + 127) / 255) as u8
     }
 
+    /// The 0-255 duty the EC actually holds after a request for `percent`.
+    ///
+    /// There is no read-back on these boards, so the duty reported as "settled" is
+    /// computed rather than observed. It is still the honest answer: the EC stores whole
+    /// percent, so this is what it holds, where echoing the requested duty back would
+    /// claim a precision the hardware never had.
+    pub fn percent_to_duty(percent: u8) -> u8 {
+        (((percent.min(MAX_DUTY) as u32) * 255 + 50) / 100) as u8
+    }
+
     /// Encode a duty request.
     ///
     /// The EC's wire format is little-endian regardless of host, so this is explicit
@@ -250,6 +260,18 @@ mod tests {
         assert_eq!(fan::duty_to_percent(28), 11);
         // And the stall point below it, which must not round up into "turning".
         assert_eq!(fan::duty_to_percent(26), 10);
+    }
+
+    #[test]
+    fn a_duty_round_trips_to_what_the_ec_stores() {
+        // The EC holds whole percent, so a round trip lands within one percent's worth
+        // of 0-255 (2.55 counts) of the request, and full scale survives exactly.
+        for duty in 0..=255u8 {
+            let settled = fan::percent_to_duty(fan::duty_to_percent(duty));
+            assert!(settled.abs_diff(duty) <= 2, "{duty} settled at {settled}");
+        }
+        assert_eq!(fan::percent_to_duty(100), 255);
+        assert_eq!(fan::percent_to_duty(0), 0);
     }
 
     #[test]

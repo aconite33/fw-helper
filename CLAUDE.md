@@ -165,7 +165,7 @@ sudo ./scripts/install-dev.sh --uninstall
 sudo sh -c './target/debug/fw-helperd >/tmp/fw-helperd.log 2>&1 &'
 sudo pkill -x fw-helperd
 fw-helperctl status | watch [secs] | charge-limit N
-fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 30-255, clamped up to the firmware floor
+fw-helperctl fan 180 | fan 0 | fan auto    # duty 0 or 33-255, clamped up to the firmware floor
 fw-helperctl fan curve | fan curve 55:0,70:65,85:120   # follow a temp->duty curve
 fw-helperctl power-limit 15               # sustained CPU watts; ~32s to take effect
 fw-helperctl profile | profile quiet      # quiet | balanced | performance; moves the GNOME slider

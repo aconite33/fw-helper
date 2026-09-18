@@ -20,7 +20,7 @@ USAGE:
     fw-helperctl watch [secs]    live telemetry, 1 Hz (default 10s)
     fw-helperctl power-top [N]   processes ranked by estimated power (default 5)
     fw-helperctl charge-limit N  set the battery charge limit (20-100)
-    fw-helperctl fan N           pin the fan at duty N (0, or 30-255)
+    fw-helperctl fan N           pin the fan at duty N (0, or 33-255)
     fw-helperctl fan auto        hand the fan back to the EC
     fw-helperctl fan curve        follow the built-in quiet curve
     fw-helperctl fan curve T:D,.. follow a custom curve, e.g. 55:0,70:65,85:120

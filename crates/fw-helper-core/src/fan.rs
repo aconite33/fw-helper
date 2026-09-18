@@ -41,10 +41,10 @@ pub const PWM_AUTO: u64 = 2;
 
 /// Lowest duty [`FanControl::take_manual`] accepts, other than zero.
 ///
-/// This is a **mechanical** limit, not a thermal one: measured on hardware, duty 20
-/// leaves the fan stopped and duty 30 turns it at 1107 rpm. Anything between is a
-/// stopped fan wearing a costume, and accepting it would mean reporting a running fan
-/// that is not running. Zero is allowed and means exactly what it says.
+/// This is a **mechanical** limit, not a thermal one - see [`crate::floor::STICTION_DUTY`]
+/// for the measurements on each board. Below it the fan may be stopped while reported as
+/// running, and accepting it would mean reporting a fan that is not turning. Zero is
+/// allowed and means exactly what it says.
 ///
 /// **It is not a safety floor.** Nothing here knows the temperature, so nothing here
 /// can decide what is safe. That is [`crate::FirmwareFloor`]'s job, and the caller is
@@ -131,6 +131,15 @@ pub enum FanError {
     NotReleased {
         observed: FanMode,
     },
+    /// An EC command failed or was refused. Carries the transport's own message, which
+    /// already names the fix ("needs root", "is cros_ec_chardev loaded?"). Core cannot
+    /// hold the daemon's error type itself - that would give core a dependency - so the
+    /// message is what crosses the boundary.
+    Ec(String),
+    /// The EC refused or failed the release command. The EC path's counterpart to
+    /// [`FanError::NotReleased`], and just as urgent: nothing may now be managing the
+    /// fan. There is no mode register on these boards to report what state it is in.
+    EcNotReleased(String),
 }
 
 impl fmt::Display for FanError {
@@ -143,9 +152,9 @@ impl fmt::Display for FanError {
             ),
             Self::DutyCannotTurnFan(d) => write!(
                 f,
-                "duty {d}/255 cannot turn the fan: measured, duty 20 gives 0 rpm and \
-                 duty {MIN_TAKEOVER_DUTY} gives 1107 rpm. Use 0 for a stopped fan, or \
-                 at least {MIN_TAKEOVER_DUTY} for a turning one"
+                "duty {d}/255 may not start the fan: measured, it stalls below about \
+                 10% and will not start from rest below 11%. Use 0 for a stopped fan, \
+                 or at least {MIN_TAKEOVER_DUTY}/255 (13%) for a turning one"
             ),
             Self::NotUnderManualControl(mode) => write!(
                 f,
@@ -168,6 +177,13 @@ impl fmt::Display for FanError {
                 "wrote fan duty {requested}/255 but the EC reports {observed}/255, \
                  more than the {DUTY_TOLERANCE} counts of percent-quantization slack; \
                  released manual control rather than hold an unverified duty"
+            ),
+            Self::Ec(e) => write!(f, "EC fan command failed: {e}"),
+            Self::EcNotReleased(e) => write!(
+                f,
+                "FAILED to return the fan to EC control ({e}). Run \
+                 fw-helper-restore-fan as root; this board has no pwm1_enable to write \
+                 by hand"
             ),
             Self::NotReleased { observed } => write!(
                 f,
@@ -531,7 +547,10 @@ mod tests {
         // A user told "no" must be told what "yes" looks like.
         let msg = FanError::DutyCannotTurnFan(10).to_string();
         assert!(msg.contains("Use 0"), "got: {msg}");
-        assert!(msg.contains("0 rpm"), "got: {msg}");
+        assert!(
+            msg.contains(&MIN_TAKEOVER_DUTY.to_string()),
+            "must name the lowest duty that works; got: {msg}"
+        );
     }
 
     #[test]

@@ -373,7 +373,7 @@ mod tests {
     fn a_wobbling_sensor_does_not_make_the_fan_hunt() {
         // The sensor is quantized to ~1 C and jitters between adjacent values. Without
         // a deadband that is a fan audibly changing speed every second forever.
-        let mut e = CurveEngine::new(Curve::new(vec![p(50.0, 30), p(90.0, 250)]).unwrap());
+        let mut e = CurveEngine::new(Curve::new(vec![p(50.0, 40), p(90.0, 250)]).unwrap());
         for _ in 0..20 {
             e.tick(70.0);
         }
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn a_real_fall_is_followed_once_past_the_deadband() {
-        let mut e = CurveEngine::new(Curve::new(vec![p(50.0, 30), p(90.0, 250)]).unwrap());
+        let mut e = CurveEngine::new(Curve::new(vec![p(50.0, 40), p(90.0, 250)]).unwrap());
         for _ in 0..40 {
             e.tick(70.0);
         }

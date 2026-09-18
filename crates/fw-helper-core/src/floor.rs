@@ -38,10 +38,27 @@
 //!   So the table is not just sparse, it describes the wrong branch. It survives only
 //!   as a cold start, and any observation supersedes it.
 
-/// Below this the fan does not turn at all: duty 20 measured 0 rpm, duty 30 measured
-/// 1107 rpm. A duty between 1 and 29 is not a slow fan, it is a stopped one, and
-/// offering it would be a control that lies.
-pub const STICTION_DUTY: u8 = 30;
+/// The lowest non-zero duty any supported board is allowed: 33/255, which the EC path
+/// sends as 13%.
+///
+/// Measured, per board:
+///
+/// - **Intel, `FRANMJCP07`**: duty 20 gave 0 rpm and duty 30 gave 1107 rpm, from a
+///   descending sweep. That is where the fan *stops*, not where it *starts*.
+/// - **AMD, `FRANMGCP05` and `FRANMGCP09`**: the fan stalls between 8% and 10% on the
+///   way down, but from a standstill will not start below **11%** (28/255). 10% sustains
+///   967 rpm and cannot begin rotation.
+///
+/// That gap is the dangerous one. A curve idling between stall and break-away runs
+/// correctly all the way down a cooldown, then silently fails to spin up from cold - a
+/// stopped fan that sounds exactly like a quiet one. So this carries the break-away
+/// number plus two points of margin for a cold or dusty bearing, and it is one value
+/// for every board: the highest any needs. Costs the Intel board three counts of
+/// minimum speed, about 100 rpm, and removes a class of per-board mistake.
+///
+/// A duty between 1 and 32 is not a slow fan, it is possibly a stopped one, and offering
+/// it would be a control that lies.
+pub const STICTION_DUTY: u8 = 33;
 
 /// Added to every non-zero floor duty.
 ///
