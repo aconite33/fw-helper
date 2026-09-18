@@ -38,6 +38,8 @@
 //!   So the table is not just sparse, it describes the wrong branch. It survives only
 //!   as a cold start, and any observation supersedes it.
 
+use crate::board::{BoardProfile, INTEL_CORE_ULTRA_3};
+
 /// The lowest non-zero duty any supported board is allowed: 33/255, which the EC path
 /// sends as 13%.
 ///
@@ -93,31 +95,10 @@ const FLOOR_MARGIN_DUTY: u8 = 2;
 /// licence to be arbitrarily louder.
 const FULL_DUTY_ABOVE_C: f64 = 95.0;
 
-/// What the EC does, unloaded and loaded, as measured. Temperature ascending.
-const EC_CURVE: [(f64, u16); 5] = [
-    (43.9, 0),
-    (44.9, 0),
-    (53.9, 2020),
-    (64.8, 2925),
-    (76.8, 3100),
-];
-
-/// What a written duty actually produces, measured 2026-08-21 at ~39 °C descending
-/// from 180 so the fan never had to start from rest at a low duty. Duty ascending.
-const DUTY_RPM: [(u8, u16); 12] = [
-    (0, 0),
-    (20, 0),
-    (30, 1107),
-    (40, 1512),
-    (50, 1879),
-    (65, 2296),
-    (77, 2693),
-    (90, 3052),
-    (100, 3355),
-    (120, 3840),
-    (150, 4551),
-    (180, 5201),
-];
+// The EC curve and duty table that used to live here are per-board measurements, and
+// now live in `crate::board` with the board they were measured on. A floor built from
+// another board's tables is not conservative, it is wrong: on the AMD boards the Intel
+// tables put it up to 2553 rpm below firmware, at 68.8 C.
 
 /// Width of an observation bucket, in degrees.
 const BUCKET_C: f64 = 2.0;
@@ -219,6 +200,8 @@ pub struct FirmwareFloor {
     /// Bumped whenever an observation changes anything, so a caller can tell whether
     /// there is something new worth persisting without diffing the whole table.
     revision: u64,
+    /// Whose measurements the model and the duty conversion come from.
+    profile: &'static BoardProfile,
 }
 
 impl Default for FirmwareFloor {
@@ -228,12 +211,33 @@ impl Default for FirmwareFloor {
 }
 
 impl FirmwareFloor {
+    /// A floor for the Intel board, which is what every existing measurement in this
+    /// module's tests was taken on. Anything running on real hardware should use
+    /// [`FirmwareFloor::for_board`] with the profile that board was identified as.
     pub fn new() -> Self {
+        Self::for_board(&INTEL_CORE_ULTRA_3)
+    }
+
+    pub fn for_board(profile: &'static BoardProfile) -> Self {
         Self {
             observed: [0; BUCKETS],
             seen: [false; BUCKETS],
             revision: 0,
+            profile,
         }
+    }
+
+    pub fn profile(&self) -> &'static BoardProfile {
+        self.profile
+    }
+
+    /// The lowest duty that reaches at least `rpm` on this board, rounding up.
+    ///
+    /// Public for the boards where firmware's decision is observed as an rpm rather
+    /// than a duty - the AMD boards report firmware's target speed, and it has to be
+    /// turned into a duty through *this* board's fan before it can be recorded.
+    pub fn duty_for_rpm(&self, rpm: u16) -> u8 {
+        duty_for_rpm(self.profile.duty_rpm, rpm)
     }
 
     fn bucket(celsius: f64) -> Option<usize> {
@@ -343,7 +347,7 @@ impl FirmwareFloor {
     /// Cold start only. [`Self::floor_duty`] prefers a direct observation whenever one
     /// exists, because measuring firmware beats interpolating two tables about it.
     pub fn modelled_rpm(&self, celsius: f64) -> u16 {
-        interpolate_rpm(celsius)
+        interpolate_rpm(self.profile, celsius)
     }
 
     /// The lowest duty we may hold at this temperature.
@@ -369,7 +373,7 @@ impl FirmwareFloor {
         if rpm == 0 {
             return 0;
         }
-        duty_for_rpm(rpm)
+        duty_for_rpm(self.profile.duty_rpm, rpm)
             .saturating_add(FLOOR_MARGIN_DUTY)
             .max(STICTION_DUTY)
     }
@@ -389,13 +393,15 @@ impl FirmwareFloor {
     }
 }
 
-/// The EC's RPM at `celsius`, interpolated between measured points.
-fn interpolate_rpm(celsius: f64) -> u16 {
+/// The EC's RPM at `celsius` on this board, interpolated between measured points.
+fn interpolate_rpm(profile: &BoardProfile, celsius: f64) -> u16 {
+    let curve = profile.firmware_curve;
+    let duty_rpm = profile.duty_rpm;
     if !celsius.is_finite() {
         // A sensor we cannot read is not permission to run the fan slowly.
         return u16::MAX;
     }
-    let (last_c, last_rpm) = EC_CURVE[EC_CURVE.len() - 1];
+    let (last_c, last_rpm) = curve[curve.len() - 1];
     if celsius >= FULL_DUTY_ABOVE_C {
         return u16::MAX;
     }
@@ -404,13 +410,13 @@ fn interpolate_rpm(celsius: f64) -> u16 {
         // time we reach FULL_DUTY_ABOVE_C.
         let span = FULL_DUTY_ABOVE_C - last_c;
         let t = (celsius - last_c) / span;
-        let top = f64::from(DUTY_RPM[DUTY_RPM.len() - 1].1);
+        let top = f64::from(duty_rpm[duty_rpm.len() - 1].1);
         return lerp(f64::from(last_rpm), top, t) as u16;
     }
-    if celsius <= EC_CURVE[0].0 {
-        return EC_CURVE[0].1;
+    if celsius <= curve[0].0 {
+        return curve[0].1;
     }
-    for w in EC_CURVE.windows(2) {
+    for w in curve.windows(2) {
         let ((c0, r0), (c1, r1)) = (w[0], w[1]);
         if celsius <= c1 {
             let t = (celsius - c0) / (c1 - c0);
@@ -421,16 +427,16 @@ fn interpolate_rpm(celsius: f64) -> u16 {
 }
 
 /// The lowest duty that reaches at least `rpm`, rounding **up**.
-fn duty_for_rpm(rpm: u16) -> u8 {
+fn duty_for_rpm(table: &[(u8, u16)], rpm: u16) -> u8 {
     if rpm == 0 {
         return 0;
     }
-    let top = DUTY_RPM[DUTY_RPM.len() - 1];
+    let top = table[table.len() - 1];
     if rpm >= top.1 {
         // Beyond anything measured: full duty. There is nothing faster to offer.
         return u8::MAX;
     }
-    for w in DUTY_RPM.windows(2) {
+    for w in table.windows(2) {
         let ((d0, r0), (d1, r1)) = (w[0], w[1]);
         if rpm <= r1 {
             if r1 == r0 {
@@ -453,6 +459,10 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every measurement below was taken on the Intel board.
+    const DUTY_RPM: &[(u8, u16)] = INTEL_CORE_ULTRA_3.duty_rpm;
+    const EC_CURVE: &[(f64, u16)] = INTEL_CORE_ULTRA_3.firmware_curve;
 
     #[test]
     fn idle_allows_a_silent_fan() {
@@ -492,7 +502,7 @@ mod tests {
     fn rounds_up_never_down() {
         // Landing a count short of firmware defeats the entire purpose.
         for rpm in [1u16, 1108, 1500, 2000, 2700, 3000, 3500] {
-            let d = duty_for_rpm(rpm);
+            let d = duty_for_rpm(DUTY_RPM, rpm);
             let produced = interpolate_duty_rpm(d);
             assert!(
                 produced >= f64::from(rpm) - 0.5,
@@ -502,6 +512,92 @@ mod tests {
     }
 
     /// Forward lookup, only used to check that `duty_for_rpm` did not round down.
+    /// What a duty actually produces on a given board's fan.
+    fn rpm_on(table: &[(u8, u16)], duty: u8) -> f64 {
+        if duty >= table[table.len() - 1].0 {
+            return f64::from(table[table.len() - 1].1);
+        }
+        for w in table.windows(2) {
+            let ((d0, r0), (d1, r1)) = (w[0], w[1]);
+            if duty <= d1 {
+                let t = (f64::from(duty) - f64::from(d0)) / (f64::from(d1) - f64::from(d0));
+                return lerp(f64::from(r0), f64::from(r1), t);
+            }
+        }
+        f64::from(table[table.len() - 1].1)
+    }
+
+    #[test]
+    fn the_amd_floor_is_never_quieter_than_amd_firmware() {
+        // The whole promise, on the board it now applies to: at every temperature
+        // firmware was measured at, the floor's duty turns this board's fan at least as
+        // fast as firmware asked for.
+        use crate::board::AMD_RYZEN_AI_300 as AMD;
+        let f = FirmwareFloor::for_board(&AMD);
+        for &(celsius, firmware_rpm) in AMD.firmware_curve {
+            let duty = f.floor_duty(celsius);
+            let produced = rpm_on(AMD.duty_rpm, duty);
+            assert!(
+                produced >= f64::from(firmware_rpm),
+                "at {celsius} C the floor's duty {duty} gives {produced:.0} rpm, \
+                 below firmware's {firmware_rpm}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_amd_floor_permits_silence_exactly_where_firmware_is_silent() {
+        use crate::board::AMD_RYZEN_AI_300 as AMD;
+        let f = FirmwareFloor::for_board(&AMD);
+        assert_eq!(f.floor_duty(45.0), 0);
+        assert_eq!(
+            f.floor_duty(49.9),
+            0,
+            "firmware is off here, so quiet is allowed"
+        );
+        assert!(
+            f.floor_duty(50.9) >= STICTION_DUTY,
+            "firmware runs 2265 rpm here"
+        );
+    }
+
+    #[test]
+    fn intel_tables_on_the_amd_fan_would_sit_below_firmware() {
+        // Why board profiles exist. Before them this module's tables were the Intel
+        // board's, applied everywhere. Pinned so the reason cannot quietly erode.
+        use crate::board::AMD_RYZEN_AI_300 as AMD;
+        let intel = FirmwareFloor::for_board(&INTEL_CORE_ULTRA_3);
+        let mut worst: f64 = 0.0;
+        let mut worst_at = 0.0;
+        for &(celsius, firmware_rpm) in AMD.firmware_curve {
+            let produced = rpm_on(AMD.duty_rpm, intel.floor_duty(celsius));
+            let gap = f64::from(firmware_rpm) - produced;
+            if gap > worst {
+                worst = gap;
+                worst_at = celsius;
+            }
+        }
+        eprintln!("intel model on the AMD fan: worst shortfall {worst:.0} rpm at {worst_at} C");
+        assert!(
+            worst > 1500.0,
+            "expected the Intel model to fall well short of AMD firmware; worst gap {worst:.0}"
+        );
+    }
+
+    #[test]
+    fn each_floor_converts_rpm_through_its_own_fan() {
+        // The AMD boards observe firmware as an rpm. It has to become a duty through the
+        // AMD fan, which is ~20% faster than the Intel one: the same rpm needs less duty.
+        use crate::board::AMD_RYZEN_AI_300 as AMD;
+        let amd = FirmwareFloor::for_board(&AMD).duty_for_rpm(5000);
+        let intel = FirmwareFloor::for_board(&INTEL_CORE_ULTRA_3).duty_for_rpm(5000);
+        assert!(amd < intel, "amd {amd}, intel {intel}");
+        assert!(
+            rpm_on(AMD.duty_rpm, amd) >= 5000.0,
+            "rounded down: duty {amd}"
+        );
+    }
+
     fn interpolate_duty_rpm(duty: u8) -> f64 {
         if duty >= DUTY_RPM[DUTY_RPM.len() - 1].0 {
             return f64::from(DUTY_RPM[DUTY_RPM.len() - 1].1);
@@ -685,7 +781,7 @@ mod tests {
         // against our model of it. Hardware caught a violation here that the model
         // was happy with, so assert on the measurements directly.
         let f = FirmwareFloor::new();
-        for (celsius, ec_rpm) in EC_CURVE {
+        for &(celsius, ec_rpm) in EC_CURVE {
             if ec_rpm == 0 {
                 continue;
             }

@@ -378,8 +378,9 @@ Full 24-thread load settled at a die temperature of 83 °C with the thermistor a
   0011's ascending-branch learning and the direction hysteresis in `floor.rs` exist to
   untangle a curve that, measured against the right sensor, is not tangled.
 - **The Intel cold-start model is unsafe here.** It predicts 2925 rpm at 64.8 °C; this
-  firmware wants 5288. A floor built from the Intel tables sits roughly 2000 rpm below
-  firmware across the middle of the range.
+  firmware wants 5288. A floor built from the Intel tables falls short of firmware at
+  every point above the step, worst at 68.8 °C by **2553 rpm** - computed through this
+  board's fan table, and pinned as a test in `floor.rs`.
 
 **An open question for the Intel board**, not a claim about it: its baseline records 20 °C
 of hysteresis measured against `peci-temp`, the die sensor — and notes that firmware "is

@@ -3,7 +3,7 @@
 //! The fan's behaviour is a property of the board, not of the code: how fast a given duty
 //! turns it, which sensor firmware follows, and what firmware does at each temperature.
 //! Upstream hardcoded one board's answers and applied them everywhere. On the AMD boards
-//! that would have put the firmware floor about 2000 rpm *below* firmware through the
+//! that would have put the firmware floor up to 2553 rpm *below* firmware through the
 //! middle of the range - the one direction the floor exists to prevent - so the answers
 //! live here, keyed by the DMI board name they were measured on.
 //!
@@ -247,11 +247,15 @@ mod tests {
     }
 
     fn ascending_duty(table: &[(u8, u16)]) -> bool {
-        table.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1)
+        table
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1)
     }
 
     fn ascending_curve(table: &[(f64, u16)]) -> bool {
-        table.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1)
+        table
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1)
     }
 
     #[test]
@@ -260,7 +264,11 @@ mod tests {
         // floor answer a hotter temperature with a quieter fan.
         for p in PROFILES {
             assert!(ascending_duty(p.duty_rpm), "{} duty table", p.name);
-            assert!(ascending_curve(p.firmware_curve), "{} firmware curve", p.name);
+            assert!(
+                ascending_curve(p.firmware_curve),
+                "{} firmware curve",
+                p.name
+            );
         }
     }
 
@@ -288,7 +296,10 @@ mod tests {
         let curve = AMD_RYZEN_AI_300.firmware_curve;
         let off = curve.iter().position(|&(c, _)| c == 49.9).unwrap();
         assert_eq!(curve[off].1, 0);
-        assert!(curve[off + 1].0 - curve[off].0 < 0.15, "step must be immediate");
+        assert!(
+            curve[off + 1].0 - curve[off].0 < 0.15,
+            "step must be immediate"
+        );
         assert_eq!(curve[off + 1].1, 2265);
     }
 }

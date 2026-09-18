@@ -4,8 +4,8 @@
 //! uses `/`; tests point it at a fixture tree so the whole capability and telemetry
 //! stack runs with no hardware attached. See `docs/adr/0004-sysfs-first-hardware-access.md`.
 
-pub mod board;
 pub mod battery;
+pub mod board;
 pub mod caps;
 pub mod ceiling;
 pub mod charge;
