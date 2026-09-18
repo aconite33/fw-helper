@@ -1,32 +1,33 @@
-# fw-helper — AMD Framework 13 fork
+# fw-helper — AMD and Intel Framework 13
 
-Firmware control and system monitoring for the **Framework Laptop 13 (AMD Ryzen AI 300)**
-on Linux.
+Firmware control and system monitoring for the **Framework Laptop 13** on Linux — the
+**AMD Ryzen AI 300** boards, alongside the **Intel Core Ultra Series 3** "Pro" that upstream
+targets.
 
-This is a hardware fork of [Wooloomooloo2/fw-helper](https://github.com/Wooloomooloo2/fw-helper),
-which targets the **Intel** Framework 13 Pro. That project's architecture, ADRs and safety
-model are carried over wholesale; what changed is everything that touches this board, which
-turned out to be most of the hardware layer. Use upstream if you have an Intel board — it is
-further along, and none of the caveats below apply to it.
+This is a hardware fork of [Wooloomooloo2/fw-helper](https://github.com/Wooloomooloo2/fw-helper).
+That project's architecture, ADRs and safety model are carried over wholesale; what changed
+is everything that touches the AMD boards, which turned out to be most of the hardware
+layer. The Intel code path is kept intact beside it rather than replaced — see
+[Which boards](#which-boards) for exactly what has been verified on each.
 
-> **Status: hardware characterised, port in progress.** The monitoring works today. Fan
-> control is *proven possible* on this board but not yet wired into the daemon. Power limits
-> have no mechanism here at all. Read the table before expecting anything.
+> **Status: fan control works on AMD, and survives `kill -9`.** Monitoring, profiles and
+> the charge limit work on both. Power limits exist only on Intel. Read the table before
+> expecting anything.
 
 ![The panel applet](docs/images/applet-panel.png)
 
 CPU and memory sparklines, a usage bar per mounted drive, the battery with its percentage
 inside it, then temperature, fan and power draw. Every screenshot here is from the machine
-described under [Hardware](#hardware) — nothing is mocked up.
+described under [Which boards](#which-boards) — nothing is mocked up.
 
 ## Why a fork rather than a patch
 
 Four of the interfaces upstream depends on are absent or different here, and two of its
 ADRs do not hold. This is not a matter of a few `#[cfg]` branches:
 
-| | Intel Pro (upstream) | This board |
+| | Intel Pro (upstream) | AMD Ryzen AI 300 |
 |---|---|---|
-| Board / EC | `FRANMJCP07`, `sakura-3.0.2` | `FRANMGCP05`, **`lilac-3.0.5`** |
+| Board / EC | `FRANMJCP07`, `sakura-3.0.2` | `FRANMGCP05` / `FRANMGCP09`, **`lilac-3.0.5` / `lilac-4.0.2`** |
 | Fan control | `pwm1` + `pwm1_enable` in sysfs | **neither exists** — raw EC commands only |
 | Fan duty | 0–255, with read-back | **percent 0–100, no read-back at all** |
 | Power limits | `intel-rapl-mmio:0`, PL1 writable | **no RAPL** (`enabled=0`, no MMIO zone) |
@@ -37,7 +38,9 @@ Everything above was measured, not assumed. The full survey is in
 [docs/hardware-baseline-amd.md](docs/hardware-baseline-amd.md); upstream's Intel figures are
 in `docs/hardware-baseline.md` and **do not carry over**.
 
-## What works, honestly
+## What works on the AMD boards, honestly
+
+For the Intel Pro, see [Which boards](#which-boards) — it keeps upstream's feature set.
 
 | Feature | Status |
 |---|---|
@@ -45,9 +48,9 @@ in `docs/hardware-baseline.md` and **do not carry over**.
 | Live telemetry | **Working** — temps, fan RPM, battery draw and charge rate |
 | Capability detection | **Working** — every knob reports available, or why not |
 | Performance profiles | **Working** — writes `platform_profile` directly, since there is no PPD here to defer to |
-| GUI | **Working**, with the fan and power controls inert until the port lands |
+| GUI | **Working**, including the fan controls and curve editor. The power-limit control stays inert, with its reason shown |
 | Battery charge limit | **Mechanism confirmed, efficacy unproven.** Framework's EC command `0x3E03` answers on this firmware ([ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)), but nothing has yet watched a charge actually *stop* at the limit. Upstream's hardest-won lesson is that read-back is not efficacy |
-| Fan control | **Possible, not yet implemented.** Duty writes move the fan and the EC reclaims it cleanly — measured. The daemon still targets the sysfs attributes this board lacks, so the capability reports unavailable ([ADR 0013](docs/adr/0013-fan-control-via-ec-commands.md)) |
+| Fan control | **Working.** Driven over EC commands, bounded by a firmware floor built from this board's own measured fan and firmware curve. `kill -9` recovery verified: fan back with the EC within 1.29 s through the crash path alone ([ADR 0013](docs/adr/0013-fan-control-via-ec-commands.md)) |
 | Power limits | **No mechanism exists.** No RAPL, and Framework's EC command set has no PPT or SOC power command. On AMD the limits move through `amd-pmf`'s profiles, so that is where power control lives |
 | Undervolting | Not attempted |
 
@@ -102,25 +105,45 @@ Details worth knowing:
 ![The GTK window](docs/images/gui.png)
 
 Carried over from upstream, and worth reading as a status report in itself: the controls
-that cannot work on this board say so rather than sitting there dead. `cpu package` shows a
-dash because there is no RAPL energy counter, the power limit explains that there is no
-`intel-rapl-mmio:0` zone, and the fan reports unavailable until [ADR 0013](docs/adr/0013-fan-control-via-ec-commands.md)
-is implemented. Whole-machine draw, temperature, battery and profiles all work.
+that cannot work on a board say so rather than sitting there dead. The screenshot predates
+the fan port, which is why the fan reads *unavailable* in it; on the AMD boards the fan
+controls and curve editor are now live. The power limit still explains that there is no
+`intel-rapl-mmio:0` zone — that one is a property of the hardware, not of the code.
 
-The fan curve editor is shown for completeness — it edits and saves a curve, but nothing
-drives the fan from it yet on this hardware.
+## Which boards
 
-## Hardware
+A fan's behaviour belongs to the board: how fast a duty turns it, which sensor firmware
+reads, what firmware does at each temperature. So those measurements live in **board
+profiles**, keyed by the DMI board name they were taken on, and the daemon picks one at
+startup. Applying one board's numbers to another is not conservative, it is wrong — the
+Intel tables on the AMD fan would put the firmware floor up to **2553 rpm below firmware**.
 
-Developed and measured against:
+| | AMD Ryzen AI 300 | Intel Core Ultra 3 ("Pro") |
+|---|---|---|
+| Boards | `FRANMGCP05`, `FRANMGCP09` | `FRANMJCP07` |
+| Verified on | both, on hardware | upstream's hardware; **not re-tested since this fork's changes** |
+| Fan control | EC commands, no read-back | `pwm1` sysfs, read back |
+| Firmware follows | `cpu_f75303@4d`, not hysteretic against it | `peci-temp`, treated as hysteretic |
+| Power limits | none — profiles only | PL1 via RAPL |
+| Charge limit | EC `0x3E03`; stops charging **unverified** | EC `0x3E03`; verified |
+| Crash recovery | `kill -9` verified, 1.29 s | verified upstream, 0.27 s |
 
-- Framework Laptop 13 (AMD Ryzen AI 300), board `FRANMGCP05`, BIOS 03.05
-- AMD Ryzen AI 5 340, EC firmware `lilac-3.0.5`
-- Arch Linux, kernel 7.1.11
+**On the Intel Pro, the fork behaves as upstream does** — it drives the fan through `pwm1`,
+sends the EC nothing, and keeps upstream's tables, sensor and read-before-release reclaim.
+That is pinned by tests with an EC transport present, so the AMD backend cannot quietly take
+over a board that has `pwm1`. What it has not had is a run on Intel hardware since these
+changes; if you have one, `scripts/verify-fan-recovery.sh` is the first thing to try. One
+deliberate difference from upstream: the lowest non-zero fan duty is now 33/255 on every
+board, not 30 — see [Safety](#safety).
 
-Other AMD Framework 13 boards will probably behave similarly, but nothing here has been run
-on one. The daemon probes capabilities at startup and disables what it cannot drive, so a
-mismatch should be inert rather than dangerous — that is the design, not a measurement.
+**Anything else is refused fan control, with a reason.** A sibling of a measured board —
+same board-name family, e.g. another `FRANMGCP` revision — is used with its family's profile
+and says so in the log. An unrecognised board gets monitoring, profiles and the charge limit,
+but not the fan: there is no floor that can be trusted to stay above its firmware. The
+refusal names the probes that would measure it.
+
+Measured on: Arch Linux, kernels 7.1.11 and 7.2.6, BIOS 03.05 and 04.02, EC firmware
+`lilac-3.0.5` and `lilac-4.0.2`.
 
 ## Safety
 
@@ -137,16 +160,25 @@ records exactly how** rather than leaving the safety story reading as intact:
   cannot answer — a manual duty of 0 and EC-auto-at-idle both read 0 rpm. So it releases
   unconditionally rather than conditionally, which is weaker as diagnosis and no weaker as
   repair.
-- **Firmware's own duty cannot be observed**, so the floor learns from RPM and inverts one
-  measured table rather than reading duty directly.
+- **Firmware's own duty cannot be observed** — but on EC `lilac-4.0.2` its *target rpm* can,
+  through `fan1_target`, and it leads the actual speed. The floor learns from that, through
+  this board's fan table, and ignores a target of 0 while the fan is plainly turning, which
+  means a dead register rather than a silent firmware.
 
-Measured on this board and worth carrying into any curve: the fan **stalls** below 10% duty
-but will not **start** from rest below 11%, and a curve idling in that gap runs correctly
-down a whole cooldown then silently fails to spin up from cold. Also note `ddr_f75303@4d`
-reports its limit at **79.85 °C**, seven degrees below the Intel board's.
+Measured on both AMD boards and worth carrying into any curve: the fan **stalls** below 10%
+duty but will not **start** from rest below 11%, and a curve idling in that gap runs
+correctly down a whole cooldown then silently fails to spin up from cold. So the lowest
+non-zero duty on every board is now **33/255 (13%)** — the break-away plus two points for a
+cold or dusty bearing. Also note `ddr_f75303@4d` reports its limit at **79.85 °C**, seven
+degrees below the Intel board's.
 
-`kill -9` recovery is a release gate upstream. **It has not been exercised on this board**,
-because the fan port is not done.
+**`kill -9` recovery is verified on `FRANMGCP09`.** With the fan held at 71% on an idle
+machine and the daemon SIGKILLed, so that none of its own release paths could run,
+`fw-helper-restore-fan` handed the fan back within 1.29 s and the restarted daemon released
+it again as a second layer. `scripts/verify-fan-recovery.sh` repeats it.
+
+**Still unverified on hardware:** suspend and resume while holding the fan, the floor
+overriding a quiet curve live under load, and break-away from a cold fan.
 
 ## Build and run
 
