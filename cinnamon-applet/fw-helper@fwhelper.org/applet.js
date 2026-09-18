@@ -186,6 +186,8 @@ FrameworkMonitor.prototype = {
         this._menuSection = new PopupMenu.PopupMenuSection();
         this._menuBox.add(this._menuSection.actor);
         this._rows = {};
+        this._sections = {};
+        this._current = null;
 
         // Added before anything else so it stays at the top: the dropdown is taller
         // than the screen and scrolls, and a launcher at the bottom would need hunting
@@ -207,6 +209,9 @@ FrameworkMonitor.prototype = {
             let monitor = Main.layoutManager.primaryMonitor;
             let cap = Math.max(240, Math.round(monitor.height * 0.75));
             this._scroll.style = "max-height: " + cap + "px;";
+            // The scroll view keeps its position between openings, so without this the
+            // menu reopened wherever it was last left - mid-way down, gauges out of view.
+            this._scroll.get_vscroll_bar().get_adjustment().set_value(0);
             this._updateLauncher();
             this._update();
         });
@@ -491,17 +496,31 @@ FrameworkMonitor.prototype = {
 
     /* ---------- menu scaffolding ---------- */
 
+    /* Open a section, making it the one rows are added to.
+     *
+     * Each section is its own container. With one flat list, a row created after the
+     * menu was first built - a drive mounted later, a new top process - was appended to
+     * the very end, and a VeraCrypt volume mounted after startup turned up below "Top
+     * processes". Rows now always land inside their own section, whenever they are made.
+     *
+     * Called on every update, not only the first: it re-selects an existing section as
+     * well as creating a new one.
+     */
     _section: function (key, title) {
-        if (this._rows[key]) return;
-        if (Object.keys(this._rows).length > 0) {
-            this._menuSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        if (!this._sections[key]) {
+            if (Object.keys(this._sections).length > 0) {
+                this._menuSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            }
+            let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+            item.actor.add_style_class_name("fw-helper-row");
+            let label = new St.Label({ text: title, style_class: "fw-helper-section" });
+            item.addActor(label, { expand: true });
+            this._menuSection.addMenuItem(item);
+            let body = new PopupMenu.PopupMenuSection();
+            this._menuSection.addMenuItem(body);
+            this._sections[key] = body;
         }
-        let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-        item.actor.add_style_class_name("fw-helper-row");
-        let label = new St.Label({ text: title, style_class: "fw-helper-section" });
-        item.addActor(label, { expand: true });
-        this._menuSection.addMenuItem(item);
-        this._rows[key] = true;
+        this._current = this._sections[key];
     },
 
     _row: function (key, label, value, color) {
@@ -530,7 +549,7 @@ FrameworkMonitor.prototype = {
             let right = new St.Label({ text: "—", style_class: "fw-helper-value" });
             item.addActor(box, { expand: true });
             item.addActor(right, { align: St.Align.END });
-            this._menuSection.addMenuItem(item);
+            this._current.addMenuItem(item);
             this._rows[key] = { item: item, left: left, right: right };
         }
         let row = this._rows[key];
@@ -569,7 +588,7 @@ FrameworkMonitor.prototype = {
                     cr.$dispose();
                 }
             });
-            this._menuSection.box.add_actor(area);
+            this._current.box.add_actor(area);
             this._rows[key] = { actor: area, area: area, paint: paint };
         }
         this._rows[key].paint = paint;
