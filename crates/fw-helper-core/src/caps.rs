@@ -58,7 +58,20 @@ impl Capabilities {
             Some(_) => Cap::Yes,
         };
 
-        let power_limit = if !fs.exists(paths::RAPL_MMIO) {
+        // Board first, sysfs second. On a board whose silicon has no writable RAPL
+        // constraint, naming the Intel zone we did not find describes the wrong
+        // machine: it reads as a missing driver or package on hardware that has no
+        // such interface to begin with, and sent one user looking at microcode
+        // packages. Say what is true here, and where power does move.
+        let board = crate::board::identify(fs);
+        let power_limit = if let Some(p) = board.profile().filter(|p| !p.rapl_power_limit) {
+            Cap::no(format!(
+                "{} exposes no writable power limit: its RAPL zone reports energy only, \
+                 with no constraint to write. Power moves with the profile here \
+                 (low-power, balanced, performance) instead",
+                p.name
+            ))
+        } else if !fs.exists(paths::RAPL_MMIO) {
             Cap::no("no intel-rapl-mmio:0 zone")
         } else if !fs.exists(&format!("{}/constraint_0_power_limit_uw", paths::RAPL_MMIO)) {
             Cap::no("rapl zone exposes no long_term constraint")

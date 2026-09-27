@@ -36,6 +36,15 @@ pub struct BoardProfile {
     /// Whether firmware's curve depends on direction against [`Self::control_sensor`].
     /// When it does, only the heating branch says what a temperature needs (ADR 0011).
     pub firmware_curve_hysteretic: bool,
+    /// Whether a sustained CPU power limit can be written at all on this board.
+    ///
+    /// Not a question of which zone to use - it is whether the mechanism exists. The
+    /// Intel board writes PL1 to `intel-rapl-mmio:0`. The AMD boards have no such zone,
+    /// and their `intel-rapl:0` - the MSR zone, which the Intel-named driver also serves
+    /// on AMD - exposes `energy_uj` and nothing else: no `constraint_*` files, so there
+    /// is no limit to write. Measured on FRANMGCP09, 2026-09-27. Power moves through
+    /// `platform_profile` here instead, which is the profile axis we already delegate.
+    pub rapl_power_limit: bool,
 }
 
 /// Framework Laptop 13 Pro, Intel Core Ultra Series 3.
@@ -71,6 +80,7 @@ pub static INTEL_CORE_ULTRA_3: BoardProfile = BoardProfile {
         (76.8, 3100),
     ],
     firmware_curve_hysteretic: true,
+    rapl_power_limit: true,
 };
 
 /// Framework Laptop 13, AMD Ryzen AI 300.
@@ -134,6 +144,8 @@ pub static AMD_RYZEN_AI_300: BoardProfile = BoardProfile {
         (68.8, 6200),
     ],
     firmware_curve_hysteretic: false,
+    // No constraint_* files anywhere in the powercap tree: energy reporting only.
+    rapl_power_limit: false,
 };
 
 /// Every profile, in the order they are tried.

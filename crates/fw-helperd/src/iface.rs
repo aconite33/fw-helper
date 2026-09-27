@@ -427,9 +427,8 @@ impl Daemon {
             .await
             .map_err(zbus::fdo::Error::Failed)?;
 
-        fw_helper_core::PowerLimit::new(&self.fs)
-            .set(profile.pl1_watts)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("power limit: {e}")))?;
+        let pl1_applied =
+            crate::apply_pl1(&self.fs, profile.pl1_watts).map_err(zbus::fdo::Error::Failed)?;
 
         self.fan
             .set_curve(profile.curve.clone(), self.thermal())
@@ -437,10 +436,19 @@ impl Daemon {
 
         if let Ok(mut state) = self.state.lock() {
             state.profile = Some(profile.name.to_string());
-            state.power_limit = Some(profile.pl1_watts);
+            // Only a limit that was actually written is worth restoring at boot.
+            state.power_limit = pl1_applied.then_some(profile.pl1_watts);
             state.save();
         }
-        eprintln!("profile {} applied by {sender}", profile.name);
+        eprintln!(
+            "profile {} applied by {sender}{}",
+            profile.name,
+            if pl1_applied {
+                String::new()
+            } else {
+                " (no power-limit interface on this board)".to_string()
+            }
+        );
         Ok(())
     }
 

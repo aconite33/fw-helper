@@ -45,6 +45,7 @@ impl Fixture {
         let f = Fixture::new(tag);
         // hwmon3 is the battery, hwmon7 the EC — deliberately not the real indices,
         // to prove lookup is by name and not by number.
+        f.write("sys/class/dmi/id/board_name", "FRANMJCP07\n");
         f.write("sys/class/hwmon/hwmon3/name", "BAT1\n");
         f.write("sys/class/hwmon/hwmon7/name", "cros_ec\n");
         f.write("sys/class/hwmon/hwmon7/pwm1_enable", "2\n");
@@ -318,6 +319,7 @@ fn prefers_the_energy_family_where_the_board_reports_it() {
 /// but `intel-rapl:0` counts joules perfectly well.
 fn framework_13_amd(tag: &str) -> Fixture {
     let f = Fixture::new(tag);
+    f.write("sys/class/dmi/id/board_name", "FRANMGCP09\n");
     let hwmon = "sys/class/hwmon/hwmon8";
     f.write(&format!("{hwmon}/name"), "cros_ec\n");
     f.write(&format!("{hwmon}/fan1_input"), "0\n");
@@ -356,6 +358,50 @@ fn package_power_works_on_a_board_with_no_mmio_zone() {
     );
     // Energy and limits are separate questions: this board answers one and not the other.
     assert!(!caps.power_limit.is_available());
+}
+
+#[test]
+fn an_amd_board_explains_the_power_limit_in_its_own_terms() {
+    // The reason a capability gives has to describe the machine in front of the user.
+    // Naming the Intel zone we did not find reads as a missing driver or package, and
+    // did exactly that: it sent a user to swap their microcode packages. On this board
+    // no writable RAPL constraint exists at all - the MSR zone carries energy_uj and
+    // nothing else - so the honest answer names the board and where power does move.
+    let f = framework_13_amd("amd-power-reason");
+    let caps = Capabilities::probe(&f.sysfs());
+
+    let fw_helper_core::Cap::No(reason) = &caps.power_limit else {
+        panic!("expected no power limit on the AMD board");
+    };
+    assert!(
+        reason.contains("AMD Ryzen AI 300"),
+        "reason does not name the board: {reason}"
+    );
+    assert!(
+        reason.contains("profile"),
+        "reason does not say where power moves instead: {reason}"
+    );
+    assert!(
+        !reason.contains("intel-rapl"),
+        "reason names an Intel zone on an AMD board: {reason}"
+    );
+}
+
+#[test]
+fn an_intel_board_missing_its_zone_still_names_the_zone() {
+    // The other half: where the mechanism does exist on this silicon, the missing zone
+    // is the actionable fact and must keep being reported as such.
+    let f = Fixture::new("intel-no-rapl");
+    f.write("sys/class/dmi/id/board_name", "FRANMJCP07\n");
+    f.write("sys/class/hwmon/hwmon7/name", "cros_ec\n");
+    let caps = Capabilities::probe(&f.sysfs());
+
+    match &caps.power_limit {
+        fw_helper_core::Cap::No(reason) => {
+            assert!(reason.contains("intel-rapl-mmio:0"), "reason was: {reason}")
+        }
+        other => panic!("expected no power limit, got {other:?}"),
+    }
 }
 
 #[test]

@@ -345,6 +345,27 @@ async fn record_profile(conn: &zbus::Connection, name: &str, watts: u32) {
 /// Order matters. The power budget goes first because it does most of the thermal work —
 /// 10 W is worth about 12 °C — so the curve is applied to a machine already heading for
 /// the right temperature rather than chasing one that is not.
+/// Apply a profile's sustained power limit, tolerating a board that has none.
+///
+/// `Ok(true)` when a limit was written, `Ok(false)` when this board has no interface to
+/// write one to, `Err` when a limit exists and refused.
+///
+/// Shared deliberately. Applying a profile was implemented twice - here for the daemon's
+/// own switching, and in `iface::set_profile` for the CLI and GUI - and only one copy was
+/// taught that a missing power limit is not a failure. The result was worse than either
+/// behaviour alone: the fan curve of a profile chosen by AC/battery switching applied,
+/// while the same profile chosen by the user reported an error mentioning an Intel zone.
+/// The two paths now cannot disagree about this.
+pub(crate) fn apply_pl1(fs: &Sysfs, watts: u32) -> Result<bool, String> {
+    match fw_helper_core::PowerLimit::new(fs).set(watts) {
+        Ok(()) => Ok(true),
+        // The knob being absent is not the profile failing; a knob that is present and
+        // refuses is. On the AMD boards no writable RAPL constraint exists at all.
+        Err(fw_helper_core::PowerError::Unsupported) => Ok(false),
+        Err(e) => Err(format!("power limit: {e}")),
+    }
+}
+
 async fn apply_profile(
     profile: &Profile,
     set_ppd: bool,
@@ -357,9 +378,9 @@ async fn apply_profile(
     if set_ppd {
         axis.set(profile.ppd).await?;
     }
-    fw_helper_core::PowerLimit::new(fs)
-        .set(profile.pl1_watts)
-        .map_err(|e| format!("power limit: {e}"))?;
+    // A board with no power-limit mechanism must not lose the rest of the profile: this
+    // aborted with `?` before, so the fan curve and charge limit below were never reached.
+    let pl1_applied = apply_pl1(fs, profile.pl1_watts)?;
 
     // The curve is a request; the firmware floor, the ceiling and the battery guard are
     // applied on top of it every tick, exactly as for a hand-set duty. A profile cannot
@@ -377,10 +398,14 @@ async fn apply_profile(
         }
     }
     eprintln!(
-        "profile {} applied: ppd={} pl1={} W",
+        "profile {} applied: ppd={} pl1={}",
         profile.name,
         profile.ppd.as_str(),
-        profile.pl1_watts
+        if pl1_applied {
+            format!("{} W", profile.pl1_watts)
+        } else {
+            "skipped, no power-limit interface on this board".to_string()
+        }
     );
     Ok(())
 }
@@ -868,6 +893,113 @@ mod tests {
         // the user last chose by hand, every boot.
         assert!(!super::is_power_source_change(None, true));
         assert!(!super::is_power_source_change(None, false));
+    }
+
+    /// Both profile paths agree that an absent power limit is not a failure.
+    ///
+    /// `iface::set_profile` (the CLI and GUI) and `apply_profile` (the daemon's own
+    /// AC/battery switching) had separate copies of this, and fixing one left the other:
+    /// the user-facing path went on reporting `no usable RAPL power limit; expected
+    /// sys/class/powercap/intel-rapl-mmio:0` on an AMD machine while the internal path
+    /// worked. They share `apply_pl1` now, so this covers both.
+    #[test]
+    fn an_absent_power_limit_is_skipped_and_a_present_one_is_written() {
+        let root = std::env::temp_dir().join(format!("fw-helperd-pl1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fs = fw_helper_core::Sysfs::new(&root);
+
+        // No powercap tree at all, as measured on both AMD boards.
+        assert_eq!(super::apply_pl1(&fs, 25), Ok(false));
+
+        // A board that has the mechanism writes the value, and says it did.
+        let zone = root.join("sys/class/powercap/intel-rapl-mmio:0");
+        std::fs::create_dir_all(&zone).unwrap();
+        std::fs::write(zone.join("constraint_0_power_limit_uw"), "25000000\n").unwrap();
+        std::fs::write(zone.join("constraint_0_max_power_uw"), "25000000\n").unwrap();
+        assert_eq!(super::apply_pl1(&fs, 15), Ok(true));
+        let written = std::fs::read_to_string(zone.join("constraint_0_power_limit_uw")).unwrap();
+        assert_eq!(written.trim(), "15000000");
+
+        // And a value the zone cannot honour is still an error, not a silent skip.
+        assert!(super::apply_pl1(&fs, 999).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A profile on a board with no power-limit interface still applies everything else.
+    ///
+    /// The regression this pins was live on the AMD boards: `apply_profile` used `?` on
+    /// the power limit, so where no writable RAPL constraint exists it returned at the
+    /// first step and the fan curve below it was never reached. Observed in the journal
+    /// as `could not follow PPD to performance: power limit: no usable RAPL power
+    /// limit`, on every profile application and every AC/battery transition - which
+    /// means the fan curve a profile carries had never once been applied there.
+    #[tokio::test]
+    async fn a_missing_power_limit_does_not_cost_the_profile_its_fan_curve() {
+        use fw_helper_core::{Curve, Point, Sysfs};
+        use std::sync::Arc;
+
+        let root =
+            std::env::temp_dir().join(format!("fw-helperd-profile-nopl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let hw = root.join("sys/class/hwmon/hwmon8");
+        std::fs::create_dir_all(&hw).unwrap();
+        for (f, v) in [
+            ("name", "cros_ec\n"),
+            ("fan1_input", "0\n"),
+            ("fan1_target", "0\n"),
+            ("temp2_input", "45850\n"),
+            ("temp2_label", "cpu_f75303@4d\n"),
+        ] {
+            std::fs::write(hw.join(f), v).unwrap();
+        }
+        let dmi = root.join("sys/class/dmi/id");
+        std::fs::create_dir_all(&dmi).unwrap();
+        // An AMD board: no powercap tree at all under this root, exactly as measured.
+        std::fs::write(dmi.join("board_name"), "FRANMGCP09\n").unwrap();
+
+        let fs = Sysfs::new(&root);
+        let board = fw_helper_core::board::identify(&fs);
+        let ec = Arc::new(crate::ec::fake::FakeEc::new(0, 100));
+        let transport: Arc<dyn crate::ec::EcTransport> = ec.clone();
+        let lease = crate::fan::FanLease::for_board(fs.clone(), board, Some(transport));
+        let profile = fw_helper_core::Profile {
+            name: "performance".to_string(),
+            ppd: fw_helper_core::Ppd::Performance,
+            pl1_watts: 25,
+            curve: Curve::new(vec![
+                Point {
+                    celsius: 40.0,
+                    duty: 60,
+                },
+                Point {
+                    celsius: 80.0,
+                    duty: 200,
+                },
+            ])
+            .unwrap(),
+            charge_limit: None,
+        };
+        let thermal = crate::fan::Thermal {
+            celsius: Some(46.0),
+            ceiling: fw_helper_core::Ceiling::from_crit(Some(100.0)),
+            battery_celsius: Some(30.0),
+            battery: fw_helper_core::BatteryGuard::from_crit(Some(49.9)),
+        };
+
+        // set_ppd false: the PPD axis is not what this test is about, and a disconnected
+        // axis would write platform_profile, which does not exist under this root.
+        let axis = crate::ppd::ProfileAxis::disconnected(fs.clone());
+        let applied =
+            super::apply_profile(&profile, false, &axis, &lease, &fs, &*ec, thermal).await;
+
+        assert!(applied.is_ok(), "profile failed: {applied:?}");
+        assert!(
+            lease.curve_active(),
+            "the curve was never applied, so the power limit aborted the profile again"
+        );
+        assert!(ec.fan_percent().is_some(), "no duty reached the EC");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
