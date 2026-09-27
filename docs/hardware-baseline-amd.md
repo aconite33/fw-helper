@@ -301,6 +301,35 @@ The EC major version changed, so nothing verified against `lilac-3` was assumed:
   machine the release ramps down to firmware's own target (5313 → 2249 rpm over 6 s)
   rather than dropping to zero.
 
+## power-profiles-daemon is present on this board, and the daemon lost a race to it
+
+The first AMD board had no PPD, so the profile axis wrote `platform_profile` directly. This
+one has PPD installed, which put the delegated path (ADR 0005) on AMD for the first time -
+and it immediately exposed the boot race that had only ever been seen on Intel.
+
+Measured at boot, 2026-09-27, with timestamps from the journal:
+
+| Elapsed | Event |
+|---|---|
+| 0.000 s | `Starting fw-helper firmware control daemon` |
+| 0.030 s | capabilities logged; startup reaches the PPD probe and blocks |
+| **90.008 s** | `start operation timed out. Terminating.` - systemd's default `TimeoutStartSec` |
+| 90.052 s | **PPD finishes activating**, 45 ms after our process died |
+| 95.115 s | `Restart=on-failure` restarts us; ready in **1.0 s**, PPD adopted in 4 ms |
+
+The cause is a deadlock of our own making: PPD is D-Bus-activatable, so the probe is what
+asks systemd to start it, and a blocking call cannot be what unblocks it. The unit is
+`Type=dbus`, so systemd waits for the bus name - which meant the daemon was simply absent
+for the first 95 s of the boot, and a GUI opened in that window reported
+`fw-helperd is not available`. It recovered only because of `Restart=on-failure`.
+
+Worse than the Intel form of the same defect, which reached a *wrong* verdict in 26.8 s and
+carried on. Fixed by bounding the probe to 2 s and adopting PPD from `NameOwnerChanged`
+whenever it appears, so the verdict is revisable rather than permanent; the unit now also
+orders `After=power-profiles-daemon.service` and sets `TimeoutStartSec=20`, so a future hang
+fails fast instead of taking 90 s to report. See
+[`measurements/ppd-boot-race-hx370.txt`](measurements/ppd-boot-race-hx370.txt).
+
 ## The fan is the same fan
 
 | Duty % | 100 | 70 | 50 | 30 | 20 | 12 | 10 | 8 |

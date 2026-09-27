@@ -1,0 +1,53 @@
+PPD boot race, FRANMGCP09 (Ryzen AI 9 HX 370), EC lilac-4.0.2, kernel 7.2.7
+Observed 2026-09-27. Symptom reported by the user: opening the GUI showed
+"fw-helperd is not available"; opening it again later showed everything.
+
+journalctl -u fw-helperd -u power-profiles-daemon -b -o short-precise
+
+  14:47:50.868  systemd[1]: Starting fw-helper firmware control daemon...
+  14:47:50.898  fw-helperd[1710]: fw-helperd starting (binary 12935 minutes old)
+  14:47:50.9xx  fw-helperd[1710]: ... capabilities, fan released, floor restored,
+                                  fan watchdog running        <- last line, then blocked
+  14:49:20.876  systemd[1]: fw-helperd.service: start operation timed out. Terminating.
+  14:49:20.917  systemd[1]: fw-helperd.service: Failed with result 'timeout'.
+  14:49:20.920  systemd[1]: Starting Power Profiles daemon...
+  14:49:20.959  systemd[1]: Started Power Profiles daemon.          <- 45 ms after we died
+  14:49:25.973  systemd[1]: fw-helperd.service: Scheduled restart job, counter at 1.
+  14:49:26.023  fw-helperd[5836]: fw-helperd starting
+  14:49:26.025  fw-helperd[5836]: power profiles: delegating to PPD at
+                                  org.freedesktop.UPower.PowerProfiles     <- 2 ms
+  14:49:26.030  systemd[1]: Started fw-helper firmware control daemon.
+  14:49:26.030  fw-helperd[5836]: listening on org.fwhelper.Daemon1
+
+Blocked for exactly systemd's 90 s default TimeoutStartSec, killed, and absent
+for 95.1 s of the boot. The unit is Type=dbus, so systemd waits for the bus
+name; the name was never claimed because startup never got past the probe.
+
+Cause: PPD is D-Bus-activatable. Our own probe is the activation request, and
+it blocked waiting for the answer - so PPD could not finish starting until the
+process waiting for it was killed. PPD then answered the restart in 2 ms.
+
+Second defect, visible in the same boot once PPD was adopted:
+
+  fw-helperd[5836]: PPD switched to performance; following with profile performance
+  fw-helperd[5836]: could not follow PPD to performance: power limit: no usable
+                    RAPL power limit; expected sys/class/powercap/intel-rapl-mmio:0
+                    with a long_term constraint
+
+apply_profile() used `?` on the power limit, so on a board with no writable RAPL
+constraint every profile application returned before applying its fan curve or
+charge limit. Pinned by
+  fw-helperd: tests::a_missing_power_limit_does_not_cost_the_profile_its_fan_curve
+which fails with this exact message against the old code.
+
+Third, and what sent the user looking at CPU microcode packages: the power-limit
+capability read "unavailable - no intel-rapl-mmio:0 zone" on an AMD machine.
+Accurate about the path, wrong about the machine. The powercap tree here is:
+
+  /sys/class/powercap/intel-rapl        enabled=1
+  /sys/class/powercap/intel-rapl:0      name=package-0  enabled=0
+                                        energy_uj (0400), max_energy_range_uj
+  /sys/class/powercap/intel-rapl:0:0    name=core       (CPU0 only, not a total)
+
+No constraint_* file anywhere: energy reporting, no limit to write. Confirms the
+2026-08-30 finding on FRANMGCP05 against the newer EC and kernel.

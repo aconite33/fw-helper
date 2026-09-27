@@ -31,7 +31,7 @@ ADRs do not hold. This is not a matter of a few `#[cfg]` branches:
 | Fan control | `pwm1` + `pwm1_enable` in sysfs | **neither exists** — raw EC commands only |
 | Fan duty | 0–255, with read-back | **percent 0–100, no read-back at all** |
 | Power limits | `intel-rapl-mmio:0`, PL1 writable | **no RAPL** (`enabled=0`, no MMIO zone) |
-| Profiles | power-profiles-daemon | **not installed**; `amd-pmf` owns `platform_profile` |
+| Profiles | power-profiles-daemon | `amd-pmf` owns `platform_profile`; PPD is delegated to when installed |
 | Sensors | 5, incl. `peci-temp`, `battery_temp` | 4 — **neither of those two** |
 
 Everything above was measured, not assumed. The full survey is in
@@ -47,11 +47,11 @@ For the Intel Pro, see [Which boards](#which-boards) — it keeps upstream's fea
 | **Cinnamon panel applet** | **Working** — temps, fan, load, memory, disks, battery, top processes. Needs no daemon and no root |
 | Live telemetry | **Working** — temps, fan RPM, battery draw and charge rate |
 | Capability detection | **Working** — every knob reports available, or why not |
-| Performance profiles | **Working** — writes `platform_profile` directly, since there is no PPD here to defer to |
+| Performance profiles | **Working** — delegated to power-profiles-daemon where it is installed (ADR 0005), and written to `platform_profile` directly where it is not. PPD was absent on the first AMD board and present on the second, so both paths now run on AMD |
 | GUI | **Working**, including the fan controls and curve editor. The power-limit control stays inert, with its reason shown |
 | Battery charge limit | **Working.** Framework's EC command `0x3E03` ([ADR 0012](docs/adr/0012-charge-limit-via-custom-ec-command.md)). On `FRANMGCP09`, charging from below on AC stopped at exactly 80%: `Not charging`, `charge_now` flat ([measurement](docs/measurements/charge-limit-hx370.txt)). Not yet run on `FRANMGCP05` |
 | Fan control | **Working.** Driven over EC commands, bounded by a firmware floor built from this board's own measured fan and firmware curve. `kill -9` recovery verified: fan back with the EC within 1.29 s through the crash path alone ([ADR 0013](docs/adr/0013-fan-control-via-ec-commands.md)) |
-| Power limits | **No mechanism exists.** No RAPL, and Framework's EC command set has no PPT or SOC power command. On AMD the limits move through `amd-pmf`'s profiles, so that is where power control lives |
+| Power limits | **No watt setpoint exists.** RAPL is present but reports energy only: `intel-rapl:0` carries `energy_uj` and no `constraint_*` file, so there is nothing to write, and there is no `intel-rapl-mmio:0` zone. Framework's EC command set has no PPT or SOC power command either. Power moves through `amd-pmf`'s profiles, so that is where power control lives — and package power is still *reported* |
 | Undervolting | Not attempted |
 
 ## The Cinnamon applet
