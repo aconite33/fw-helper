@@ -10,5 +10,5 @@ rust-version.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 libc = "0.2"
 fw-helper-core = { path = "../fw-helper-core" }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 zbus = "5.13.2"

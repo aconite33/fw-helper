@@ -3,10 +3,19 @@ Description=fw-helper firmware control daemon
 Documentation=https://github.com/Wooloomooloo2/fw-helper
 After=dbus.service
 Requires=dbus.service
+# Ordering only, deliberately without Wants=: if something else on the system pulls PPD
+# in, start after it, but never be the reason it starts. PPD is D-Bus-activatable, so
+# our own probe used to be what activated it - while blocking on the answer. See
+# PROBE_TIMEOUT in ppd.rs.
+After=power-profiles-daemon.service
 
 [Service]
 Type=dbus
 BusName=org.fwhelper.Daemon1
+# Type=dbus means systemd waits for the bus name, so a daemon that hangs before claiming
+# it is simply absent - and at the 90 s default nobody waits that long to find out.
+# Ready takes well under a second on measured hardware.
+TimeoutStartSec=20
 ExecStart=/usr/libexec/fw-helperd
 Restart=on-failure
 RestartSec=5

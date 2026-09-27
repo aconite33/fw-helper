@@ -170,9 +170,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pending = Arc::clone(&pending_ppd);
         axis.watch(move |p| {
             pending.store(ppd_code(p), Ordering::SeqCst);
-        })
-        .await;
+        });
     }
+    // PPD is D-Bus-activatable and usually not up yet at boot, so the startup probe is
+    // bounded and this is what makes the verdict revisable: adopt PPD whenever it
+    // appears. Without it, losing the boot race meant writing platform_profile behind
+    // the desktop's back for the whole session (ADR 0005).
+    axis.adopt_when_available();
 
     let resumed = Arc::new(AtomicBool::new(false));
     logind::watch_sleep(&conn, Arc::clone(&resumed), Arc::clone(&lease)).await;
